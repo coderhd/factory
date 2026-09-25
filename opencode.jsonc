@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode-go/glm-5.3-flash",
+  "agents": {
+    "explore": { "model": "opencode-go/mimo-v2.6-flash" },
+    "general": { "model": "opencode-go/deepseek-v4.1-flash" },
+    "build": { "model": "opencode-go/qwen3.8-flash" },
+    "plan": { "model": "opencode-go/glm-5.3" }
+  },
+  "permissions": [
+    { "action": "shell", "resource": "*", "effect": "ask" },
+    { "action": "shell", "resource": "git status *", "effect": "allow" },
+    { "action": "shell", "resource": "git diff *", "effect": "allow" },
+    { "action": "shell", "resource": "git push origin main *", "effect": "deny" },
+    { "action": "edit", "resource": ".env*", "effect": "deny" }
+  ],
+  "plugins": ["./.opencode/plugins/factory-guard"],
+  "compaction": { "auto": true, "keep": { "tokens": 15000 }, "buffer": 20000 }
+}

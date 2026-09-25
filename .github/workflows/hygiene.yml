@@ -1,0 +1,10 @@
+name: hygiene
+on: { schedule: [{ cron: "0 6 * * *" }], workflow_dispatch: {} }
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          find factory-docs/implementation/roadmap.md -mtime -7 | grep -q roadmap || (echo "roadmap stale >7d" && exit 1)
+          gh issue list --json title,state --limit 50 | grep -q . || echo "no issues yet (ok on bootstrap)"

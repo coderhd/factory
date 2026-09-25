@@ -1,0 +1,10 @@
+name: validate
+on: [pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          test -f .factory/evidence.log || (echo "missing evidence log" && exit 1)
+          git log --format=%B -n 5 | grep -qE "spec:|plan:" || (echo "PR needs spec:/plan: links" && exit 1)

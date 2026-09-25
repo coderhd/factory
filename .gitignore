@@ -1,0 +1,5 @@
+node_modules/
+.opencode/plugins/*/node_modules/
+.factory/evidence.log
+../worktrees/
+.superpowers/
