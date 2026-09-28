@@ -42,7 +42,10 @@ def map_response(pack, response):
     try:
         scored = response["behaviors"]
         tdefs = pack["task_definitions"]
-        task = max(tdefs, key=lambda k: scored[k]["present"])
+        ranked = sorted(tdefs, key=lambda k: scored[k]["present"], reverse=True)
+        task = ranked[0]
+        conf = scored[task]["present"]
+        margin = conf - scored[ranked[1]]["present"] if len(ranked) > 1 else 1.0
         cdefs = pack["complexity_definitions"]
         complexity = max(cdefs, key=lambda k: scored[k]["present"])
         risk = (
@@ -50,7 +53,13 @@ def map_response(pack, response):
         )
     except (KeyError, TypeError, AttributeError) as e:
         raise ValueError(f"malformed span response: {e}")
-    return {"task": task, "complexity": complexity, "risk": risk}
+    return {
+        "task": task,
+        "complexity": complexity,
+        "risk": risk,
+        "confidence": round(conf, 4),
+        "margin": round(margin, 4),
+    }
 
 
 def fixture_responder(pack):
@@ -329,7 +338,9 @@ def score_report(results, baseline, pack=None):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--split", default="all", choices=["train", "verify", "all"])
+    ap.add_argument(
+        "--split", default="all", choices=["train", "verify", "fresh", "all"]
+    )
     ap.add_argument("--dry-run", action="store_true", default=True)
     ap.add_argument("--live", action="store_true", default=False)
     ap.add_argument("--limit", type=int, default=0)
