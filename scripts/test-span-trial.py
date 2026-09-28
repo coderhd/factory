@@ -11,6 +11,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PACK = ROOT / "scripts" / "span-trial-questions.json"
 
+
+def load_harness():
+    """Import hyphenated scripts/span-trial.py without adding deps."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "span_trial", str(ROOT / "scripts" / "span-trial.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 ALL_16_TASKS = [
     "exploration",
     "repository-analysis",
@@ -90,12 +103,34 @@ def test_selection_rules_pinned(pack):
     check("4 complexity levels", len(pack["complexity_definitions"]) == 4)
 
 
+def test_dry_run_scores_fixture_corpus():
+    mod = load_harness()
+    pack = json.loads(PACK.read_text())
+    cases = mod.load_cases("train")[:3]
+    results = mod.run_trial(cases, mod.fixture_responder(pack), pack)
+    check("dry run scores 3 cases", len(results) == 3, f"got={len(results)}")
+    check("results carry predictions", all("predicted" in r for r in results))
+
+
+def test_malformed_fixture_records_error_not_crash():
+    mod = load_harness()
+    pack = json.loads(PACK.read_text())
+    results = mod.run_trial(
+        [{"id": "bad", "prompt": "x", "expected": {}}],
+        lambda prompt: {"nonsense": True},
+        pack,
+    )
+    check("malformed response records error", results[0].get("error") is not None)
+
+
 if __name__ == "__main__":
     pack = test_pack_exists_and_versioned()
     test_coarse_map_covers_all_tasks(pack)
     test_task_definitions_complete(pack)
     test_pack_prompt_budget(pack)
     test_selection_rules_pinned(pack)
+    test_dry_run_scores_fixture_corpus()
+    test_malformed_fixture_records_error_not_crash()
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILURES")
         sys.exit(1)

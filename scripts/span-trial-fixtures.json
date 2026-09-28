@@ -1,0 +1,223 @@
+[
+ {
+  "behaviors": {
+   "exploration": {
+    "present": 0.9,
+    "absent": 0.05,
+    "not_observable": 0.05
+   },
+   "repository-analysis": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "planning": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "architecture": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "implementation": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "refactoring": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "debugging": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "test-generation": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "test-debugging": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "ci-troubleshooting": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "documentation": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "code-review": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "security-review": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "adversarial-review": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "second-opinion": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "large-context-analysis": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "trivial": {
+    "present": 0.1,
+    "absent": 0.85,
+    "not_observable": 0.05
+   },
+   "simple": {
+    "present": 0.1,
+    "absent": 0.85,
+    "not_observable": 0.05
+   },
+   "normal": {
+    "present": 0.85,
+    "absent": 0.1,
+    "not_observable": 0.05
+   },
+   "complex": {
+    "present": 0.1,
+    "absent": 0.85,
+    "not_observable": 0.05
+   },
+   "__risk__": {
+    "present": 0.1,
+    "absent": 0.85,
+    "not_observable": 0.05
+   }
+  }
+ },
+ {
+  "behaviors": {
+   "exploration": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "repository-analysis": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "planning": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "architecture": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "implementation": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "refactoring": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "debugging": {
+    "present": 0.9,
+    "absent": 0.05,
+    "not_observable": 0.05
+   },
+   "test-generation": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "test-debugging": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "ci-troubleshooting": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "documentation": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "code-review": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "security-review": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "adversarial-review": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "second-opinion": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "large-context-analysis": {
+    "present": 0.05,
+    "absent": 0.9,
+    "not_observable": 0.05
+   },
+   "trivial": {
+    "present": 0.1,
+    "absent": 0.85,
+    "not_observable": 0.05
+   },
+   "simple": {
+    "present": 0.1,
+    "absent": 0.85,
+    "not_observable": 0.05
+   },
+   "normal": {
+    "present": 0.1,
+    "absent": 0.85,
+    "not_observable": 0.05
+   },
+   "complex": {
+    "present": 0.85,
+    "absent": 0.1,
+    "not_observable": 0.05
+   },
+   "__risk__": {
+    "present": 0.8,
+    "absent": 0.15,
+    "not_observable": 0.05
+   }
+  }
+ },
+ {
+  "nonsense": true
+ }
+]
