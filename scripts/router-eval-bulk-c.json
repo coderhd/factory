@@ -1,0 +1,590 @@
+[
+  {
+    "id": "bulk-debug-01",
+    "prompt": "Debug the login redirect loop",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-02",
+    "prompt": "The checkout crashes on submit",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-debug-03",
+    "prompt": "Users report a bug in search",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-04",
+    "prompt": "The build is broken on main",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-05",
+    "prompt": "It broke right after the deploy",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-06",
+    "prompt": "The service breaks under load",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-07",
+    "prompt": "There is a defect in the tax calc",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-debug-08",
+    "prompt": "Investigate the spike in errors",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-09",
+    "prompt": "Trace the timeout through the gateway",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-10",
+    "prompt": "The worker crashes and restarts",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-11",
+    "prompt": "Repro the leak with a script",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-12",
+    "prompt": "Stack trace from the auth service",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-debug-13",
+    "prompt": "Traceback in the billing job",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-14",
+    "prompt": "The app is flaky on weekends",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-15",
+    "prompt": "Debug the failing checkout test",
+    "expected": {
+      "task": "test-debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-16",
+    "prompt": "Unit tests fail on the CI image",
+    "expected": {
+      "task": "test-debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-17",
+    "prompt": "The spec suite fails randomly",
+    "expected": {
+      "task": "test-debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-18",
+    "prompt": "Debug why the tests fail in staging",
+    "expected": {
+      "task": "test-debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-19",
+    "prompt": "CI fails on the lint step",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "ci-fail without test word stays debugging, not ci-troubleshooting",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-20",
+    "prompt": "The pipeline fails at the docker stage",
+    "expected": {
+      "task": "ci-troubleshooting",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-21",
+    "prompt": "GitHub action fails on windows",
+    "expected": {
+      "task": "ci-troubleshooting",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-22",
+    "prompt": "The nightly workflow fails to publish",
+    "expected": {
+      "task": "ci-troubleshooting",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-debug-23",
+    "prompt": "Debug the production outage now",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-24",
+    "prompt": "Auth tokens expire too early, debug why",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-debug-25",
+    "prompt": "Debug why webhooks duplicate",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-26",
+    "prompt": "The cache returns stale data, investigate",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-27",
+    "prompt": "Crash on logout for expired sessions",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-28",
+    "prompt": "Broken pipe in the export stream",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-29",
+    "prompt": "Defect: totals mismatch on refunds",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-debug-30",
+    "prompt": "Bizarre failure, no logs at all",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "bare failure needs fails-word rule; FAILED pre-fix",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-31",
+    "prompt": "The build failed on the release branch",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "FAILED pre-fix",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-32",
+    "prompt": "Tests fail after the dependency upgrade",
+    "expected": {
+      "task": "test-debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-debug-33",
+    "prompt": "The payment webhook fails silently",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-34",
+    "prompt": "Auth callback fails with 500",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-35",
+    "prompt": "Flaky test in the billing suite",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "flaky without fail-word stays debugging",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-debug-36",
+    "prompt": "Debug the deadlock in the queue",
+    "expected": {
+      "task": "debugging",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-37",
+    "prompt": "Complex race between two writers",
+    "expected": {
+      "task": "implementation",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "race is complexity-only; no debug verb present",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-38",
+    "prompt": "Crash loop in the staging pod",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-39",
+    "prompt": "Investigate high memory in prod",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-40",
+    "prompt": "Broken auth redirect after upgrade",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-41",
+    "prompt": "Debug the slow query with the DBA",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-debug-42",
+    "prompt": "The on-call is debugging latency",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-43",
+    "prompt": "Debug the stuck deploy",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-44",
+    "prompt": "Debug a broken pipe in the importer",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-45",
+    "prompt": "Why do requests hang after deploy",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "question shape wins; add a debug verb to route debugging",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-46",
+    "prompt": "How do I debug a deadlock",
+    "expected": {
+      "task": "debugging",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "debug verb beats question shape (rule order)",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-47",
+    "prompt": "What is the stack trace saying",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "stack trace beats question shape",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-debug-48",
+    "prompt": "Show me how to read a core dump",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "no debug-family word; show-me wins",
+    "split": "train"
+  },
+  {
+    "id": "bulk-debug-49",
+    "prompt": "Find the broken link in the docs",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "broken beats later docs rule",
+    "split": "train"
+  }
+]

@@ -1,0 +1,446 @@
+[
+  {
+    "id": "explore-where",
+    "prompt": "Where is the auth logic implemented?",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "auth forces risk high by rule; harmless in exploration (all candidates cheap)",
+    "split": "train"
+  },
+  {
+    "id": "explore-list",
+    "prompt": "List all API endpoints in the server",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "api keyword forces risk medium; harmless for exploration routing",
+    "split": "train"
+  },
+  {
+    "id": "explore-explain",
+    "prompt": "Explain how the payment flow works",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "payment forces risk high",
+    "split": "train"
+  },
+  {
+    "id": "explore-search",
+    "prompt": "Search the codebase for the session cache",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "search matches before codebase rule; same family",
+    "split": "train"
+  },
+  {
+    "id": "repo-map",
+    "prompt": "Map the codebase structure for onboarding",
+    "expected": {
+      "task": "repository-analysis",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "codebase keyword",
+    "split": "train"
+  },
+  {
+    "id": "repo-whole",
+    "prompt": "Read the whole repo and summarize the architecture",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "xlarge"
+    },
+    "note": "read/summar win over large-context task rule; context carries the weight",
+    "split": "train"
+  },
+  {
+    "id": "plan-spec",
+    "prompt": "Write a spec for the billing migration",
+    "expected": {
+      "task": "planning",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "spec keyword; billing+migration force high risk",
+    "split": "train"
+  },
+  {
+    "id": "arch-adr",
+    "prompt": "Create an ADR for the worker execution model",
+    "expected": {
+      "task": "architecture",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "adr keyword",
+    "split": "verify"
+  },
+  {
+    "id": "arch-review-doc",
+    "prompt": "Review the architecture design doc",
+    "expected": {
+      "task": "architecture",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "code-review rule is narrow (pr/diff/change); design wins",
+    "split": "train"
+  },
+  {
+    "id": "review-pr",
+    "prompt": "Review this PR diff for the auth change",
+    "expected": {
+      "task": "code-review",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "pr diff + auth => high-risk review path",
+    "split": "train"
+  },
+  {
+    "id": "impl-login",
+    "prompt": "Implement the login endpoint",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "default task",
+    "split": "verify"
+  },
+  {
+    "id": "docs-typo",
+    "prompt": "Quick typo fix in the readme",
+    "expected": {
+      "task": "documentation",
+      "complexity": "trivial",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "readme + typo",
+    "split": "train"
+  },
+  {
+    "id": "refactor-cache",
+    "prompt": "Refactor the session cache module",
+    "expected": {
+      "task": "refactoring",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "refactor-migrate",
+    "prompt": "Migrate the database schema to v3",
+    "expected": {
+      "task": "refactoring",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "migration work is high-risk; migrat-verb now fires high (changed 2026-09-28)",
+    "split": "train"
+  },
+  {
+    "id": "debug-failing",
+    "prompt": "Debug the failing test in the auth suite",
+    "expected": {
+      "task": "test-debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "failing test + auth",
+    "split": "train"
+  },
+  {
+    "id": "debug-trace",
+    "prompt": "Explain this stack trace from prod",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "stack trace beats explain; prod forces high risk",
+    "split": "verify"
+  },
+  {
+    "id": "debug-bug",
+    "prompt": "Find the bug in the checkout flow",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "bug keyword; FAILED pre-fix (was exploration)",
+    "split": "train"
+  },
+  {
+    "id": "debug-crash",
+    "prompt": "The app crashes on startup after the upgrade",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "crash keyword; FAILED pre-fix (was implementation)",
+    "split": "train"
+  },
+  {
+    "id": "ci-pipeline",
+    "prompt": "CI pipeline failed on the lint job",
+    "expected": {
+      "task": "ci-troubleshooting",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "pipeline fail",
+    "split": "train"
+  },
+  {
+    "id": "testgen-unit",
+    "prompt": "Generate unit tests for the router module",
+    "expected": {
+      "task": "test-generation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "docs-update",
+    "prompt": "Update the docs for the new config options",
+    "expected": {
+      "task": "documentation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "docs keyword; FAILED pre-fix (was implementation)",
+    "split": "verify"
+  },
+  {
+    "id": "docs-changelog",
+    "prompt": "Add a changelog entry for v0.3",
+    "expected": {
+      "task": "documentation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "adv-break",
+    "prompt": "Try to break this payment flow",
+    "expected": {
+      "task": "adversarial-review",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "adversarial first in chain; payment forces high",
+    "split": "train"
+  },
+  {
+    "id": "sec-xss",
+    "prompt": "Check for XSS in the login form",
+    "expected": {
+      "task": "security-review",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "opinion-cache",
+    "prompt": "Give me a second opinion on this caching approach",
+    "expected": {
+      "task": "second-opinion",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "plan-review-doc",
+    "prompt": "Review the plan document before we commit",
+    "expected": {
+      "task": "planning",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "plan is not pr/diff/change; planning wins",
+    "split": "train"
+  },
+  {
+    "id": "impl-then-review",
+    "prompt": "Implement the endpoint then review the diff",
+    "expected": {
+      "task": "code-review",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "KNOWN LIMITATION: first-match picks review; split into two tasks or use hints",
+    "split": "train"
+  },
+  {
+    "id": "refactor-rename",
+    "prompt": "Simple rename of the config flag",
+    "expected": {
+      "task": "refactoring",
+      "complexity": "simple",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "rename + simple",
+    "split": "verify"
+  },
+  {
+    "id": "impl-race",
+    "prompt": "Complex distributed lock with possible race conditions",
+    "expected": {
+      "task": "implementation",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "complexity keywords; default task",
+    "split": "train"
+  },
+  {
+    "id": "hint-deep",
+    "prompt": "@deep review the payment flow",
+    "expected": {
+      "task": "code-review",
+      "complexity": "complex",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "hint forces complex/high; payment also high",
+    "split": "verify"
+  },
+  {
+    "id": "hint-plan",
+    "prompt": "@plan the worker rollout",
+    "expected": {
+      "task": "planning",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "hint overrides task+complexity",
+    "split": "train"
+  },
+  {
+    "id": "explore-entire",
+    "prompt": "Read the entire codebase to find dead code",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "xlarge"
+    },
+    "note": "read wins as task; entire codebase sets xlarge",
+    "split": "train"
+  },
+  {
+    "id": "audit-pii",
+    "prompt": "Audit the production deploy pipeline for PII leaks",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "KNOWN LIMITATION: audit is not a security keyword; risk high is the only signal. Split or use @deep for adversarial handling",
+    "split": "train"
+  },
+  {
+    "id": "debug-repro",
+    "prompt": "Write a test that reproduces the crash",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "repro/crash are debugging work, not test generation",
+    "split": "train"
+  },
+  {
+    "id": "debug-flaky",
+    "prompt": "Fix the flaky test in CI",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "flaky without fail => debugging, not test-debugging",
+    "split": "train"
+  },
+  {
+    "id": "docs-contract",
+    "prompt": "Document the API contract changes",
+    "expected": {
+      "task": "documentation",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "api/contract force medium risk",
+    "split": "train"
+  },
+  {
+    "id": "explore-large",
+    "prompt": "Summarize this large log file",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "large"
+    },
+    "note": "summar wins as task; large sets context (deepseek-first exploration)",
+    "split": "verify"
+  }
+]

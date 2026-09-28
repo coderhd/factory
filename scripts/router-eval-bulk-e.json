@@ -1,0 +1,1250 @@
+[
+    {
+        "id": "bulk-ref-01",
+        "prompt": "Refactor the session handler",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-02",
+        "prompt": "Clean up the date utils",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-03",
+        "prompt": "Migrate the cache to redis",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "migrate-verb fires high; FAILED pre-fix (was low)",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-ref-04",
+        "prompt": "Rename the config keys",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-05",
+        "prompt": "Refactor the auth login flow",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-06",
+        "prompt": "Clean up dead code in billing",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-07",
+        "prompt": "Migrate user data with zero downtime",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-08",
+        "prompt": "Rename the API client",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-ref-09",
+        "prompt": "Refactor across several modules",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": " [corrected 2026-09-28 triage]",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-10",
+        "prompt": "Clean up the full legacy file",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "large"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-11",
+        "prompt": "Simple rename of the helper",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "simple",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-12",
+        "prompt": "Complex refactor of the payment state machine",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "complex",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-13",
+        "prompt": "Trivial cleanup of whitespace",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "trivial",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-ref-14",
+        "prompt": "Migrate the database with backups",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-15",
+        "prompt": "Rename variables for clarity",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-16",
+        "prompt": "Clean up the test helpers",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "no test-gen phrase present",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-17",
+        "prompt": "Refactor the webhook handler for retries",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-18",
+        "prompt": "Migrate the docs site to the new theme",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "refactor precedes docs in chain [corrected 2026-09-28 triage]",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-ref-19",
+        "prompt": "Rename the prod flag",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ref-20",
+        "prompt": "@cheap clean up the logs",
+        "expected": {
+            "task": "exploration",
+            "complexity": "trivial",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-01",
+        "prompt": "Second opinion on the caching plan",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "second-opinion precedes planning",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-02",
+        "prompt": "Give me a second opinion on auth",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-03",
+        "prompt": "Sanity check this against the other approach",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-op-04",
+        "prompt": "Independent opinion on the data model",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-05",
+        "prompt": "Second opinion: production deploy strategy",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-06",
+        "prompt": "Sanity-check the migration independently",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-07",
+        "prompt": "Second opinion on the complex refactor",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "complex",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-08",
+        "prompt": "Quick second opinion on the diff",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "simple",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-op-09",
+        "prompt": "Second opinion for the security review",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "second-opinion precedes security; a consult on a review is a consult",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-10",
+        "prompt": "Second opinion on the test plan",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "second-opinion precedes planning",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-11",
+        "prompt": "Independent review of the outage",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "independent-review; FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-12",
+        "prompt": "An independent take on the delay",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-13",
+        "prompt": "Second opinion on docs wording",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "second-opinion precedes docs",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-14",
+        "prompt": "Second opinion: should we migrate",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-op-15",
+        "prompt": "Second opinion on the long thread",
+        "expected": {
+            "task": "second-opinion",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "large"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-op-16",
+        "prompt": "Sanity check my logic here",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "sanity-check needs a comparator word",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-01",
+        "prompt": "Audit auth for vulns",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-02",
+        "prompt": "Fix the XSS in comments",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-sec-03",
+        "prompt": "CVE-2026-1234 affects our parser",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-04",
+        "prompt": "Is this an auth bypass",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-05",
+        "prompt": "Sanitize the SQL injection vector",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-06",
+        "prompt": "Review the auth bypass test",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "security precedes code-review",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-07",
+        "prompt": "Check for prompt injection in the agent",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-sec-08",
+        "prompt": "Harden the login against brute force",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "harden keyword; FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-09",
+        "prompt": "Rotate secrets after the incident",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "rotation is ops execution, not a security finding",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-10",
+        "prompt": "Threat model the new SSO flow",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-11",
+        "prompt": "Pen test the checkout API",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-12",
+        "prompt": "Security review of the payment flow",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-13",
+        "prompt": "Scan dependencies for CVEs",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-sec-14",
+        "prompt": "Fix the auth bypass in staging",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-15",
+        "prompt": "Harden the upload endpoint",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-sec-16",
+        "prompt": "Review the threat model",
+        "expected": {
+            "task": "security-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "security precedes code-review",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-01",
+        "prompt": "CI pipeline is red",
+        "expected": {
+            "task": "ci-troubleshooting",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "is-red pattern; FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-02",
+        "prompt": "Pipeline failure in the build job",
+        "expected": {
+            "task": "ci-troubleshooting",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-03",
+        "prompt": "GitHub Actions is down",
+        "expected": {
+            "task": "ci-troubleshooting",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-04",
+        "prompt": "The deploy workflow is stuck",
+        "expected": {
+            "task": "ci-troubleshooting",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "is-stuck pattern; FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-05",
+        "prompt": "CI/CD config for the monorepo",
+        "expected": {
+            "task": "ci-troubleshooting",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-ci-06",
+        "prompt": "Cache the pipeline dependencies",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "no fail/status word; add one to route CI",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-07",
+        "prompt": "Debug the pipeline failure",
+        "expected": {
+            "task": "ci-troubleshooting",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "CI rule precedes debugging after reorder",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-08",
+        "prompt": "Fix the broken CI build",
+        "expected": {
+            "task": "debugging",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "no CI pattern matched; broken wins; same model pool either way",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-09",
+        "prompt": "Why is CI so slow",
+        "expected": {
+            "task": "exploration",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "question shape wins; slowness is not failure",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-10",
+        "prompt": "The workflow needs approval",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "no fail word present",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-11",
+        "prompt": "Pipeline success notification",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "success is not failure",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-12",
+        "prompt": "Migrate the pipeline to v2 runners",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "migrate wins; CI-flavored refactor [corrected 2026-09-28 triage]",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-13",
+        "prompt": "Review the workflow file",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "file noun matches",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-14",
+        "prompt": "@debug the flaky pipeline",
+        "expected": {
+            "task": "debugging",
+            "complexity": "complex",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "no fail word for CI rule; flaky fires",
+        "split": "train"
+    },
+    {
+        "id": "bulk-ci-15",
+        "prompt": "Pipeline went red after the merge",
+        "expected": {
+            "task": "ci-troubleshooting",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-adv-01",
+        "prompt": "Try to break the login rate limiter",
+        "expected": {
+            "task": "adversarial-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-adv-02",
+        "prompt": "Red team the password reset",
+        "expected": {
+            "task": "adversarial-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-adv-03",
+        "prompt": "Attempt to bypass the paywall",
+        "expected": {
+            "task": "adversarial-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "bypass keyword; FAILED pre-fix",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-adv-04",
+        "prompt": "Add a cache bypass header",
+        "expected": {
+            "task": "adversarial-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "documented edge: feature-sense bypass still matches; prefer skip-list wording",
+        "split": "train"
+    },
+    {
+        "id": "bulk-adv-05",
+        "prompt": "Try to break the refund flow",
+        "expected": {
+            "task": "adversarial-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-adv-06",
+        "prompt": "Red-team the session handling",
+        "expected": {
+            "task": "adversarial-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-adv-07",
+        "prompt": "Try to break prod auth",
+        "expected": {
+            "task": "adversarial-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-adv-08",
+        "prompt": "Fuzz the upload parser",
+        "expected": {
+            "task": "adversarial-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "FAILED pre-fix",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-adv-09",
+        "prompt": "Attempted break-in via the API",
+        "expected": {
+            "task": "adversarial-review",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-adv-10",
+        "prompt": "Probe the rate limits for holes",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "probe is not a keyword; use try-to-break phrasing",
+        "split": "train"
+    },
+    {
+        "id": "bulk-adv-11",
+        "prompt": "Try to break the caching layer",
+        "expected": {
+            "task": "adversarial-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-adv-12",
+        "prompt": "Red team the signup with fake accounts",
+        "expected": {
+            "task": "adversarial-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-repo-01",
+        "prompt": "Map out the codebase for onboarding",
+        "expected": {
+            "task": "repository-analysis",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-repo-02",
+        "prompt": "Audit the codebase structure for dead code",
+        "expected": {
+            "task": "repository-analysis",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-repo-03",
+        "prompt": "Analyze the codebase for tech debt",
+        "expected": {
+            "task": "repository-analysis",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-repo-04",
+        "prompt": "Repo-wide analysis of the auth module",
+        "expected": {
+            "task": "repository-analysis",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-repo-05",
+        "prompt": "Survey the codebase layout",
+        "expected": {
+            "task": "repository-analysis",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-repo-06",
+        "prompt": "Tour the codebase for new hires",
+        "expected": {
+            "task": "repository-analysis",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-repo-07",
+        "prompt": "Assess the codebase test coverage",
+        "expected": {
+            "task": "repository-analysis",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "assess has no test-gen phrase without add/write/generate",
+        "split": "train"
+    },
+    {
+        "id": "bulk-repo-08",
+        "prompt": "Repo module graph mapping",
+        "expected": {
+            "task": "repository-analysis",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "repo-first phrasing with map after",
+        "split": "train"
+    },
+    {
+        "id": "bulk-repo-09",
+        "prompt": "Codebase overview for the audit",
+        "expected": {
+            "task": "repository-analysis",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-repo-10",
+        "prompt": "Give a codebase tour to the team",
+        "expected": {
+            "task": "repository-analysis",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-repo-11",
+        "prompt": "Catalog the modules in the codebase",
+        "expected": {
+            "task": "repository-analysis",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-01",
+        "prompt": "Debug the failing login test",
+        "expected": {
+            "task": "test-debugging",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-02",
+        "prompt": "The payment test fails on retry",
+        "expected": {
+            "task": "test-debugging",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-03",
+        "prompt": "Spec failures in the auth suite",
+        "expected": {
+            "task": "test-debugging",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-04",
+        "prompt": "Failing tests block the release",
+        "expected": {
+            "task": "test-debugging",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-05",
+        "prompt": "Debug the red suite",
+        "expected": {
+            "task": "ci-troubleshooting",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "red-suite matches CI rule first; same model pool either way",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-06",
+        "prompt": "The auth tests fail intermittently",
+        "expected": {
+            "task": "test-debugging",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-tdb-07",
+        "prompt": "Debug the flaky payment test",
+        "expected": {
+            "task": "debugging",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "flaky without fail-word stays debugging",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-08",
+        "prompt": "Failing spec for the refund flow",
+        "expected": {
+            "task": "test-debugging",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "RSpec reading wins: failing spec is a failing test",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-09",
+        "prompt": "Tests fail in the billing container",
+        "expected": {
+            "task": "test-debugging",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-10",
+        "prompt": "Debug the failing API contract test",
+        "expected": {
+            "task": "test-debugging",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-11",
+        "prompt": "The red build blocks merging",
+        "expected": {
+            "task": "ci-troubleshooting",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-12",
+        "prompt": "Debug test pollution between suites",
+        "expected": {
+            "task": "debugging",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "bare test is not a test-debugging signal",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-13",
+        "prompt": "Fix the failing security test",
+        "expected": {
+            "task": "test-debugging",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-tdb-14",
+        "prompt": "@debug the failing deploy test",
+        "expected": {
+            "task": "debugging",
+            "complexity": "complex",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "hint task wins over test-debugging",
+        "split": "verify"
+    }
+]

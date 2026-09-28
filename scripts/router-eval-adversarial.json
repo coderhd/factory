@@ -1,0 +1,603 @@
+[
+  {
+    "id": "adv-author",
+    "prompt": "The author of this commit is unknown",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "author must not fire auth",
+    "split": "train"
+  },
+  {
+    "id": "adv-rapid",
+    "prompt": "We need rapid prototyping for the demo",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "rapid must not fire api",
+    "split": "verify"
+  },
+  {
+    "id": "adv-product",
+    "prompt": "Update the product roadmap for Q4",
+    "expected": {
+      "task": "planning",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "product must not fire prod; roadmap fires planning",
+    "split": "train"
+  },
+  {
+    "id": "adv-specific",
+    "prompt": "Read the specific error message carefully",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "specific must not fire spec",
+    "split": "verify"
+  },
+  {
+    "id": "adv-inspect",
+    "prompt": "Inspect the output of the build",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "inspect must not fire spec",
+    "split": "train"
+  },
+  {
+    "id": "adv-deployed",
+    "prompt": "I already deployed the fix yesterday",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "already must not fire read; deployed fires high risk",
+    "split": "train"
+  },
+  {
+    "id": "adv-longer",
+    "prompt": "The test no longer passes on main",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "longer must not fire long context",
+    "split": "verify"
+  },
+  {
+    "id": "adv-hardcoded",
+    "prompt": "Handle the hardcoded token in config",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "hardcoded must not fire hard/complex",
+    "split": "train"
+  },
+  {
+    "id": "adv-races",
+    "prompt": "Fix the races in the worker pool",
+    "expected": {
+      "task": "implementation",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "races fires complex, no task keyword",
+    "split": "train"
+  },
+  {
+    "id": "adv-minor",
+    "prompt": "Minor cleanup of dead code",
+    "expected": {
+      "task": "refactoring",
+      "complexity": "simple",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "adv-findings",
+    "prompt": "List the findings from the audit",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "audit is not a security keyword (documented limitation)",
+    "split": "train"
+  },
+  {
+    "id": "adv-repro-steps",
+    "prompt": "Summarize the reproduction steps",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "reproduction must not fire prod",
+    "split": "train"
+  },
+  {
+    "id": "adv-authn",
+    "prompt": "Explain authentication vs authorization",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "authentication fires high risk",
+    "split": "train"
+  },
+  {
+    "id": "adv-planet",
+    "prompt": "Check the planet-scale cache design",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "planet must not fire plan",
+    "split": "train"
+  },
+  {
+    "id": "adv-datamodel",
+    "prompt": "Review the data model for v2",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "model is not in the review noun list; data model fires medium risk (narrow rule is intentional)",
+    "split": "train"
+  },
+  {
+    "id": "adv-impl-test",
+    "prompt": "Implement the endpoint and add unit tests",
+    "expected": {
+      "task": "test-generation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "unit-tests phrase wins over default implementation; both route cheap",
+    "split": "train"
+  },
+  {
+    "id": "adv-debug-doc",
+    "prompt": "Debug the crash and document the fix",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "debugging precedes documentation in chain",
+    "split": "train"
+  },
+  {
+    "id": "adv-plan-impl",
+    "prompt": "Plan the sprint then implement the top ticket",
+    "expected": {
+      "task": "planning",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "plan wins by chain order",
+    "split": "train"
+  },
+  {
+    "id": "adv-refactor-review",
+    "prompt": "Refactor the auth module and review the diff",
+    "expected": {
+      "task": "code-review",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "review-the-diff wins over refactor by chain order; auth fires high",
+    "split": "train"
+  },
+  {
+    "id": "adv-docs-tests",
+    "prompt": "Write docs and generate tests for the cache",
+    "expected": {
+      "task": "test-generation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "generate-tests precedes docs in chain; both route cheap",
+    "split": "train"
+  },
+  {
+    "id": "adv-negation",
+    "prompt": "This is not a security issue, just a typo",
+    "expected": {
+      "task": "implementation",
+      "complexity": "trivial",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "negation blindness: keywords ignore not/no/dont. Needs semantic judgment; out of scope for regex v1",
+    "status": "known-limitation",
+    "split": "train"
+  },
+  {
+    "id": "adv-no-tests",
+    "prompt": "No tests needed, just fix the typo",
+    "expected": {
+      "task": "implementation",
+      "complexity": "trivial",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "tests-needed is not a test-gen phrase; narrow rule saves us here",
+    "split": "train"
+  },
+  {
+    "id": "adv-dont-review",
+    "prompt": "Don't review this yet, it's a draft implementation",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "review-this-yet has no review noun; narrow rule saves us here",
+    "split": "verify"
+  },
+  {
+    "id": "adv-auth-bypass-q",
+    "prompt": "Is this an auth bypass or expected behavior?",
+    "expected": {
+      "task": "security-review",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "adv-upper",
+    "prompt": "REVIEW THIS PR DIFF NOW",
+    "expected": {
+      "task": "code-review",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "case-insensitive",
+    "split": "verify"
+  },
+  {
+    "id": "adv-mixed-case",
+    "prompt": "Debug THIS Crash Immediately",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "adv-empty",
+    "prompt": "   ",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "must not crash; defaults apply",
+    "split": "train"
+  },
+  {
+    "id": "adv-fix-it",
+    "prompt": "Fix it",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "minimal prompt baseline",
+    "split": "train"
+  },
+  {
+    "id": "adv-two-hints",
+    "prompt": "@review @deep the auth flow",
+    "expected": {
+      "task": "code-review",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "first hint wins; @deep never applies",
+    "split": "train"
+  },
+  {
+    "id": "adv-bad-route",
+    "prompt": "/route unknown-model do the thing",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "unknown override returns null; falls back to auto classification",
+    "split": "train"
+  },
+  {
+    "id": "adv-route-upper",
+    "prompt": "/route QWEN3.8-MAX plan the migration",
+    "expected": {
+      "task": "planning",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "alias lowercased; override wins at plugin layer, classification still recorded",
+    "split": "train"
+  },
+  {
+    "id": "adv-cheap-hint",
+    "prompt": "@cheap explain the outage",
+    "expected": {
+      "task": "exploration",
+      "complexity": "trivial",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "adv-arch-review",
+    "prompt": "Architectural review of the session system",
+    "expected": {
+      "task": "architecture",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "adv-rearchitect",
+    "prompt": "Re-architect the cache layer",
+    "expected": {
+      "task": "architecture",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "adv-propose-arch",
+    "prompt": "Propose a new system architecture",
+    "expected": {
+      "task": "architecture",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "verb-led architecture ask; FAILED pre-fix (was implementation)",
+    "split": "train"
+  },
+  {
+    "id": "adv-adr-record",
+    "prompt": "Write the architecture decision record",
+    "expected": {
+      "task": "architecture",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "adv-breakdown",
+    "prompt": "Break down the epic into tickets",
+    "expected": {
+      "task": "planning",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "break-down is work-breakdown language; FAILED pre-fix (was implementation)",
+    "split": "train"
+  },
+  {
+    "id": "adv-planned",
+    "prompt": "Planned migration for Q3",
+    "expected": {
+      "task": "planning",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "adv-rollout-plan",
+    "prompt": "What is the rollout plan?",
+    "expected": {
+      "task": "planning",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "adv-broken",
+    "prompt": "The build is broken after the merge",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "broken signals a bug; FAILED pre-fix (was implementation). broker must NOT match",
+    "split": "train"
+  },
+  {
+    "id": "adv-defect",
+    "prompt": "There is a defect in the parser",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "defect ~= bug; FAILED pre-fix (was implementation)",
+    "split": "train"
+  },
+  {
+    "id": "adv-investigate",
+    "prompt": "Investigate the outage in prod",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "investigation precedes fixing; FAILED pre-fix (was implementation)",
+    "split": "train"
+  },
+  {
+    "id": "adv-vague",
+    "prompt": "Something is wrong with login",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "too vague to route; default is the honest answer",
+    "split": "train"
+  },
+  {
+    "id": "adv-trace-req",
+    "prompt": "Trace the request through the gateway",
+    "expected": {
+      "task": "debugging",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "bare trace is debugging work; FAILED pre-fix (was implementation)",
+    "split": "train"
+  },
+  {
+    "id": "adv-review-func",
+    "prompt": "Review my function for edge cases",
+    "expected": {
+      "task": "code-review",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "adv-eval-risk",
+    "prompt": "Is eval a security risk in this codebase?",
+    "expected": {
+      "task": "security-review",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "adv-redteam",
+    "prompt": "Red team the signup flow",
+    "expected": {
+      "task": "adversarial-review",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "adv-sanity",
+    "prompt": "Sanity-check this with an independent lens",
+    "expected": {
+      "task": "second-opinion",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "hyphenated sanity-check; FAILED pre-fix (was implementation)",
+    "split": "train"
+  },
+  {
+    "id": "adv-lgtm",
+    "prompt": "LGTM the diff",
+    "expected": {
+      "task": "code-review",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "approval is a review action; FAILED pre-fix (was implementation)",
+    "split": "train"
+  },
+  {
+    "id": "adv-second-op",
+    "prompt": "Second opinion: is this over-engineered?",
+    "expected": {
+      "task": "second-opinion",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  }
+]

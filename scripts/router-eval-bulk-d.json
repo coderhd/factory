@@ -1,0 +1,1574 @@
+[
+    {
+        "id": "bulk-plan-01",
+        "prompt": "Plan the sprint backlog",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-02",
+        "prompt": "Write the launch spec",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-03",
+        "prompt": "Update the hiring roadmap",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-plan-04",
+        "prompt": "Decompose the epic into stories",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-05",
+        "prompt": "Break down the release into phases",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-06",
+        "prompt": "Draft the work breakdown for Q3",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-07",
+        "prompt": "Review the roadmap with the team",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "roadmap is not a review noun",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-08",
+        "prompt": "Read the plan before kickoff",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "planning rule precedes exploration",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-plan-09",
+        "prompt": "Plan the debugging session for Friday",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "planning precedes debugging in chain",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-10",
+        "prompt": "Spec out the auth migration",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-11",
+        "prompt": "Plan the production deploy freeze",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-12",
+        "prompt": "Roadmap the billing overhaul",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-13",
+        "prompt": "Planned refactor of the cache layer",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "planning precedes refactoring",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-plan-14",
+        "prompt": "Break down the payment integration",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-15",
+        "prompt": "What is the delivery plan",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "plan-word beats question-word (rule order)",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-16",
+        "prompt": "Design the rollout phases",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "bare design without doc/decision/system stays implementation by design",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-17",
+        "prompt": "Plan the team offsite",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-18",
+        "prompt": "Spec the rate limits for v2",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-19",
+        "prompt": "Decompose the payment migration",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-plan-20",
+        "prompt": "Break down the auth epic",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-21",
+        "prompt": "Work breakdown for the docs overhaul",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-22",
+        "prompt": "Roadmap planning for next half",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-23",
+        "prompt": "Plan the incident review meeting",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "incident review is not a review-noun shape",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-24",
+        "prompt": "Draft the migration runbook",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "runbook is not a plan-word; add spec to route planning",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-25",
+        "prompt": "Plan the on-call rotation",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-plan-26",
+        "prompt": "Spec the webhook retries",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-27",
+        "prompt": "Break down the refactor week",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-28",
+        "prompt": "Decompose the launch checklist",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-29",
+        "prompt": "Plan the security audit",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-30",
+        "prompt": "Roadmap the API deprecations",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-plan-31",
+        "prompt": "Plan the database cutover",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-32",
+        "prompt": "Spec the contract changes",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-33",
+        "prompt": "Break down the schema migration",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-plan-34",
+        "prompt": "@plan the holiday freeze",
+        "expected": {
+            "task": "planning",
+            "complexity": "complex",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-01",
+        "prompt": "Review this PR before merge",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-02",
+        "prompt": "Review the diff for the hotfix",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-03",
+        "prompt": "Review our module for leaks",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-04",
+        "prompt": "Review my endpoint for auth gaps",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-rev-05",
+        "prompt": "Review the code for style",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-06",
+        "prompt": "Review the function logic",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-07",
+        "prompt": "PR review for the release",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-08",
+        "prompt": "Code review the payment handler",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-09",
+        "prompt": "LGTM the auth change",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-rev-10",
+        "prompt": "Review the flow for dead ends",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-11",
+        "prompt": "Review the changes to billing",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-12",
+        "prompt": "Review the diffs in the security patch",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-13",
+        "prompt": "Review the production deploy script",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "script noun; FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-14",
+        "prompt": "Review the config file",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "file noun; FAILED pre-fix",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-rev-15",
+        "prompt": "Review the last commit",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "commit noun; FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-16",
+        "prompt": "Review the security patch",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "patch noun; FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-17",
+        "prompt": "Review the feature branch",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "branch noun; FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-18",
+        "prompt": "Review the deploy script",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-19",
+        "prompt": "Review the auth module for PII leaks",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-rev-20",
+        "prompt": "Review the payment diff carefully",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-21",
+        "prompt": "Review the billing module",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-22",
+        "prompt": "Review the production migration",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "migration is not a review noun; add a review noun to route review",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-23",
+        "prompt": "Review the schema change",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-24",
+        "prompt": "Review the breaking API diff",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-25",
+        "prompt": "Review the database migration script",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "migration fires high over database medium",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-rev-26",
+        "prompt": "Review the docs update",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "docs is not a review noun; reviewing docs is docs work",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-27",
+        "prompt": "Review the readme changes",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "changes noun wins; peer review of a diff",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-28",
+        "prompt": "Review the test file",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "test as middle word stays review-safe",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-29",
+        "prompt": "Review the multi-file refactor",
+        "expected": {
+            "task": "refactoring",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "medium"
+        },
+        "note": "no review noun matched; refactor keyword wins",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-30",
+        "prompt": "@review the checkout flow",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-31",
+        "prompt": "Review the error handling",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "handling is not a review noun; use a review noun",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-rev-32",
+        "prompt": "Review the caching layer",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "layer is not a review noun",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-33",
+        "prompt": "Review the auth flow for the audit",
+        "expected": {
+            "task": "code-review",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-rev-34",
+        "prompt": "Review the rollout checklist",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "checklist is not a review noun",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-01",
+        "prompt": "Draft the architecture proposal",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "FAILED pre-fix (verb-led architecture)",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-02",
+        "prompt": "Define the service boundaries",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "no architecture word; add it or write an ADR to route architecture",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-03",
+        "prompt": "Create an architecture decision record",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-04",
+        "prompt": "Propose the data architecture",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-05",
+        "prompt": "Design the database schema",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "bare design stays implementation by design",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-arch-06",
+        "prompt": "Architect the new billing service",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "architect verb; FAILED pre-fix",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-arch-07",
+        "prompt": "Re-architect the session layer",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-08",
+        "prompt": "Architecture review for the payments platform",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-09",
+        "prompt": "ADR for the caching strategy",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-10",
+        "prompt": "Design doc for the new queue",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-11",
+        "prompt": "Review the architecture",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "review-arch capture; FAILED pre-fix",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-arch-12",
+        "prompt": "Review the system architecture",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "FAILED pre-fix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-13",
+        "prompt": "Evaluate architecture options for storage",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "options is not an architecture word",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-14",
+        "prompt": "Compare database options for the ledger",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-15",
+        "prompt": "Plan the architecture migration",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "plan wins over architecture-less migration phrasing",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-16",
+        "prompt": "Design decision: REST vs gRPC",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-17",
+        "prompt": "System design for the notifier",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "reversed order misses the design-doc pattern",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-18",
+        "prompt": "Architect the auth migration",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-19",
+        "prompt": "Technical design review next week",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "review without determiner-noun shape",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-20",
+        "prompt": "Write the technical design document",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "doc prefixes document",
+        "split": "train"
+    },
+    {
+        "id": "bulk-arch-21",
+        "prompt": "Draft the rollout architecture",
+        "expected": {
+            "task": "architecture",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-arch-22",
+        "prompt": "Architecture principles for the team",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "principles is not an architecture word",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-arch-23",
+        "prompt": "@architecture the cache eviction policy",
+        "expected": {
+            "task": "architecture",
+            "complexity": "complex",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-01",
+        "prompt": "Generate tests for the parser",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-02",
+        "prompt": "Write tests for the retry logic",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-03",
+        "prompt": "Add test coverage for the auth module",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-test-04",
+        "prompt": "Write a unit test for the splitter",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-05",
+        "prompt": "Generate unit tests for edge cases",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-06",
+        "prompt": "Add unit tests across several files",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "medium"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-07",
+        "prompt": "Write a quick test for the formatter",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "simple",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-08",
+        "prompt": "Generate tests for the payment flow",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-test-09",
+        "prompt": "Write tests for the migration script",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-10",
+        "prompt": "Add test coverage for the database layer",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-11",
+        "prompt": "Unit test the contract parser",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-12",
+        "prompt": "Test the login flow manually",
+        "expected": {
+            "task": "implementation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "bare test is not a test-gen phrase",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-13",
+        "prompt": "Write a test plan for the release",
+        "expected": {
+            "task": "planning",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "test plan is planning (plan-word beats test-gen order)",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-test-14",
+        "prompt": "Generate tests for the CI pipeline",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "generate-tests prefix matches",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-15",
+        "prompt": "Write tests for the full file parser",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "large"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-test-17",
+        "prompt": "Write simple tests for the validator",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "simple",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "write test prefix",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-18",
+        "prompt": "Generate tests for the API client",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-19",
+        "prompt": "Write tests for prod billing logic",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-20",
+        "prompt": "Add test coverage for race scenarios",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "complex",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-test-21",
+        "prompt": "Unit tests for the multi-file uploader",
+        "expected": {
+            "task": "test-generation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "medium"
+        },
+        "note": "unit test substring",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-doc-01",
+        "prompt": "Document the retry behavior",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-02",
+        "prompt": "Update the docs for the flags",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-03",
+        "prompt": "Write the readme for the SDK",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "readme beats write-test? no test word; documentation wins",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-04",
+        "prompt": "Add a changelog entry",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-05",
+        "prompt": "Add docstrings to the auth module",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-doc-06",
+        "prompt": "Document the API for partners",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-07",
+        "prompt": "Write the migration docs",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "guide alone has no doc keyword",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-08",
+        "prompt": "Simple docs update for the typo",
+        "expected": {
+            "task": "documentation",
+            "complexity": "trivial",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-09",
+        "prompt": "Document the database schema",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-10",
+        "prompt": "Changelog for the security release",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-doc-11",
+        "prompt": "Readme section on production deploys",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-12",
+        "prompt": "JSDoc for the payment helpers",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "jsdoc matches; payment fires high",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-13",
+        "prompt": "Document the full file header policy",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "large"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-14",
+        "prompt": "Write docs for several modules",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": " [corrected 2026-09-28 triage]",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-15",
+        "prompt": "Update the contract documentation",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "medium",
+            "context": "small"
+        },
+        "note": "documentation contains document",
+        "split": "verify"
+    },
+    {
+        "id": "bulk-doc-16",
+        "prompt": "Document the complex merge strategy",
+        "expected": {
+            "task": "documentation",
+            "complexity": "complex",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-17",
+        "prompt": "Explain the docs to the intern",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "docs beats explain (rule order)",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-18",
+        "prompt": "Summarize the readme for the homepage",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "readme beats summar",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-19",
+        "prompt": "List the documented endpoints",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "low",
+            "context": "small"
+        },
+        "note": "documented contains document, beats list",
+        "split": "train"
+    },
+    {
+        "id": "bulk-doc-20",
+        "prompt": "Find the docs on PII handling",
+        "expected": {
+            "task": "documentation",
+            "complexity": "normal",
+            "risk": "high",
+            "context": "small"
+        },
+        "note": "docs beats find",
+        "split": "verify"
+    }
+]

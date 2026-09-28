@@ -1,1 +1,1 @@
-{ "name": "factory-guard", "version": "0.1.0", "type": "module" }
+{"dependencies": {"@opencode/plugin": "latest"}, "exports": {".": "./index.ts"}, "name": "factory-guard", "type": "module", "version": "0.1.0"}

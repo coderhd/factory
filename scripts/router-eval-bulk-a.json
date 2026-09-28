@@ -1,0 +1,914 @@
+[
+  {
+    "id": "bulk-impl-01",
+    "prompt": "Implement the signup endpoint",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-02",
+    "prompt": "Add pagination to user results",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-03",
+    "prompt": "Create the session cookie handler",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-04",
+    "prompt": "Build the CSV export for reports",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-05",
+    "prompt": "Fix the off-by-one in the pager",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-06",
+    "prompt": "Update the retry logic with backoff",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-07",
+    "prompt": "Wire the webhook receiver to the queue",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-08",
+    "prompt": "Integrate the payment provider SDK",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-09",
+    "prompt": "Handle expired tokens on the client",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-10",
+    "prompt": "Support dark mode in settings",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-11",
+    "prompt": "Remove the deprecated feature flag",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-12",
+    "prompt": "Add rate limiting to the API",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-13",
+    "prompt": "Implement OAuth login with PKCE",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-14",
+    "prompt": "Change the default timezone to UTC",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-15",
+    "prompt": "Small fix for the avatar upload",
+    "expected": {
+      "task": "implementation",
+      "complexity": "simple",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-16",
+    "prompt": "Quick patch for the avatar cropper",
+    "expected": {
+      "task": "implementation",
+      "complexity": "simple",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-17",
+    "prompt": "Minor styling tweak on the dashboard",
+    "expected": {
+      "task": "implementation",
+      "complexity": "simple",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-18",
+    "prompt": "Straightforward update of the env var default",
+    "expected": {
+      "task": "implementation",
+      "complexity": "simple",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-19",
+    "prompt": "Complex distributed cache invalidation",
+    "expected": {
+      "task": "implementation",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-20",
+    "prompt": "Ambiguous requirements for the billing report",
+    "expected": {
+      "task": "implementation",
+      "complexity": "complex",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-21",
+    "prompt": "Hard deadline: ship the export today",
+    "expected": {
+      "task": "implementation",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-22",
+    "prompt": "Fix the race in the job runner",
+    "expected": {
+      "task": "implementation",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-23",
+    "prompt": "Resolve the deadlock in the import worker",
+    "expected": {
+      "task": "implementation",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-24",
+    "prompt": "Nondeterministic failure in the seed generator",
+    "expected": {
+      "task": "debugging",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "failure-reporting routes debugging",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-25",
+    "prompt": "Difficult pagination edge with cursor overlap",
+    "expected": {
+      "task": "implementation",
+      "complexity": "complex",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-26",
+    "prompt": "Add the auth middleware to admin routes",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-27",
+    "prompt": "Rotate the signing secrets via the vault",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-28",
+    "prompt": "Deploy the canary to staging",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-29",
+    "prompt": "Touch the production config for the flag",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-30",
+    "prompt": "Move user PII to the new vault",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-31",
+    "prompt": "Update the database indexes for lookup speed",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-32",
+    "prompt": "Change the API contract for checkout",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-33",
+    "prompt": "Handle breaking changes from the provider",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-34",
+    "prompt": "Update the JSON schema for webhooks",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-35",
+    "prompt": "Refine the data model for teams",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-36",
+    "prompt": "Propagate the change across several files",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "medium"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-37",
+    "prompt": "Rewrite the full file for the parser",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "large"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-38",
+    "prompt": "Restructure the directory layout for packages",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "large"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-39",
+    "prompt": "Touch a long function in the renderer",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "large"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-40",
+    "prompt": "Small change in one file",
+    "expected": {
+      "task": "implementation",
+      "complexity": "simple",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-41",
+    "prompt": "One-line fix for the typo in the banner",
+    "expected": {
+      "task": "implementation",
+      "complexity": "trivial",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-42",
+    "prompt": "Fix a typo in the footer",
+    "expected": {
+      "task": "implementation",
+      "complexity": "trivial",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-43",
+    "prompt": "Implement the specific validation rule",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "specific must not fire spec",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-44",
+    "prompt": "Inspect the payload and add validation",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "inspect must not fire spec",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-45",
+    "prompt": "Check the planet config for typos",
+    "expected": {
+      "task": "implementation",
+      "complexity": "trivial",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "planet must not fire plan",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-46",
+    "prompt": "Support rapid iteration on the form",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "rapid must not fire api",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-47",
+    "prompt": "Credit the original author in the footer",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "author must not fire auth",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-48",
+    "prompt": "Update the product catalog import",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "product must not fire prod",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-49",
+    "prompt": "Already handled the edge case, verify locally",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "already must not fire read",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-50",
+    "prompt": "The export no longer includes drafts",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "longer must not fire long context",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-51",
+    "prompt": "Remove hardcoded credentials from the sample",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "hardcoded must not fire hard",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-52",
+    "prompt": "Ship the hotfix tonight",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-53",
+    "prompt": "Add the missing index to the orders table",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-54",
+    "prompt": "Create the audit log writer",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "audit is not a task keyword (documented limitation)",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-55",
+    "prompt": "Implement dependency injection for the store",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "dependency injection excluded from security rule",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-56",
+    "prompt": "Handle the webhook retry storm",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-57",
+    "prompt": "Add support for multiple workspaces",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-58",
+    "prompt": "Gate the feature behind the new flag",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-59",
+    "prompt": "Sanitize filenames on upload",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-60",
+    "prompt": "Compress API responses at the edge",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-61",
+    "prompt": "Version the public endpoints",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-62",
+    "prompt": "Deprecate the v1 token format",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-63",
+    "prompt": "Add the health check endpoint",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-64",
+    "prompt": "Support resumable uploads",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-65",
+    "prompt": "Throttle the sync worker",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-66",
+    "prompt": "Batch the notification sender",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-67",
+    "prompt": "Cache the tenant config in memory",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-68",
+    "prompt": "Invalidate stale sessions hourly",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-69",
+    "prompt": "Log slow queries with timings",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-70",
+    "prompt": "Add a dry-run flag to the importer",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-71",
+    "prompt": "Timezone handling for recurring events",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-impl-72",
+    "prompt": "Avatar resizing on upload",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-73",
+    "prompt": "Implement the checkout total with tax",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-74",
+    "prompt": "Add the forgot-password email flow",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-75",
+    "prompt": "@deep implement the payment splitter",
+    "expected": {
+      "task": "implementation",
+      "complexity": "complex",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "hint forces complex/high",
+    "split": "train"
+  },
+  {
+    "id": "bulk-impl-76",
+    "prompt": "Handle the multi-tenant invite flow",
+    "expected": {
+      "task": "implementation",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  }
+]

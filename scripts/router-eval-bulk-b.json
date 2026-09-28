@@ -1,0 +1,638 @@
+[
+  {
+    "id": "bulk-expl-01",
+    "prompt": "Explore the billing module structure",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-02",
+    "prompt": "Search for the session timeout value",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-expl-03",
+    "prompt": "Explain the retry policy to me",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-04",
+    "prompt": "Summarize the release highlights",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-05",
+    "prompt": "List the environment variables",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-06",
+    "prompt": "Read the contributing guide",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-07",
+    "prompt": "Find where tokens are refreshed",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-expl-08",
+    "prompt": "Where is the cache invalidated",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-09",
+    "prompt": "How does the webhook retry work",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-10",
+    "prompt": "Show me the auth flow",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "show-me routing; auth fires high",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-11",
+    "prompt": "Walk me through the deploy pipeline",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-12",
+    "prompt": "What does this regex do",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "question-word routing; FAILED pre-fix",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-expl-13",
+    "prompt": "Why is the build so slow",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "FAILED pre-fix",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-14",
+    "prompt": "What was changed in the last release",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-15",
+    "prompt": "How do I run the tests locally",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "bare tests is not a test-gen phrase",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-16",
+    "prompt": "Explain the specific error code",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-17",
+    "prompt": "List findings from yesterday's incident",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-expl-18",
+    "prompt": "Search the entire codebase for TODOs",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "xlarge"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-19",
+    "prompt": "Read the full file before the meeting",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "large"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-20",
+    "prompt": "Find all usages across several files",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "medium"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-21",
+    "prompt": "Show the product overview page",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "product must not fire prod; overview without repo stays exploration",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-22",
+    "prompt": "What is the refund policy",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-expl-23",
+    "prompt": "Why did the deploy fail",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "question wins over CI-shape; deploy fires high",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-24",
+    "prompt": "How do I deploy the canary",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-25",
+    "prompt": "Walk me through the payment flow",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-26",
+    "prompt": "Show me the passing test output",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "passing, not failing, stays exploration",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-27",
+    "prompt": "What are the supported regions",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-expl-28",
+    "prompt": "Why do we need the queue here",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-29",
+    "prompt": "How was this shipped",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-30",
+    "prompt": "What is authentication in this app",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-31",
+    "prompt": "I already read the guide, explain caching",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-32",
+    "prompt": "Give an explanation of the auth refresh",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "explanation must not fire plan",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-expl-33",
+    "prompt": "Read the specific config for staging",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-34",
+    "prompt": "Search for rapid feedback on the form",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-35",
+    "prompt": "List the authors of the module",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-36",
+    "prompt": "Show us the dashboard metrics",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-37",
+    "prompt": "What does the author field mean",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-expl-38",
+    "prompt": "Find the planet entry in the config",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-39",
+    "prompt": "Explore the multi-file upload flow",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "medium"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-40",
+    "prompt": "Search many files for the flag name",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "low",
+      "context": "large"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-41",
+    "prompt": "Read the long migration guide",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "large"
+    },
+    "note": "migration fires high risk even for reading",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-42",
+    "prompt": "How is billing computed",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-expl-43",
+    "prompt": "Why is PII encrypted here",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-44",
+    "prompt": "What does the API return on error",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-45",
+    "prompt": "Show me the database schema diagram",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-46",
+    "prompt": "Walk me through the contract changes",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-47",
+    "prompt": "Where are secrets stored",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-expl-48",
+    "prompt": "Find the breaking change in v2",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-49",
+    "prompt": "How does the data model link teams",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "medium",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-50",
+    "prompt": "What is the production topology",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-51",
+    "prompt": "List the deploy targets",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  },
+  {
+    "id": "bulk-expl-52",
+    "prompt": "Search payment transactions by id",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "verify"
+  },
+  {
+    "id": "bulk-expl-53",
+    "prompt": "Explain the security headers",
+    "expected": {
+      "task": "exploration",
+      "complexity": "normal",
+      "risk": "high",
+      "context": "small"
+    },
+    "note": "",
+    "split": "train"
+  }
+]
