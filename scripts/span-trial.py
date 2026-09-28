@@ -204,6 +204,7 @@ def live_responder(
     endpoint=OPENROUTER_URL,
     key_env="SPAN_API_KEY",
     allow_anonymous=False,
+    delay_s=0.0,
 ):
     import os
     import time as _time
@@ -220,13 +221,16 @@ def live_responder(
         last = None
         for attempt in range(retries):
             try:
+                if delay_s > 0:
+                    _time.sleep(delay_s)
                 payload = post(endpoint, body, timeout_s, key or None)
                 out = _normalize_live_payload(payload)
                 break
             except urllib.error.HTTPError as e:
                 last = e
-                if e.code and 500 <= e.code < 600 and attempt < retries - 1:
-                    _time.sleep(2**attempt)
+                transient = (e.code and 500 <= e.code < 600) or e.code == 429
+                if transient and attempt < retries - 1:
+                    _time.sleep(2**attempt + delay_s)
                     continue
                 raise
         else:
@@ -370,6 +374,7 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--out", default="")
     ap.add_argument("--prompt", default="")
+    ap.add_argument("--delay", type=float, default=0.0)
     ap.add_argument(
         "--backend",
         default="span",
@@ -423,7 +428,11 @@ def main(argv=None):
     if args.live:
         try:
             responder = live_responder(
-                pack, model=model, endpoint=endpoint, allow_anonymous=anonymous
+                pack,
+                model=model,
+                endpoint=endpoint,
+                allow_anonymous=anonymous,
+                delay_s=args.delay,
             )
         except MissingKeyError as e:
             print(f"live unavailable: {e} (dry-run instead)")

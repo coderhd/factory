@@ -205,6 +205,22 @@ def test_persistent_transport_failure_records_error():
     )
 
 
+def _rate_limit_then_ok(url, body, timeout_s, api_key=None, state={"n": 0}):
+    import urllib.error
+
+    state["n"] += 1
+    if state["n"] < 2:
+        raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, None)
+    return _stub_http_ok(url, body, timeout_s)
+
+
+def test_live_responder_retries_429():
+    mod = load_harness()
+    pack = json.loads(PACK.read_text())
+    resp = mod.live_responder(pack, api_key="test", http=_rate_limit_then_ok)("x")
+    check("429 retried then parses", "behaviors" in resp)
+
+
 def test_report_computes_bar_legs():
     mod = load_harness()
     rep = mod.score_report([], {"accuracy": 0.998, "negation_correct": False})
@@ -284,6 +300,7 @@ if __name__ == "__main__":
     test_verify_run_is_logged()
     test_prompt_mode_needs_live_key()
     test_anonymous_jev_responder_needs_no_key()
+    test_live_responder_retries_429()
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILURES")
         sys.exit(1)
