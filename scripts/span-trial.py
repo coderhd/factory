@@ -367,8 +367,39 @@ def main(argv=None):
     ap.add_argument("--live", action="store_true", default=False)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--out", default="")
+    ap.add_argument("--prompt", default="")
     args = ap.parse_args(argv)
     pack = load_pack()
+    if args.prompt:
+        if not args.live:
+            print("single-prompt mode requires --live (needs SPAN_API_KEY)")
+            return 2
+        try:
+            responder = live_responder(pack)
+        except MissingKeyError as e:
+            print(f"live unavailable: {e}")
+            return 2
+        results = run_trial(
+            [{"id": "adhoc", "prompt": args.prompt, "expected": {}}], responder, pack
+        )
+        r = results[0]
+        if r["error"]:
+            print(f"ERROR: {r['error']}")
+            return 1
+        p = r["predicted"]
+        print(
+            f"task={p['task']} complexity={p['complexity']} risk={p['risk']} "
+            f"confidence={p.get('confidence')} margin={p.get('margin')}"
+        )
+        if p.get("margin", 1.0) < 0.2:
+            print(
+                "APPEAL: margin below 0.2 — escalate via "
+                "'/route opencode-go/glm-5.3-flash' with this brief:"
+            )
+            print(json.dumps({"prompt": args.prompt, "span": p}, indent=1))
+        else:
+            print("ROUTE: margin sufficient — proceed on Span task.")
+        return 0
     cases = load_cases(args.split)
     if args.limit:
         cases = cases[: args.limit]

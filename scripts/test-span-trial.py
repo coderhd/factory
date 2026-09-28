@@ -223,6 +223,20 @@ def test_report_computes_bar_legs():
     check("bar verdict binary", rep["bar_verdict"] in ("PASS", "FAIL"))
 
 
+def test_prompt_mode_needs_live_key():
+    import os
+
+    mod = load_harness()
+    env = dict(os.environ)
+    os.environ.pop("SPAN_API_KEY", None)
+    try:
+        rc = mod.main(["--prompt", "x", "--live"])
+    finally:
+        os.environ.clear()
+        os.environ.update(env)
+    check("prompt mode without key exits 2, no traceback", rc == 2, f"rc={rc}")
+
+
 def test_verify_run_is_logged():
     import tempfile
 
@@ -247,6 +261,7 @@ if __name__ == "__main__":
     test_persistent_transport_failure_records_error()
     test_report_computes_bar_legs()
     test_verify_run_is_logged()
+    test_prompt_mode_needs_live_key()
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILURES")
         sys.exit(1)
