@@ -361,7 +361,7 @@ def score_report(results, baseline, pack=None):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--split", default="all", choices=["train", "verify", "fresh", "all"]
+        "--split", default="all", choices=["train", "verify", "fresh", "fresh2", "all"]
     )
     ap.add_argument("--dry-run", action="store_true", default=True)
     ap.add_argument("--live", action="store_true", default=False)

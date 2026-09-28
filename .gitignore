@@ -3,3 +3,11 @@ node_modules/
 .factory/evidence.log
 ../worktrees/
 .superpowers/
+.env
+.env.*
+__pycache__/
+*.pyc
+.factory/span-*.json
+.factory/span-*.txt
+.factory/span-trial.log
+.factory/routing.log
