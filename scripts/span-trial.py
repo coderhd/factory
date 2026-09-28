@@ -189,6 +189,78 @@ def format_report(results):
     return "\n".join(lines)
 
 
+RULES_BASELINE = {"accuracy": 499 / 500, "negation_correct": False}
+
+
+def _pct(xs, q):
+    if not xs:
+        return None
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(q * len(xs)))]
+
+
+def score_report(results, baseline, pack=None):
+    """Score a trial against the pre-registered promotion bar.
+
+    Bar legs (spec section 7): (a) accuracy >= baseline AND adv-negation
+    correct; (b) p95 latency <= 1000 ms on live timings; (c) cost/decision
+    <= $0.001 (Lite is free, tallied $0). Dry-run (fixture) timings fail
+    leg (b) by construction - promotion requires a live run.
+    """
+    pack = pack or load_pack()
+    coarse = pack["coarse_map"]
+    ok = [r for r in results if not r["error"]]
+    fine = (
+        (
+            sum(
+                1 for r in ok if r["predicted"].get("task") == r["expected"].get("task")
+            )
+            / len(ok)
+        )
+        if ok
+        else 0.0
+    )
+    coarse_acc = (
+        (
+            sum(
+                1
+                for r in ok
+                if coarse.get(r["predicted"].get("task"))
+                == coarse.get(r["expected"].get("task"))
+            )
+            / len(ok)
+        )
+        if ok
+        else 0.0
+    )
+    neg = next((r for r in ok if r["id"] == "adv-negation"), None)
+    neg_ok = bool(
+        neg
+        and neg["predicted"].get("task") == "implementation"
+        and neg["predicted"].get("risk") == "low"
+    )
+    lats = [r["latency_ms"] for r in ok]
+    p95 = _pct(lats, 0.95)
+    live = any(r["latency_ms"] > 5 for r in ok)
+    legs = {
+        "accuracy_ge_baseline": fine >= baseline["accuracy"],
+        "negation_correct": neg_ok,
+        "p95_within_budget": (p95 is not None and p95 <= 1000) if live else False,
+        "cost_within_budget": True,
+    }
+    return {
+        "n": len(results),
+        "accuracy_fine": round(fine, 4),
+        "accuracy_coarse": round(coarse_acc, 4),
+        "negation_correct": neg_ok,
+        "p50_ms": _pct(lats, 0.5),
+        "p95_ms": p95,
+        "est_cost_usd": 0.0,
+        "legs": legs,
+        "bar_verdict": "PASS" if all(legs.values()) else "FAIL",
+    }
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="all", choices=["train", "verify", "all"])

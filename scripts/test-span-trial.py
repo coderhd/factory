@@ -162,6 +162,24 @@ def test_live_responder_parses_stubbed_http():
     )
 
 
+def test_report_computes_bar_legs():
+    mod = load_harness()
+    rep = mod.score_report([], {"accuracy": 0.998, "negation_correct": False})
+    check(
+        "report has all bar legs",
+        set(rep)
+        >= {
+            "accuracy_fine",
+            "negation_correct",
+            "p95_ms",
+            "est_cost_usd",
+            "bar_verdict",
+        },
+        str(sorted(rep)),
+    )
+    check("bar verdict binary", rep["bar_verdict"] in ("PASS", "FAIL"))
+
+
 if __name__ == "__main__":
     pack = test_pack_exists_and_versioned()
     test_coarse_map_covers_all_tasks(pack)
@@ -172,6 +190,7 @@ if __name__ == "__main__":
     test_malformed_fixture_records_error_not_crash()
     test_missing_key_raises_not_crashes()
     test_live_responder_parses_stubbed_http()
+    test_report_computes_bar_legs()
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILURES")
         sys.exit(1)
