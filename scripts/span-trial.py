@@ -192,9 +192,16 @@ def build_span_request(pack, prompt, model):
 
 
 def live_responder(
-    pack, model="respan/span-01-lite", timeout_s=30, api_key=None, http=None
+    pack,
+    model="respan/span-01-lite",
+    timeout_s=30,
+    api_key=None,
+    http=None,
+    retries=3,
 ):
     import os
+    import time as _time
+    import urllib.error
 
     key = api_key if api_key is not None else os.environ.get("SPAN_API_KEY", "")
     if not key:
@@ -206,8 +213,20 @@ def live_responder(
         body = build_span_request(pack, prompt, model)
         body["_key"] = key
         try:
-            payload = post(OPENROUTER_URL, body, timeout_s)
-            out = _normalize_live_payload(payload)
+            last = None
+            for attempt in range(retries):
+                try:
+                    payload = post(OPENROUTER_URL, body, timeout_s)
+                    out = _normalize_live_payload(payload)
+                    break
+                except urllib.error.HTTPError as e:
+                    last = e
+                    if e.code and 500 <= e.code < 600 and attempt < retries - 1:
+                        _time.sleep(2**attempt)
+                        continue
+                    raise
+            else:
+                raise last
         finally:
             body.pop("_key", None)
         out["_latency_ms"] = round((time.monotonic() - t0) * 1000, 1)
@@ -225,7 +244,10 @@ def run_trial(cases, responder, pack):
             err = None
         except ValueError as e:
             predicted = {}
-            err = str(e)
+            err = f"parse: {e}"
+        except Exception as e:
+            predicted = {}
+            err = f"transport: {type(e).__name__}: {str(e)[:120]}"
         results.append(
             {
                 "id": case["id"],

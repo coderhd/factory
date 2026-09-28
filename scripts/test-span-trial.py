@@ -169,6 +169,42 @@ def test_live_responder_parses_stubbed_http():
     )
 
 
+def _flaky_then_ok(url, body, timeout_s, state={"n": 0}):
+    import urllib.error
+
+    state["n"] += 1
+    if state["n"] < 3:
+        raise urllib.error.HTTPError(url, 502, "Bad Gateway", {}, None)
+    return _stub_http_ok(url, body, timeout_s)
+
+
+def test_live_responder_retries_transient_5xx():
+    mod = load_harness()
+    pack = json.loads(PACK.read_text())
+    resp = mod.live_responder(pack, api_key="test", http=_flaky_then_ok)("x")
+    check("retries then parses", "behaviors" in resp)
+
+
+def _always_502(url, body, timeout_s):
+    import urllib.error
+
+    raise urllib.error.HTTPError(url, 502, "Bad Gateway", {}, None)
+
+
+def test_persistent_transport_failure_records_error():
+    mod = load_harness()
+    pack = json.loads(PACK.read_text())
+    results = mod.run_trial(
+        [{"id": "net", "prompt": "x", "expected": {}}],
+        mod.live_responder(pack, api_key="test", http=_always_502),
+        pack,
+    )
+    check(
+        "transport failure recorded, run survives",
+        results[0].get("error", "").startswith("transport:"),
+    )
+
+
 def test_report_computes_bar_legs():
     mod = load_harness()
     rep = mod.score_report([], {"accuracy": 0.998, "negation_correct": False})
@@ -207,6 +243,8 @@ if __name__ == "__main__":
     test_malformed_fixture_records_error_not_crash()
     test_missing_key_raises_not_crashes()
     test_live_responder_parses_stubbed_http()
+    test_live_responder_retries_transient_5xx()
+    test_persistent_transport_failure_records_error()
     test_report_computes_bar_legs()
     test_verify_run_is_logged()
     if FAILURES:
