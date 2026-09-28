@@ -123,8 +123,8 @@ def test_malformed_fixture_records_error_not_crash():
     check("malformed response records error", results[0].get("error") is not None)
 
 
-def _stub_http_ok(url, body, timeout_s):
-    assert body["model"] == "respan/span-01-lite", body.get("model")
+def _stub_http_ok(url, body, timeout_s, api_key=None):
+    assert body["model"] in ("respan/span-01-lite", "jev-1.13-free"), body.get("model")
     qs = body["questions"]
     assert all(q["type"] == "noul" for q in qs.values()), "Lite: noul-only"
     assert all(
@@ -169,7 +169,7 @@ def test_live_responder_parses_stubbed_http():
     )
 
 
-def _flaky_then_ok(url, body, timeout_s, state={"n": 0}):
+def _flaky_then_ok(url, body, timeout_s, api_key=None, state={"n": 0}):
     import urllib.error
 
     state["n"] += 1
@@ -185,7 +185,7 @@ def test_live_responder_retries_transient_5xx():
     check("retries then parses", "behaviors" in resp)
 
 
-def _always_502(url, body, timeout_s):
+def _always_502(url, body, timeout_s, api_key=None):
     import urllib.error
 
     raise urllib.error.HTTPError(url, 502, "Bad Gateway", {}, None)
@@ -237,6 +237,27 @@ def test_prompt_mode_needs_live_key():
     check("prompt mode without key exits 2, no traceback", rc == 2, f"rc={rc}")
 
 
+def test_anonymous_jev_responder_needs_no_key():
+    import os
+
+    mod = load_harness()
+    env = dict(os.environ)
+    os.environ.pop("SPAN_API_KEY", None)
+    try:
+        r = mod.live_responder(
+            json.loads(PACK.read_text()),
+            model="jev-1.13-free",
+            endpoint=mod.OPENCODE_ZEN_URL,
+            allow_anonymous=True,
+            api_key=None,
+            http=_stub_http_ok,
+        )("x")
+        check("anonymous responder builds without key", "behaviors" in r)
+    finally:
+        os.environ.clear()
+        os.environ.update(env)
+
+
 def test_verify_run_is_logged():
     import tempfile
 
@@ -262,6 +283,7 @@ if __name__ == "__main__":
     test_report_computes_bar_legs()
     test_verify_run_is_logged()
     test_prompt_mode_needs_live_key()
+    test_anonymous_jev_responder_needs_no_key()
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILURES")
         sys.exit(1)

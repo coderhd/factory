@@ -79,19 +79,22 @@ class MissingKeyError(RuntimeError):
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/alpha/decisions"
+OPENCODE_ZEN_URL = "https://opencode.ai/zen/v1/systemone"
 
 
-def _urllib_post(url, body, timeout_s):
+def _urllib_post(url, body, timeout_s, api_key=None):
     import urllib.request
 
+    headers = {
+        "Content-Type": "application/json",
+        # Identify as an agent (generic HTTP-library UAs get challenged):
+        # https://opencode.ai/v2/docs/console/go/ asks clients to do this.
+        "User-Agent": "factory-router-trial/1.0",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {body.pop('_key')}",
-        },
-        method="POST",
+        url, data=json.dumps(body).encode(), headers=headers, method="POST"
     )
     with urllib.request.urlopen(req, timeout=timeout_s) as r:
         return json.loads(r.read().decode())
@@ -198,37 +201,36 @@ def live_responder(
     api_key=None,
     http=None,
     retries=3,
+    endpoint=OPENROUTER_URL,
+    key_env="SPAN_API_KEY",
+    allow_anonymous=False,
 ):
     import os
     import time as _time
     import urllib.error
 
-    key = api_key if api_key is not None else os.environ.get("SPAN_API_KEY", "")
-    if not key:
-        raise MissingKeyError("set SPAN_API_KEY to an OpenRouter key for --live")
+    key = api_key if api_key is not None else os.environ.get(key_env, "")
+    if not key and not allow_anonymous:
+        raise MissingKeyError(f"set {key_env} to an OpenRouter key for --live")
     post = http or _urllib_post
 
     def respond(prompt):
         t0 = time.monotonic()
         body = build_span_request(pack, prompt, model)
-        body["_key"] = key
-        try:
-            last = None
-            for attempt in range(retries):
-                try:
-                    payload = post(OPENROUTER_URL, body, timeout_s)
-                    out = _normalize_live_payload(payload)
-                    break
-                except urllib.error.HTTPError as e:
-                    last = e
-                    if e.code and 500 <= e.code < 600 and attempt < retries - 1:
-                        _time.sleep(2**attempt)
-                        continue
-                    raise
-            else:
-                raise last
-        finally:
-            body.pop("_key", None)
+        last = None
+        for attempt in range(retries):
+            try:
+                payload = post(endpoint, body, timeout_s, key or None)
+                out = _normalize_live_payload(payload)
+                break
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code and 500 <= e.code < 600 and attempt < retries - 1:
+                    _time.sleep(2**attempt)
+                    continue
+                raise
+        else:
+            raise last
         out["_latency_ms"] = round((time.monotonic() - t0) * 1000, 1)
         return out
 
@@ -368,14 +370,29 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--out", default="")
     ap.add_argument("--prompt", default="")
+    ap.add_argument(
+        "--backend",
+        default="span",
+        choices=["span", "jev"],
+        help="span=respan/span-01-lite via OpenRouter (needs SPAN_API_KEY); "
+        "jev=jev-1.13-free via OpenCode Zen, no key needed",
+    )
     args = ap.parse_args(argv)
     pack = load_pack()
+    if args.backend == "jev":
+        model, endpoint = "jev-1.13-free", OPENCODE_ZEN_URL
+        anonymous = True
+    else:
+        model, endpoint = "respan/span-01-lite", OPENROUTER_URL
+        anonymous = False
     if args.prompt:
         if not args.live:
             print("single-prompt mode requires --live (needs SPAN_API_KEY)")
             return 2
         try:
-            responder = live_responder(pack)
+            responder = live_responder(
+                pack, model=model, endpoint=endpoint, allow_anonymous=anonymous
+            )
         except MissingKeyError as e:
             print(f"live unavailable: {e}")
             return 2
@@ -405,7 +422,9 @@ def main(argv=None):
         cases = cases[: args.limit]
     if args.live:
         try:
-            responder = live_responder(pack)
+            responder = live_responder(
+                pack, model=model, endpoint=endpoint, allow_anonymous=anonymous
+            )
         except MissingKeyError as e:
             print(f"live unavailable: {e} (dry-run instead)")
             return 0
