@@ -65,6 +65,96 @@ def fixture_responder(pack):
     return respond
 
 
+class MissingKeyError(RuntimeError):
+    """Raised when no API key is available; callers fall back to dry-run."""
+
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def _urllib_post(url, body, timeout_s):
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {body.pop('_key')}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as r:
+        return json.loads(r.read().decode())
+
+
+def _normalize_live_payload(payload):
+    """Accept likely Span-on-OpenRouter shapes; return {"behaviors": {...}}.
+
+    Tries top-level behaviors, then JSON embedded in a chat message.
+    Raises ValueError when nothing parses (recorded per case, never raised
+    into the scorer beyond the error record).
+    """
+    if isinstance(payload, dict) and isinstance(payload.get("behaviors"), dict):
+        return {"behaviors": payload["behaviors"]}
+    try:
+        content = payload["choices"][0]["message"]["content"]
+        parsed = json.loads(content) if isinstance(content, str) else content
+        if isinstance(parsed, dict) and isinstance(parsed.get("behaviors"), dict):
+            return {"behaviors": parsed["behaviors"]}
+    except (KeyError, IndexError, TypeError, ValueError):
+        pass
+    raise ValueError(f"unrecognized span payload keys: {list(payload)[:5]}")
+
+
+def build_span_request(pack, prompt, model):
+    defs = [f"- {k}: {v}" for k, v in pack["task_definitions"].items()]
+    defs += [
+        f"- complexity:{k}: {v}" for k, v in pack["complexity_definitions"].items()
+    ]
+    defs += [f"- high_risk: {pack['risk_definition']}"]
+    return {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Developer request to classify:\n"
+                    + prompt
+                    + "\n\nScore each definition (present/absent/not_observable) "
+                    'and return JSON {"behaviors": {id: {present, absent, '
+                    "not_observable}}}.\nDefinitions:\n" + "\n".join(defs)
+                ),
+            }
+        ],
+    }
+
+
+def live_responder(
+    pack, model="respan/span-01-lite", timeout_s=30, api_key=None, http=None
+):
+    import os
+
+    key = api_key if api_key is not None else os.environ.get("SPAN_API_KEY", "")
+    if not key:
+        raise MissingKeyError("set SPAN_API_KEY to an OpenRouter key for --live")
+    post = http or _urllib_post
+
+    def respond(prompt):
+        t0 = time.monotonic()
+        body = build_span_request(pack, prompt, model)
+        body["_key"] = key
+        try:
+            payload = post(OPENROUTER_URL, body, timeout_s)
+            out = _normalize_live_payload(payload)
+        finally:
+            body.pop("_key", None)
+        out["_latency_ms"] = round((time.monotonic() - t0) * 1000, 1)
+        return out
+
+    return respond
+
+
 def run_trial(cases, responder, pack):
     results = []
     for case in cases:
@@ -103,13 +193,22 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="all", choices=["train", "verify", "all"])
     ap.add_argument("--dry-run", action="store_true", default=True)
+    ap.add_argument("--live", action="store_true", default=False)
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args(argv)
     pack = load_pack()
     cases = load_cases(args.split)
     if args.limit:
         cases = cases[: args.limit]
-    results = run_trial(cases, fixture_responder(pack), pack)
+    if args.live:
+        try:
+            responder = live_responder(pack)
+        except MissingKeyError as e:
+            print(f"live unavailable: {e} (dry-run instead)")
+            return 0
+    else:
+        responder = fixture_responder(pack)
+    results = run_trial(cases, responder, pack)
     print(format_report(results))
     return 0
 

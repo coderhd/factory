@@ -123,6 +123,45 @@ def test_malformed_fixture_records_error_not_crash():
     check("malformed response records error", results[0].get("error") is not None)
 
 
+def _stub_http_ok(url, body, timeout_s):
+    return {
+        "behaviors": {
+            "exploration": {"present": 0.9, "absent": 0.05, "not_observable": 0.05},
+            "implementation": {"present": 0.2, "absent": 0.7, "not_observable": 0.1},
+            "trivial": {"present": 0.1, "absent": 0.8, "not_observable": 0.1},
+            "simple": {"present": 0.1, "absent": 0.8, "not_observable": 0.1},
+            "normal": {"present": 0.85, "absent": 0.1, "not_observable": 0.05},
+            "complex": {"present": 0.1, "absent": 0.8, "not_observable": 0.1},
+            "__risk__": {"present": 0.1, "absent": 0.8, "not_observable": 0.1},
+        }
+    }
+
+
+def test_missing_key_raises_not_crashes():
+    mod = load_harness()
+    pack = json.loads(PACK.read_text())
+    try:
+        mod.live_responder(pack, api_key="")
+        check("missing key raises MissingKeyError", False, "no exception raised")
+    except Exception as e:
+        check(
+            "missing key raises MissingKeyError",
+            type(e).__name__ == "MissingKeyError",
+            type(e).__name__,
+        )
+
+
+def test_live_responder_parses_stubbed_http():
+    mod = load_harness()
+    pack = json.loads(PACK.read_text())
+    resp = mod.live_responder(pack, api_key="test", http=_stub_http_ok)("x")
+    check(
+        "stubbed live response parses",
+        "behaviors" in resp or "exploration" in resp,
+        str(resp)[:120],
+    )
+
+
 if __name__ == "__main__":
     pack = test_pack_exists_and_versioned()
     test_coarse_map_covers_all_tasks(pack)
@@ -131,6 +170,8 @@ if __name__ == "__main__":
     test_selection_rules_pinned(pack)
     test_dry_run_scores_fixture_corpus()
     test_malformed_fixture_records_error_not_crash()
+    test_missing_key_raises_not_crashes()
+    test_live_responder_parses_stubbed_http()
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILURES")
         sys.exit(1)
