@@ -61,12 +61,15 @@ ONLY here and in planning — never in the live path). Factory = policy,
 thresholds, human review, durable state. This mirrors the G/D/C split:
 generation→S2, decisions→S1, exact rules→code.
 
-**Appeal model (decided 2026-09-29): `opencode-go/glm-5.2`.**
-Go pricing $1.40/$4.40/$0.26 per M with a **$60/month** budget (~880 req/5h,
-~4,300/mo) — 4× the headroom of GLM-5.3 at ~10 pts lower WebDev standing
-(1600 vs 1622), the right trade for appeal volume (~41% of traffic at
-margin < 0.2). Estimated ~$0.0025/appeal (~1k fresh input + ~250 output
-tokens); 100 tasks/day ≈ $0.10/day against the $60 budget. Appeals run as
+**Appeal model (decided 2026-09-29, shootout 2026-09-30): `opencode-go/glm-5.3-flash`.**
+GLM-5.2 and GLM-5.3-Flash scored identically on the same 41 blind appeals
+(30/41 = 73.2% task each; complexity/risk/context within noise), so Flash
+takes the seat at ~10× lower per-token cost ($0.15/$0.50 vs $1.40/$4.40)
+on the same $60/month budget (~31,580 req/mo).
+Go pricing $0.15/$0.50/$0.03 per M with a **$60/month** budget (~6,320 req/5h)
+— appeal volume (~41% of traffic at margin < 0.2) costs an estimated
+~$0.0003/appeal (~1k fresh input + ~250 output tokens); 100 tasks/day ≈
+$0.01/day against the $60 budget. Appeals run as
 a pinned child session (no cache churn on the parent), carrying the appeal
 brief: `{prompt, span top-2 + probabilities + margin, rules vote,
 disagreement flag}`. S2 returns `{task, complexity, risk, rationale}` and
