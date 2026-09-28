@@ -157,18 +157,27 @@ def build_span_request(pack, prompt, model):
         questions[f"task_{task}"] = {
             "type": "noul",
             "instructions": f"Is this developer request a {task} task?",
-            "criteria": definition,
+            "criteria": {
+                "true": definition,
+                "false": f"This request is not a {task} task.",
+            },
         }
     for level, definition in pack["complexity_definitions"].items():
         questions[f"cx_{level}"] = {
             "type": "noul",
             "instructions": "How complex is this developer request?",
-            "criteria": definition,
+            "criteria": {
+                "true": definition,
+                "false": "This does not describe the request complexity.",
+            },
         }
     questions["high_risk"] = {
         "type": "noul",
         "instructions": "Does this developer request carry blast radius?",
-        "criteria": pack["risk_definition"],
+        "criteria": {
+            "true": pack["risk_definition"],
+            "false": "This request is low-risk routine work.",
+        },
     }
     return {"model": model, "questions": questions, "state": prompt}
 
@@ -324,6 +333,7 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", default=True)
     ap.add_argument("--live", action="store_true", default=False)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--out", default="")
     args = ap.parse_args(argv)
     pack = load_pack()
     cases = load_cases(args.split)
@@ -339,6 +349,18 @@ def main(argv=None):
         responder = fixture_responder(pack)
     results = run_trial(cases, responder, pack)
     print(format_report(results))
+    if args.live:
+        rep = score_report(results, RULES_BASELINE, pack)
+        print(
+            f"accuracy_fine={rep['accuracy_fine']} "
+            f"accuracy_coarse={rep['accuracy_coarse']} "
+            f"negation={rep['negation_correct']} "
+            f"p50={rep['p50_ms']}ms p95={rep['p95_ms']}ms "
+            f"est_cost=${rep['est_cost_usd']}"
+        )
+        print(f"bar_verdict={rep['bar_verdict']} legs={rep['legs']}")
+    if args.out:
+        Path(args.out).write_text(json.dumps(results, indent=1))
     if args.split == "verify" and not args.live:
         print("(dry-run verify: no log written; live verify runs are logged)")
     if args.split == "verify" and args.live:

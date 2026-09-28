@@ -128,9 +128,11 @@ def _stub_http_ok(url, body, timeout_s):
     qs = body["questions"]
     assert all(q["type"] == "noul" for q in qs.values()), "Lite: noul-only"
     assert all(
-        isinstance(q["instructions"], str) and isinstance(q["criteria"], str)
+        isinstance(q["instructions"], str)
+        and isinstance(q["criteria"], dict)
+        and all(isinstance(v, str) for v in q["criteria"].values())
         for q in qs.values()
-    ), "Lite: string instructions+criteria"
+    ), "Lite: string instructions + string-valued criteria object"
     assert body["state"] == "x"
     return {
         "answers": {
