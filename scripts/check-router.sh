@@ -25,7 +25,7 @@ grep -q "glm-5.3-flash" .opencode/commands/appeal.md && echo APPEAL_MODEL_OK
 sh scripts/factory-tickets.sh --dry-run --spec factory-docs/architecture/root-architecture.md --plan docs/superpowers/plans/2026-09-25-factory-dev-workflow.md --complexity complex --model opencode-go/glm-5.3 --confidence 0.9 | grep -q "complexity: complex" && echo TICKETS_OK
 if command -v bun >/dev/null 2>&1; then
   echo "--- bun tests (real router.ts) ---"
-  bun test ./.opencode/plugins/factory-guard/router.test.ts
+  bun test ./.opencode/plugins/factory-guard/
 elif command -v node >/dev/null 2>&1; then
   echo "--- node tests (if runtime present) ---"
   node --test .opencode/plugins/factory-guard/router.test.ts 2>/dev/null || echo "node tests skipped (needs ts support)"

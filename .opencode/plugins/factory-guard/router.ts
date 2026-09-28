@@ -1,14 +1,17 @@
 /**
- * Factory dev router — rules-first, capability-aware, budget-aware.
+ * Factory dev router — Span-default, capability-aware, budget-aware.
  *
  * Scope: OpenCode DEVELOPMENT environment only (building the Software Factory).
  * NOT Factory runtime routing / Work Order execution. See factory-docs/ for product.
  *
- * Pipeline:
- *   task type + complexity + risk + context + developer override
- *     -> capability matrix (candidate models, ordered)
- *     -> budget-aware selection (Go 5h/weekly/monthly limits)
- *     -> OpenCode model + concise decision metadata
+ * Pipeline (admission, once per task — never per turn):
+ *   prompt -> Span-01 Lite triage (free, outside the loop)
+ *     -> margin >= 0.2: record Span route, pin session
+ *     -> margin < 0.2: appeal to opencode-go/glm-5.3-flash, pin session
+ *     -> Span unavailable: rules fallback (offline, zero-dep), pin session
+ *   pinned session -> record only, no re-routing, no model switches.
+ *   Manual /route override always wins. Capability matrix + Go budgets
+ *   map the final (task, complexity, risk, context) to the model.
  *
  * Constraints preserved:
  * - DecisionModel stays generic (never JevDecisionModel).
@@ -285,6 +288,65 @@ export class RulesDecisionModel implements DecisionModel {
   recommend(input: RouteInput): ModelId[] {
     return candidatesFor(input);
   }
+}
+
+// --- Span-default admission (locked 2026-09-30) ---
+
+export const MARGIN_THRESHOLD = 0.2;
+export const APPEAL_MODEL: ModelId = "glm-5.3-flash";
+export const SPAN_TIMEOUT_MS = 3000;
+
+export interface SpanVerdict {
+  task: TaskType;
+  complexity: Complexity;
+  risk: Risk;
+  confidence: number;
+  margin: number;
+}
+
+export type RouteAction =
+  | { kind: "record"; source: "pinned" | "manual" }
+  | { kind: "record"; source: "span"; decision: RouteDecision }
+  | { kind: "record"; source: "rules-fallback"; decision: RouteDecision }
+  | { kind: "appeal"; source: "span"; decision: RouteDecision; brief: object };
+
+/**
+ * Pure admission decision. Called once per task (unpinned session) or never
+ * (pinned sessions record only). Never performs I/O; never switches models.
+ */
+export function decideAction(opts: {
+  sessionPinned: boolean;
+  spanOk: boolean;
+  span?: SpanVerdict;
+  rules: RouteInput;
+  budget?: BudgetState;
+  unavailable?: ModelId[];
+}): RouteAction {
+  if (opts.sessionPinned) return { kind: "record", source: "pinned" };
+  if (!opts.spanOk || !opts.span) {
+    const decision = selectModel(opts.rules, opts.budget, opts.unavailable);
+    return { kind: "record", source: "rules-fallback", decision };
+  }
+  const input: RouteInput = {
+    task: opts.span.task,
+    complexity: opts.span.complexity,
+    risk: opts.span.risk,
+    context: opts.rules.context,
+  };
+  const decision = selectModel(input, opts.budget, opts.unavailable);
+  if (opts.span.margin < MARGIN_THRESHOLD) {
+    return {
+      kind: "appeal",
+      source: "span",
+      decision,
+      brief: {
+        span: opts.span,
+        rulesTask: opts.rules.task,
+        disagreement: opts.span.task !== opts.rules.task,
+      },
+    };
+  }
+  return { kind: "record", source: "span", decision };
 }
 
 /**

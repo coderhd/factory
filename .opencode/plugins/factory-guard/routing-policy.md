@@ -106,16 +106,17 @@ Shadow only. `jevShadowSuggest()` logs a suggestion; routing uses
 `RulesDecisionModel`. No `JevDecisionModel` exists. Promote only on
 measured win over the same 10–30 Work Orders.
 
-## 9. Wired appeal loop (live since 2026-09-30)
+## 9. Wired admission loop (Span-default since 2026-09-30)
 
-The hot prompt hook stays rules-only and network-free on purpose:
-per-turn Span calls would add ~0.6–1.6 s to every turn and break session
-pinning. The appeal path is explicit instead:
+Rules are off the default path (kept as offline fallback only). Admission,
+once per task — never per turn:
 
 ```text
-New task or uncertainty → /appeal → Span triage (free, ~600 ms)
-   ├── ROUTE (margin ≥ 0.2): proceed, record provenance
-   └── APPEAL (margin < 0.2): /route opencode-go/glm-5.3-flash + brief
+New task prompt → Span-01 Lite triage (free, ~600 ms, outside the loop)
+   ├── margin ≥ 0.2: record Span route, pin session
+   ├── margin < 0.2: switchModel to opencode-go/glm-5.3-flash, pin, log appeal
+   └── Span unavailable: rules fallback, pin session
+Pinned session → record only. Manual /route always wins.
 ```
 
 - `/appeal` command (`.opencode/commands/appeal.md`): runs

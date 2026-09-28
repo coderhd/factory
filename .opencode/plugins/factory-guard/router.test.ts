@@ -1,14 +1,26 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  APPEAL_MODEL,
+  MARGIN_THRESHOLD,
   budgetAllows,
   candidatesFor,
   classifyTask,
+  decideAction,
   jevShadowSuggest,
   parseRouteOverride,
   parseTaskHint,
   selectModel,
 } from "./router.js";
+import {
+  PACK_VERSION,
+  buildSpanQuestions,
+  parseSpanAnswers,
+  requestSpanVerdict,
+} from "./span.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 const FULL = { monthlyRemaining: 1, weeklyRemaining: 1, fiveHourRemaining: 1 };
 
@@ -141,5 +153,102 @@ describe("jev + DecisionModel invariants", () => {
   it("jev shadow never claims active routing", () => {
     const s = jevShadowSuggest({ task: "planning", complexity: "complex", risk: "medium", context: "medium" });
     assert.match(s.note, /shadow-only/);
+  });
+});
+
+const BASE_INPUT = { task: "debugging", complexity: "complex", risk: "medium", context: "small" } as const;
+const SPAN_OK = { task: "debugging", complexity: "complex", risk: "medium", confidence: 0.9, margin: 0.5 } as const;
+
+describe("decideAction (admission, once per task)", () => {
+  it("pinned sessions record only, no new decision", () => {
+    const a = decideAction({ sessionPinned: true, spanOk: true, span: SPAN_OK, rules: BASE_INPUT });
+    assert.equal(a.kind, "record");
+    assert.equal((a as { source: string }).source, "pinned");
+  });
+  it("unpinned span failure falls back to rules, never throws", () => {
+    const a = decideAction({ sessionPinned: false, spanOk: false, rules: BASE_INPUT });
+    assert.equal(a.kind, "record");
+    assert.equal((a as { source: string }).source, "rules-fallback");
+  });
+  it("high margin records the span route", () => {
+    const a = decideAction({ sessionPinned: false, spanOk: true, span: SPAN_OK, rules: BASE_INPUT });
+    assert.equal(a.kind, "record");
+    assert.equal((a as { source: string }).source, "span");
+  });
+  it("margin below threshold appeals with a brief", () => {
+    const a = decideAction({
+      sessionPinned: false, spanOk: true,
+      span: { ...SPAN_OK, margin: MARGIN_THRESHOLD - 0.01 }, rules: BASE_INPUT,
+    });
+    assert.equal(a.kind, "appeal");
+    if (a.kind === "appeal") {
+      assert.equal((a.brief as { disagreement: boolean }).disagreement, false);
+      assert.ok(a.decision.selected);
+    }
+  });
+});
+
+describe("span client", () => {
+  it("question pack matches scripts/span-trial-questions.json v2", () => {
+    assert.equal(PACK_VERSION, "v2");
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "scripts", "span-trial-questions.json");
+    const pack = JSON.parse(readFileSync(root, "utf8"));
+    assert.equal(pack.version, PACK_VERSION);
+    const qs = buildSpanQuestions();
+    const payloadTasks = Object.keys(qs)
+      .filter((k) => k.startsWith("task_"))
+      .map((k) => k.slice(5))
+      .sort();
+    assert.deepEqual(payloadTasks, Object.keys(pack.task_definitions).sort());
+    for (const [task, def] of Object.entries(pack.task_definitions)) {
+      assert.equal(
+        (qs[`task_${task}`].criteria as { true: string }).true, def,
+        `criteria drift for ${task}`,
+      );
+    }
+  });
+  it("builds 21 noul-only questions with string criteria", () => {
+    const qs = buildSpanQuestions();
+    assert.equal(Object.keys(qs).length, 21);
+    for (const q of Object.values(qs)) {
+      assert.equal(q.type, "noul");
+      assert.equal(typeof q.instructions, "string");
+      assert.equal(typeof q.criteria.true, "string");
+      assert.equal(typeof q.criteria.false, "string");
+    }
+  });
+  it("parses noul answers to task/complexity/risk with confidence+margin", () => {
+    const v = parseSpanAnswers({
+      task_debugging: { noul: 0.9 },
+      task_implementation: { noul: 0.1 },
+      cx_complex: { noul: 0.8 },
+      cx_normal: { noul: 0.1 },
+      cx_simple: { noul: 0.05 },
+      cx_trivial: { noul: 0.05 },
+      high_risk: { noul: 0.7 },
+    });
+    assert.equal(v.task, "debugging");
+    assert.equal(v.complexity, "complex");
+    assert.equal(v.risk, "high");
+    assert.equal(v.confidence, 0.9);
+    assert.ok(v.margin > 0.7);
+  });
+  it("requestSpanVerdict maps a stubbed fetch", async () => {
+    const v = await requestSpanVerdict(
+      "x", "key",
+      (async () => ({
+        answers: {
+          task_exploration: { noul: 0.9 },
+          high_risk: { noul: 0.1 },
+          cx_normal: { noul: 0.8 },
+        },
+      })) as never,
+    );
+    assert.equal(v.task, "exploration");
+    assert.equal(v.risk, "low");
+  });
+  it("requestSpanVerdict throws on malformed payload", async () => {
+    await assert.rejects(() =>
+      requestSpanVerdict("x", "key", (async () => ({ nope: 1 })) as never));
   });
 });
