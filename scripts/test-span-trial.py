@@ -124,15 +124,20 @@ def test_malformed_fixture_records_error_not_crash():
 
 
 def _stub_http_ok(url, body, timeout_s):
+    assert body["model"] == "respan/span-01-lite", body.get("model")
+    qs = body["questions"]
+    assert all(q["type"] == "noul" for q in qs.values()), "Lite: noul-only"
+    assert all(
+        isinstance(q["instructions"], str) and isinstance(q["criteria"], str)
+        for q in qs.values()
+    ), "Lite: string instructions+criteria"
+    assert body["state"] == "x"
     return {
-        "behaviors": {
-            "exploration": {"present": 0.9, "absent": 0.05, "not_observable": 0.05},
-            "implementation": {"present": 0.2, "absent": 0.7, "not_observable": 0.1},
-            "trivial": {"present": 0.1, "absent": 0.8, "not_observable": 0.1},
-            "simple": {"present": 0.1, "absent": 0.8, "not_observable": 0.1},
-            "normal": {"present": 0.85, "absent": 0.1, "not_observable": 0.05},
-            "complex": {"present": 0.1, "absent": 0.8, "not_observable": 0.1},
-            "__risk__": {"present": 0.1, "absent": 0.8, "not_observable": 0.1},
+        "answers": {
+            "task_exploration": {"type": "noul", "noul": 0.9},
+            "task_implementation": {"type": "noul", "noul": 0.1},
+            "cx_normal": {"type": "noul", "noul": 0.85},
+            "high_risk": {"type": "noul", "noul": 0.1},
         }
     }
 

@@ -69,7 +69,7 @@ class MissingKeyError(RuntimeError):
     """Raised when no API key is available; callers fall back to dry-run."""
 
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_URL = "https://openrouter.ai/api/alpha/decisions"
 
 
 def _urllib_post(url, body, timeout_s):
@@ -89,45 +89,88 @@ def _urllib_post(url, body, timeout_s):
 
 
 def _normalize_live_payload(payload):
-    """Accept likely Span-on-OpenRouter shapes; return {"behaviors": {...}}.
+    """Convert a Decisions-API response to {"behaviors": {...}} for map_response.
 
-    Tries top-level behaviors, then JSON embedded in a chat message.
-    Raises ValueError when nothing parses (recorded per case, never raised
-    into the scorer beyond the error record).
+    Accepts the documented answers shape ({answers: {route: {choice,
+    probabilities, confidence}, complexity: {score, probabilities},
+    risk: {noul}}}) plus the legacy behaviors shape. Score positions map to
+    the nearest complexity level. Raises ValueError when nothing parses
+    (recorded per case, never raised into the scorer).
     """
     if isinstance(payload, dict) and isinstance(payload.get("behaviors"), dict):
         return {"behaviors": payload["behaviors"]}
     try:
-        content = payload["choices"][0]["message"]["content"]
-        parsed = json.loads(content) if isinstance(content, str) else content
-        if isinstance(parsed, dict) and isinstance(parsed.get("behaviors"), dict):
-            return {"behaviors": parsed["behaviors"]}
-    except (KeyError, IndexError, TypeError, ValueError):
+        answers = payload["answers"]
+        out = {}
+        for qid, ans in answers.items():
+            p = ans.get("noul")
+            if p is None:
+                continue
+            if qid.startswith("task_"):
+                out[qid[5:]] = {"present": p, "absent": 1 - p, "not_observable": 0.0}
+            elif qid.startswith("cx_"):
+                out[qid[3:]] = {"present": p, "absent": 1 - p, "not_observable": 0.0}
+            elif qid == "high_risk":
+                out["__risk__"] = {"present": p, "absent": 1 - p, "not_observable": 0.0}
+        if out:
+            return {"behaviors": out}
+        route = answers["route"]
+        for task, p in route.get("probabilities", {}).items():
+            out[task] = {"present": p, "absent": 1 - p, "not_observable": 0.0}
+        cx = answers.get("complexity", {})
+        for lvl, p in cx.get("probabilities", {}).items():
+            out[lvl] = {"present": p, "absent": 1 - p, "not_observable": 0.0}
+        if "score" in cx and not cx.get("probabilities"):
+            levels = ["trivial", "simple", "normal", "complex"]
+            idx = min(3, max(0, round(float(cx["score"]))))
+            out[levels[idx]] = {"present": 1.0, "absent": 0.0, "not_observable": 0.0}
+        if not out:
+            out[route["choice"]] = {
+                "present": route.get("confidence", 1.0),
+                "absent": 0.0,
+                "not_observable": 0.0,
+            }
+        risk = answers.get("risk", {})
+        if "noul" in risk:
+            out["__risk__"] = {
+                "present": risk["noul"],
+                "absent": 1 - risk["noul"],
+                "not_observable": 0.0,
+            }
+        if out:
+            return {"behaviors": out}
+    except (KeyError, IndexError, TypeError, AttributeError, ValueError):
         pass
-    raise ValueError(f"unrecognized span payload keys: {list(payload)[:5]}")
+    keys = list(payload)[:5] if isinstance(payload, dict) else type(payload).__name__
+    raise ValueError(f"unrecognized span payload: {keys}")
 
 
 def build_span_request(pack, prompt, model):
-    defs = [f"- {k}: {v}" for k, v in pack["task_definitions"].items()]
-    defs += [
-        f"- complexity:{k}: {v}" for k, v in pack["complexity_definitions"].items()
-    ]
-    defs += [f"- high_risk: {pack['risk_definition']}"]
-    return {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    "Developer request to classify:\n"
-                    + prompt
-                    + "\n\nScore each definition (present/absent/not_observable) "
-                    'and return JSON {"behaviors": {id: {present, absent, '
-                    "not_observable}}}.\nDefinitions:\n" + "\n".join(defs)
-                ),
-            }
-        ],
+    """One batched Decisions-API request, noul-only (Span-01 Lite constraint).
+
+    The Lite tier rejects choice/score questions and non-string criteria,
+    so each label becomes its own yes/no question; mapping back to a
+    decision is argmax-over-present in map_response.
+    """
+    questions = {}
+    for task, definition in pack["task_definitions"].items():
+        questions[f"task_{task}"] = {
+            "type": "noul",
+            "instructions": f"Is this developer request a {task} task?",
+            "criteria": definition,
+        }
+    for level, definition in pack["complexity_definitions"].items():
+        questions[f"cx_{level}"] = {
+            "type": "noul",
+            "instructions": "How complex is this developer request?",
+            "criteria": definition,
+        }
+    questions["high_risk"] = {
+        "type": "noul",
+        "instructions": "Does this developer request carry blast radius?",
+        "criteria": pack["risk_definition"],
     }
+    return {"model": model, "questions": questions, "state": prompt}
 
 
 def live_responder(
