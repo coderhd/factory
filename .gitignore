@@ -11,3 +11,4 @@ __pycache__/
 .factory/span-*.txt
 .factory/span-trial.log
 .factory/routing.log
+.factory/*.json
