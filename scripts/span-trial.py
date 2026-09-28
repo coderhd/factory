@@ -192,6 +192,20 @@ def format_report(results):
 RULES_BASELINE = {"accuracy": 499 / 500, "negation_correct": False}
 
 
+def log_verify_run(path=None, n=0, verdict="UNKNOWN", pack_version="v1"):
+    """Append-only record of every verify-split scoring (leakage discipline)."""
+    import datetime
+
+    dest = Path(path) if path else ROOT / ".factory" / "span-trial.log"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "a") as f:
+        f.write(
+            f"{datetime.datetime.now(datetime.timezone.utc).isoformat()} "
+            f"pack={pack_version} n={n} verdict={verdict}\n"
+        )
+    return str(dest)
+
+
 def _pct(xs, q):
     if not xs:
         return None
@@ -282,6 +296,16 @@ def main(argv=None):
         responder = fixture_responder(pack)
     results = run_trial(cases, responder, pack)
     print(format_report(results))
+    if args.split == "verify" and not args.live:
+        print("(dry-run verify: no log written; live verify runs are logged)")
+    if args.split == "verify" and args.live:
+        rep = score_report(results, RULES_BASELINE, pack)
+        print(f"bar_verdict={rep['bar_verdict']} legs={rep['legs']}")
+        log_verify_run(
+            n=rep["n"],
+            verdict=rep["bar_verdict"],
+            pack_version=pack.get("version", "v1"),
+        )
     return 0
 
 

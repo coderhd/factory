@@ -180,6 +180,16 @@ def test_report_computes_bar_legs():
     check("bar verdict binary", rep["bar_verdict"] in ("PASS", "FAIL"))
 
 
+def test_verify_run_is_logged():
+    import tempfile
+
+    mod = load_harness()
+    with tempfile.TemporaryDirectory() as d:
+        p = str(Path(d) / "span-trial.log")
+        mod.log_verify_run(path=p, n=16, verdict="FAIL")
+        check("verify run logged with verdict", "verdict=FAIL" in Path(p).read_text())
+
+
 if __name__ == "__main__":
     pack = test_pack_exists_and_versioned()
     test_coarse_map_covers_all_tasks(pack)
@@ -191,6 +201,7 @@ if __name__ == "__main__":
     test_missing_key_raises_not_crashes()
     test_live_responder_parses_stubbed_http()
     test_report_computes_bar_legs()
+    test_verify_run_is_logged()
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILURES")
         sys.exit(1)
