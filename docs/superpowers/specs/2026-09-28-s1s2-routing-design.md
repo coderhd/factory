@@ -55,11 +55,25 @@ Uncertainty protocol (fires on low S1 margin, NOT raw confidence):
 ```
 
 **Roles.** S1 = classify, verify completion, gate (fast, cheap, beside the
-loop: rules now; Span-01-Lite/Jev/Laya challengers later). S2 = execute,
+loop: rules as fallback guardrail, **Span-01 Lite as current champion**;
+Jev/Laya challengers later). S2 = execute,
 adjudicate routing on appeal, manufacture labels offline (reasoning models
 ONLY here and in planning — never in the live path). Factory = policy,
 thresholds, human review, durable state. This mirrors the G/D/C split:
 generation→S2, decisions→S1, exact rules→code.
+
+**S1 pricing (verified 2026-09-30):** Span-01 Lite free/free via OpenRouter
+(`respan/span-01-lite`); Span-01 full $0.02/M input, output free; hosted
+Jev 1.13 $0.042/M input, output free; Jev 1.13 Free via OpenCode Zen
+(`POST /zen/v1/systemone`, no key) metered at cost `"0"`. Per routing
+decision (~1–2k input tokens): Span Lite $0, Jev-free $0, Span full
+≈ $0.00004, Jev paid ≈ $0.00008. At 100 tasks/day every option rounds to
+~$0/month — the decision between them is accuracy/latency/reliability,
+never price. Jev-free's caveat is operational, not financial: unauthenticated
+bulk use gets throttled (HTTP 429 across 100 sequential calls, 2026-09-30),
+while sparse per-task calls never tripped limits. Jev graduates from
+challenger only on a clean, unthrottled head-to-head win over Span on blind
+sets — partial train data (77.5% on 244/406 scored) does not qualify.
 
 **Appeal model (decided 2026-09-29, shootout 2026-09-30): `opencode-go/glm-5.3-flash`.**
 GLM-5.2 and GLM-5.3-Flash scored identically on the same 41 blind appeals
