@@ -150,16 +150,31 @@ export interface VerificationEngine {
   verify(changeSet: ChangeSet, options?: VerifyOptions): Promise<VerificationRun>;
 }
 
+/**
+ * A pre-run configuration error: the caller wired the run wrong, so the run
+ * never started and no check executed. Kept distinct from a check failure so a
+ * caller (e.g. #19's promotion gate) can tell "this run was misconfigured"
+ * apart from "this change set failed a check".
+ */
+export class VerificationConfigurationError extends Error {
+  readonly category = 'configuration' as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'VerificationConfigurationError';
+  }
+}
+
 function assertProvider(provider: CheckProvider): void {
   if (typeof provider.id !== 'string' || provider.id.trim().length === 0) {
-    throw new Error('a check provider requires a non-empty id');
+    throw new VerificationConfigurationError('a check provider requires a non-empty id');
   }
   const kinds = CHECK_KINDS[provider.category];
   if (!kinds) {
-    throw new Error(`unknown check category: ${provider.category}`);
+    throw new VerificationConfigurationError(`unknown check category: ${provider.category}`);
   }
   if (!kinds.includes(provider.kind)) {
-    throw new Error(
+    throw new VerificationConfigurationError(
       `check "${provider.id}" claims category "${provider.category}" with incompatible kind "${provider.kind}"`,
     );
   }
@@ -270,13 +285,24 @@ function suite(category: CheckCategory, checks: CheckResult[]): SuiteResult {
   return { category, checks: scoped, passed: scoped.every((check) => check.status === 'pass') };
 }
 
+/**
+ * Whether the run actually executed at least one check that produced durable
+ * evidence. An empty run verifies nothing: `every` over an empty set is
+ * vacuously true, so without this gate a misconfigured engine (no providers
+ * registered, or registrations never executed) would read as a green pass.
+ * Fail closed — `passed` is the promotion gate, never a silent pass.
+ */
+function executedChecks(checks: CheckResult[]): boolean {
+  return checks.some((check) => check.evidence.summary.trim().length > 0);
+}
+
 export function createVerificationEngine(): VerificationEngine {
   const providers: CheckProvider[] = [];
 
   function registerCheck(provider: CheckProvider): void {
     assertProvider(provider);
     if (providers.some((registered) => registered.id === provider.id)) {
-      throw new Error(`duplicate check id: ${provider.id}`);
+      throw new VerificationConfigurationError(`duplicate check id: ${provider.id}`);
     }
     providers.push(provider);
   }
@@ -295,7 +321,9 @@ export function createVerificationEngine(): VerificationEngine {
     for (const [criterion, checkIds] of Object.entries(mapping)) {
       for (const checkId of checkIds) {
         if (!registered.has(checkId)) {
-          throw new Error(`criterion "${criterion}" maps to unknown check "${checkId}"`);
+          throw new VerificationConfigurationError(
+            `criterion "${criterion}" maps to unknown check "${checkId}"`,
+          );
         }
       }
     }
@@ -348,6 +376,7 @@ export function createVerificationEngine(): VerificationEngine {
     }
 
     const passed =
+      executedChecks(checks) &&
       deterministic.passed &&
       behavioral.passed &&
       criterionResults.every((criterion) => criterion.status === 'pass');

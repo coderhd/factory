@@ -11,6 +11,7 @@ import {
   type CheckCategory,
   type CheckKind,
   type CheckProvider,
+  VerificationConfigurationError,
   type VerificationRun,
 } from '../../src/factory/verification/engine';
 
@@ -28,6 +29,28 @@ const baseChangeSet: ChangeSet = {
   diff: 'diff --git a/src/x.ts b/src/x.ts\n+export const x = 1;',
   artifactIds: ['art_log', 'art_screenshot'],
 };
+
+/** A complete E1 Attempt fixture — the one place the cross-module shape is pinned. */
+function makeAttempt(overrides: Partial<Attempt> = {}): Attempt {
+  return {
+    id: 'attempt_42',
+    taskId: 'task_42',
+    model: 'provider/model',
+    workerId: 'worker_1',
+    context: 'fresh',
+    skills: ['typescript'],
+    diff: 'diff --git a/b c/d',
+    artifactIds: ['art_1'],
+    interactionIds: [],
+    verificationRunIds: [],
+    environment: 'local',
+    outcome: 'success',
+    failureHistory: [],
+    createdAt: '2026-09-30T00:00:00.000Z',
+    updatedAt: '2026-09-30T00:00:00.000Z',
+    ...overrides,
+  };
+}
 
 /** A fake check that passes. */
 function passing(
@@ -99,23 +122,7 @@ describe('E5.1 check taxonomy (spec §14.1/§14.2)', () => {
 
 describe('E5.1 change set conformance to E1/E3 shapes', () => {
   it('derives a change set from an E1 Attempt without mutating it', () => {
-    const attempt: Attempt = {
-      id: 'attempt_42',
-      taskId: 'task_42',
-      model: 'provider/model',
-      workerId: 'worker_1',
-      context: 'fresh',
-      skills: ['typescript'],
-      diff: 'diff --git a/b c/d',
-      artifactIds: ['art_1'],
-      interactionIds: [],
-      verificationRunIds: [],
-      environment: 'local',
-      outcome: 'success',
-      failureHistory: [],
-      createdAt: '2026-09-30T00:00:00.000Z',
-      updatedAt: '2026-09-30T00:00:00.000Z',
-    };
+    const attempt: Attempt = makeAttempt();
 
     const changeSet = changeSetFromAttempt(attempt);
 
@@ -132,8 +139,8 @@ describe('E5.1 change set conformance to E1/E3 shapes', () => {
   });
 
   it('accepts a null diff (a failed Attempt with no change) unchanged', () => {
-    const attempt = { id: 'attempt_empty', taskId: 'task_1', diff: null, artifactIds: [] };
-    const changeSet = changeSetFromAttempt(attempt as Attempt);
+    const attempt = makeAttempt({ id: 'attempt_empty', diff: null, artifactIds: [] });
+    const changeSet = changeSetFromAttempt(attempt);
     expect(changeSet.diff).toBeNull();
     expect(changeSet.artifactIds).toEqual([]);
   });
@@ -181,6 +188,41 @@ describe('E5.1 category registration', () => {
       'duplicate check id: tsc',
     );
     expect(engine.listChecks()).toHaveLength(1);
+  });
+
+  it('rejects a check registered under an unknown category', () => {
+    const engine = createVerificationEngine();
+    expect(() =>
+      engine.registerCheck({
+        ...passing('mystery', 'deterministic', 'typecheck'),
+        category: 'chaos' as unknown as CheckCategory,
+      }),
+    ).toThrow('unknown check category: chaos');
+    expect(engine.listChecks()).toEqual([]);
+  });
+
+  it('rejects a provider whose id is empty or whitespace', () => {
+    const engine = createVerificationEngine();
+    expect(() => engine.registerCheck(passing('', 'deterministic', 'typecheck'))).toThrow(
+      'non-empty id',
+    );
+    expect(() => engine.registerCheck(passing('   ', 'behavioral', 'e2e'))).toThrow(
+      'non-empty id',
+    );
+    expect(engine.listChecks()).toEqual([]);
+  });
+
+  it('raises a structured configuration error, not a bare Error, for wiring mistakes', () => {
+    const engine = createVerificationEngine();
+    let caught: unknown;
+    try {
+      engine.registerCheck(passing('', 'deterministic', 'typecheck'));
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(VerificationConfigurationError);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as VerificationConfigurationError).category).toBe('configuration');
   });
 });
 
@@ -301,13 +343,23 @@ describe('E5.1 runner: deterministic + behavioral suites, per-criterion results'
     ).rejects.toThrow('unknown check');
   });
 
-  it('runs an empty engine as a vacuous pass', async () => {
+  it('fails closed on an empty run instead of a vacuous pass', async () => {
     const run = await createVerificationEngine().verify(baseChangeSet);
     expect(run.deterministic.checks).toEqual([]);
     expect(run.behavioral.checks).toEqual([]);
     expect(run.criteria).toEqual([]);
     expect(run.failures).toEqual([]);
-    expect(run.passed).toBe(true);
+    // No check executed, so the run proved nothing: never a silent pass.
+    expect(run.passed).toBe(false);
+  });
+
+  it('fails closed when criteria are supplied but no check is registered', async () => {
+    const run = await createVerificationEngine().verify(baseChangeSet, {
+      criteria: ['AC-1'],
+      criterionChecks: { 'AC-1': [] },
+    });
+    expect(run.criteria).toEqual([{ criterion: 'AC-1', status: 'unmapped', checkIds: [] }]);
+    expect(run.passed).toBe(false);
   });
 });
 
