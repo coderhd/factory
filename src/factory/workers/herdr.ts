@@ -121,7 +121,9 @@ export function createHerdrWorker(options: HerdrOptions = {}): WorkerAdapter {
   let result: WorkerResult | null = null;
   let heartbeatAt = new Date().toISOString();
   let stdoutBuffer = '';
-  let reportWaiter: ((value: WorkerResult) => void) | null = null;
+  // Every parked `collectArtifacts` call gets its own resolver; a single slot
+  // would let a second concurrent collect clobber (and leak) the first.
+  let reportWaiters: Array<(value: WorkerResult) => void> = [];
 
   const heartbeat = (): void => {
     heartbeatAt = new Date().toISOString();
@@ -129,9 +131,28 @@ export function createHerdrWorker(options: HerdrOptions = {}): WorkerAdapter {
 
   const settleReport = (report: WorkerResult): void => {
     result = report;
-    const waiter = reportWaiter;
-    reportWaiter = null;
-    waiter?.(report);
+    const waiters = reportWaiters;
+    reportWaiters = [];
+    for (const resolve of waiters) resolve(report);
+  };
+
+  /**
+   * Discard every trace of a prior run before a new one begins. The release
+   * rule keeps a worker's adapter alive across assignments, so a reused worker
+   * must never observe the previous assignment's settled report, buffered
+   * stdout or waiters (otherwise `status()` reports the old run's state and
+   * `collectArtifacts()` returns the old run's `WorkerResult`). A collect still
+   * parked here is a caller bug — the scheduler serializes polls per worker —
+   * and is settled as a failure rather than silently leaked.
+   */
+  const resetRunState = (): void => {
+    const waiters = reportWaiters;
+    reportWaiters = [];
+    for (const resolve of waiters) {
+      resolve(emptyResult('execution superseded before a report arrived'));
+    }
+    result = null;
+    stdoutBuffer = '';
   };
 
   const ingestLine = (line: string): void => {
@@ -175,8 +196,7 @@ export function createHerdrWorker(options: HerdrOptions = {}): WorkerAdapter {
       heartbeat();
     },
     async start(): Promise<void> {
-      result = null;
-      stdoutBuffer = '';
+      resetRunState();
       child = spawn(command, ['start'], {
         env: { ...process.env, ...(options.env ?? {}) },
         stdio: ['pipe', 'pipe', 'ignore'],
@@ -222,6 +242,10 @@ export function createHerdrWorker(options: HerdrOptions = {}): WorkerAdapter {
       return { state, lastHeartbeatAt: heartbeatAt };
     },
     async execute(envelope: ExecutionEnvelope): Promise<void> {
+      // A fresh run on a possibly-reused adapter: clear the prior run's report,
+      // buffered stdout and waiters before dispatching so this run cannot
+      // observe the previous assignment's state.
+      resetRunState();
       if (!child?.stdin) {
         result = emptyResult('herdr runtime is not running');
         return;
@@ -233,8 +257,10 @@ export function createHerdrWorker(options: HerdrOptions = {}): WorkerAdapter {
       if (result) return result;
       if (!child) return emptyResult('herdr runtime is not running');
       // Block until the runtime emits its next report (or exits without one).
+      // Concurrent collects all resolve with that same next report rather than
+      // overwriting one another's resolver.
       return new Promise<WorkerResult>((resolve) => {
-        reportWaiter = resolve;
+        reportWaiters.push(resolve);
       });
     },
     async destroy(): Promise<void> {

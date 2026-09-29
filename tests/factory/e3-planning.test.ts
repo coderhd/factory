@@ -103,7 +103,18 @@ class FakeHerdr implements WorkerAdapter {
   async pause(): Promise<void> {}
   async resume(): Promise<void> {}
   async status(): Promise<WorkerStatus> {
-    return { state: this.result ? 'completed' : 'running', lastHeartbeatAt: new Date().toISOString() };
+    // Mirror the real adapter's mapping (`herdr.ts` `status()`): the settled
+    // report's own state decides, otherwise the runtime is live while started.
+    const state: WorkerStatus['state'] = this.result
+      ? this.result.status === 'completed'
+        ? 'completed'
+        : this.result.status === 'waiting_input'
+          ? 'waiting_input'
+          : 'failed'
+      : this.started
+        ? 'running'
+        : 'stopped';
+    return { state, lastHeartbeatAt: new Date().toISOString() };
   }
   async execute(envelope: ExecutionEnvelope): Promise<void> {
     if (this.dispatchError) throw this.dispatchError;
@@ -1011,6 +1022,64 @@ describe('E3 assignment + completion rules', () => {
     }
   });
 
+  it('does not renew the lease when status() reports a non-live (failed) runtime', async () => {
+    const h = harness();
+    try {
+      const { dag } = plan(h, [{ nodeId: 'a', title: 'A' }]);
+      const a = nodeTask(dag, 'a');
+      const worker = h.workers.provisionWorker('herdr');
+
+      let renewals = 0;
+      const renewLease = h.workers.renewLease.bind(h.workers);
+      h.workers.renewLease = (workerId, binding, ttl) => {
+        renewals += 1;
+        return renewLease(workerId, binding, ttl);
+      };
+
+      // The runtime settles a `failed` report; a poll sees a non-live status.
+      h.adapters[0].result = failedResult('boom');
+      h.scheduler.tick();
+      await settle();
+
+      expect((await h.workers.status(worker.id)).state).toBe('failed');
+      // Only `startTask`'s grant — the dead runtime's lease is not extended
+      // (design §6.2; a wedged runtime must not hold a lease forever).
+      expect(renewals).toBe(1);
+      expect(stateOf(h, a)).toBe('RUNNING');
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('renews the lease when status() reports a live waiting_input runtime', async () => {
+    const h = harness();
+    try {
+      const { dag } = plan(h, [{ nodeId: 'a', title: 'A' }]);
+      const a = nodeTask(dag, 'a');
+      const worker = h.workers.provisionWorker('herdr');
+
+      let renewals = 0;
+      const renewLease = h.workers.renewLease.bind(h.workers);
+      h.workers.renewLease = (workerId, binding, ttl) => {
+        renewals += 1;
+        return renewLease(workerId, binding, ttl);
+      };
+
+      // A live runtime that has asked a question still holds its lease.
+      h.adapters[0].result = waitingResult();
+      h.scheduler.tick();
+      await settle();
+
+      expect((await h.workers.status(worker.id)).state).toBe('waiting_input');
+      // `startTask`'s grant plus the poll's heartbeat off the live status.
+      expect(renewals).toBe(2);
+      expect(workerOf(h, worker.id).runtimeState).toBe('BUSY');
+      expect(workerOf(h, worker.id).lease?.taskId).toBe(a);
+    } finally {
+      h.store.close();
+    }
+  });
+
   it('surfaces a dispatch rejection as a failed WorkerResult', async () => {
     const h = harness();
     try {
@@ -1170,6 +1239,69 @@ describe('E3 Herdr adapter wire protocol', () => {
       expect(result.status).toBe('failed');
       expect(result.failure).toContain('without emitting a report');
       expect((await adapter.status()).state).toBe('failed');
+    } finally {
+      await adapter.destroy();
+    }
+  });
+
+  it('drops the previous run when a reused adapter executes again', async () => {
+    const report = (sha: string): WorkerResult => ({
+      status: 'completed',
+      commits: [{ sha, message: sha }],
+      artifacts: [],
+      interactions: [],
+      observations: [],
+      verificationRequests: [],
+      diff: `diff:${sha}`,
+      failure: null,
+    });
+    const script = stubScript(
+      'herdr-reuse.sh',
+      [
+        'read -r line',
+        `echo '${JSON.stringify(report('first'))}'`,
+        'read -r line',
+        'sleep 0.2',
+        `echo '${JSON.stringify(report('second'))}'`,
+      ].join('\n'),
+    );
+    const adapter = createHerdrWorker({ command: script });
+    try {
+      await adapter.start();
+
+      await adapter.execute(envelope);
+      const first = await adapter.collectArtifacts();
+      expect(first.commits).toEqual([{ sha: 'first', message: 'first' }]);
+      expect((await adapter.status()).state).toBe('completed');
+
+      // The release rule keeps the adapter alive across assignments, so a
+      // second run reuses it. The first run's settled report must not leak.
+      await adapter.execute(envelope);
+      expect((await adapter.status()).state).toBe('running');
+      const second = await adapter.collectArtifacts();
+      expect(second.commits).toEqual([{ sha: 'second', message: 'second' }]);
+      expect(second.diff).toBe('diff:second');
+    } finally {
+      await adapter.destroy();
+    }
+  });
+
+  it('resolves every concurrent collect with the next report instead of orphaning one', async () => {
+    const script = stubScript(
+      'herdr-waiters.sh',
+      `read -r line\nsleep 0.1\necho '{"status":"completed","commits":[{"sha":"only","message":"m"}],"diff":"d"}'`,
+    );
+    const adapter = createHerdrWorker({ command: script });
+    try {
+      await adapter.start();
+      await adapter.execute(envelope);
+
+      const [a, b] = await Promise.all([
+        adapter.collectArtifacts(),
+        adapter.collectArtifacts(),
+      ]);
+      expect(a.commits).toEqual([{ sha: 'only', message: 'm' }]);
+      expect(b.commits).toEqual(a.commits);
     } finally {
       await adapter.destroy();
     }
