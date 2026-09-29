@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import type { Attempt } from '../../src/factory/domain/workOrder';
+import type { Attempt, WorkOrder } from '../../src/factory/domain/workOrder';
 import {
   BEHAVIORAL_CHECKS,
   CHECK_KINDS,
@@ -9,11 +9,29 @@ import {
   createVerificationEngine,
   type ChangeSet,
   type CheckCategory,
+  type CheckEvidence,
   type CheckKind,
   type CheckProvider,
+  type FailureRecord,
+  type SuiteResult,
   VerificationConfigurationError,
   type VerificationRun,
 } from '../../src/factory/verification/engine';
+import {
+  buildSemanticContext,
+  createSemanticVerifier,
+  type JudgeRuling,
+  type ModelIdentity,
+  type PromptProvenance,
+  type SemanticJudge,
+  type SemanticVerificationResult,
+  type SemanticVerifyInput,
+} from '../../src/factory/verification/semantic';
+import {
+  buildEvidenceBundle,
+  type CriterionProof,
+  type EvidenceBundleInput,
+} from '../../src/factory/evidence/bundle';
 
 /**
  * E5.1 (#18) verification engine harness. All checks here are FAKE providers —
@@ -529,5 +547,567 @@ describe('E5.1 engine mutates nothing', () => {
     // Mutating the engine's copy cannot corrupt the provider's object.
     run.deterministic.checks[0]!.evidence.artifacts?.push('later');
     expect(evidence.artifacts).toEqual(['a.log']);
+  });
+});
+
+/**
+ * E5.2 (#19) independent semantic verifier + immutable Evidence Bundle. The
+ * judge is always a FAKE (hermetic; no model, no network); the verifier must
+ * falsify ACs from fresh context, never the developer transcript, and never be
+ * the same model that wrote the change.
+ */
+
+function makeWorkOrder(overrides: Partial<WorkOrder> = {}): WorkOrder {
+  return {
+    id: 'wo_1',
+    intent: 'Add a cart total',
+    acceptanceCriteria: ['AC-cart-total', 'AC-cart-empty'],
+    riskTier: 'YELLOW',
+    constraints: [],
+    outOfScope: [],
+    repository: null,
+    requiredVerification: [],
+    state: 'VERIFYING',
+    createdAt: '2026-09-30T00:00:00.000Z',
+    updatedAt: '2026-09-30T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+const generatorIdentity: ModelIdentity = {
+  provider: 'opencode-go',
+  model: 'writer-1',
+  family: 'fam-writer',
+};
+const judgeIdentity: ModelIdentity = {
+  provider: 'opencode-go',
+  model: 'judge-1',
+  family: 'fam-judge',
+};
+const promptProvenance: PromptProvenance = { id: 'semantic-rubric', version: 'v1' };
+
+function suiteOf(category: CheckCategory, passed = true): SuiteResult {
+  return { category, checks: [], passed };
+}
+
+function semanticInput(overrides: Partial<SemanticVerifyInput> = {}): SemanticVerifyInput {
+  return {
+    workOrder: makeWorkOrder(),
+    changeSet: baseChangeSet,
+    deterministic: suiteOf('deterministic'),
+    behavioral: suiteOf('behavioral'),
+    ...overrides,
+  };
+}
+
+function passRulings(criteria: string[], identity: ModelIdentity = judgeIdentity): JudgeRuling[] {
+  return criteria.map((criterion) => ({
+    criterion,
+    falsified: false,
+    evidence: { summary: `${criterion}: survived "${identity.model}" falsification` },
+  }));
+}
+
+function falsifyingRulings(criteria: string[]): JudgeRuling[] {
+  return criteria.map((criterion) => ({
+    criterion,
+    falsified: true,
+    evidence: { summary: `${criterion}: counterexample found in the diff` },
+    diagnosis: `${criterion} not satisfied`,
+    action: `fix ${criterion}`,
+  }));
+}
+
+function judgeReturning(rulings: JudgeRuling[], identity: ModelIdentity = judgeIdentity): SemanticJudge {
+  return { identity, falsify: () => rulings };
+}
+
+function semanticVerifier(judge: SemanticJudge, generator: ModelIdentity = generatorIdentity) {
+  return createSemanticVerifier({
+    judge,
+    generator,
+    prompt: promptProvenance,
+    rubric: ['seek counterexamples, not confirmation'],
+  });
+}
+
+const FRESH_CONTEXT_KEYS = [
+  'behavioral',
+  'changeSet',
+  'criteria',
+  'deterministic',
+  'rubric',
+  'workOrder',
+];
+
+describe('E5.2 semantic verifier: fresh context (spec §9)', () => {
+  it('carries the work order, ACs, change set, tier results and rubric — and nothing else', () => {
+    const context = buildSemanticContext({
+      workOrder: makeWorkOrder(),
+      changeSet: baseChangeSet,
+      deterministic: suiteOf('deterministic'),
+      behavioral: suiteOf('behavioral'),
+      rubric: ['seek counterexamples'],
+    });
+
+    expect(Object.keys(context).sort()).toEqual(FRESH_CONTEXT_KEYS);
+    expect(context.criteria).toEqual(['AC-cart-total', 'AC-cart-empty']);
+    expect(context.rubric).toEqual(['seek counterexamples']);
+    expect(context.changeSet).toEqual(baseChangeSet);
+    expect('transcript' in context).toBe(false);
+  });
+
+  it('refuses a developer transcript supplied to the context builder', () => {
+    expect(() =>
+      buildSemanticContext({
+        workOrder: makeWorkOrder(),
+        changeSet: baseChangeSet,
+        deterministic: suiteOf('deterministic'),
+        behavioral: suiteOf('behavioral'),
+        rubric: [],
+        transcript: 'the developer reasoned like so...',
+      } as unknown as Parameters<typeof buildSemanticContext>[0]),
+    ).toThrow('rejects field "transcript"');
+  });
+
+  it('hands the judge a private change set, never the caller object', async () => {
+    const changeSet: ChangeSet = { ...baseChangeSet, artifactIds: ['art_1'] };
+    const snapshot = structuredClone(changeSet);
+    const judge: SemanticJudge = {
+      identity: judgeIdentity,
+      falsify: (context) => {
+        // A misbehaving judge must not be able to reach the caller's object.
+        context.changeSet.artifactIds.push('injected');
+        context.changeSet.diff = 'overwritten';
+        return passRulings(context.criteria);
+      },
+    };
+
+    await semanticVerifier(judge).verify(semanticInput({ changeSet }));
+
+    expect(changeSet).toEqual(snapshot);
+  });
+
+  it('honours a caller-supplied criterion list over the work order default', async () => {
+    const judge = judgeReturning(passRulings(['AC-subset']));
+    const result = await semanticVerifier(judge).verify(semanticInput({ criteria: ['AC-subset'] }));
+    expect(result.verdicts.map((verdict) => verdict.criterion)).toEqual(['AC-subset']);
+  });
+
+  it('drops runtime fields smuggled onto the work order', () => {
+    const workOrder = {
+      ...makeWorkOrder(),
+      transcript: 'developer reasoning',
+    } as unknown as WorkOrder;
+
+    const context = buildSemanticContext({
+      workOrder,
+      changeSet: baseChangeSet,
+      deterministic: suiteOf('deterministic'),
+      behavioral: suiteOf('behavioral'),
+      rubric: [],
+    });
+
+    expect('transcript' in context.workOrder).toBe(false);
+    expect(JSON.stringify(context)).not.toContain('developer reasoning');
+  });
+});
+
+describe('E5.2 writer ≠ verifier (spec §9)', () => {
+  it('rejects a same-model self-sign-off', () => {
+    const judge = judgeReturning([], generatorIdentity);
+    expect(() => semanticVerifier(judge, generatorIdentity)).toThrow('same-model self-sign-off');
+  });
+
+  it('rejects the same model name even when the provider differs', () => {
+    const judge = judgeReturning([], { provider: 'other-provider', model: 'writer-1', family: 'fam-judge' });
+    expect(() => semanticVerifier(judge)).toThrow('same-model self-sign-off');
+  });
+
+  it('rejects a model id that only differs by case or whitespace', () => {
+    const judge = judgeReturning([], { provider: 'opencode-go', model: '  WRITER-1 ', family: 'fam-judge' });
+    expect(() => semanticVerifier(judge)).toThrow('same-model self-sign-off');
+  });
+
+  it('refuses to verify when the generator identity is missing', () => {
+    expect(() =>
+      createSemanticVerifier({
+        judge: judgeReturning([]),
+        generator: undefined as unknown as ModelIdentity,
+        prompt: promptProvenance,
+        rubric: [],
+      }),
+    ).toThrow('generator identity');
+  });
+
+  it('accepts an independent model and attests model/family difference', async () => {
+    const result = await semanticVerifier(
+      judgeReturning(passRulings(['AC-cart-total', 'AC-cart-empty'])),
+    ).verify(semanticInput());
+
+    expect(result.provenance).toEqual({ modelDifferent: true, familyDifferent: true, freshContext: true });
+    expect(result.generator).toEqual(generatorIdentity);
+    expect(result.verifier).toEqual(judgeIdentity);
+    expect(result.prompt).toEqual(promptProvenance);
+    expect(result.changeSetId).toBe('cs_1');
+  });
+
+  it('permits a different model in the same family but records familyDifferent=false', async () => {
+    const sameFamilyJudge = judgeReturning(passRulings(['AC-cart-total', 'AC-cart-empty']), {
+      provider: 'opencode-go',
+      model: 'judge-2',
+      family: 'fam-writer',
+    });
+    const result = await semanticVerifier(sameFamilyJudge).verify(semanticInput());
+
+    expect(result.provenance.modelDifferent).toBe(true);
+    expect(result.provenance.familyDifferent).toBe(false);
+    expect(result.passed).toBe(true);
+  });
+
+  it('snapshots the generator identity, so later mutation cannot forge provenance', async () => {
+    const mutableGenerator: ModelIdentity = {
+      provider: 'opencode-go',
+      model: 'writer-1',
+      family: 'fam-writer',
+    };
+    const verifier = semanticVerifier(
+      judgeReturning(passRulings(['AC-cart-total', 'AC-cart-empty'])),
+      mutableGenerator,
+    );
+
+    // Forge the generator's identity after construction.
+    mutableGenerator.model = 'judge-1';
+
+    const result = await verifier.verify(semanticInput());
+    expect(result.generator.model).toBe('writer-1');
+    expect(result.provenance.modelDifferent).toBe(true);
+  });
+});
+
+describe('E5.2 semantic falsification (spec §14.3)', () => {
+  it('falsifies every AC and feeds the same structured failure shape', async () => {
+    const judge = judgeReturning(falsifyingRulings(['AC-cart-total', 'AC-cart-empty']));
+
+    const result = await semanticVerifier(judge).verify(semanticInput());
+
+    expect(result.verdicts.map((verdict) => [verdict.criterion, verdict.status])).toEqual([
+      ['AC-cart-total', 'fail'],
+      ['AC-cart-empty', 'fail'],
+    ]);
+    expect(result.passed).toBe(false);
+    expect(result.failures).toHaveLength(2);
+
+    const failure = result.failures[0]!;
+    // Exactly E5.1's FailureRecord fields: same shape, `semantic` category.
+    const failureKeys: Array<keyof FailureRecord> = [
+      'category',
+      'criterion',
+      'verifier',
+      'evidence',
+      'diagnosis',
+      'action',
+    ];
+    expect(Object.keys(failure).sort()).toEqual([...failureKeys].sort());
+    expect(failure.category).toBe('semantic');
+    expect(failure.criterion).toBe('AC-cart-total');
+    expect(failure.verifier).toBe('opencode-go/judge-1');
+    expect(failure.evidence.summary).toContain('counterexample');
+    expect(failure.diagnosis).toBe('AC-cart-total not satisfied');
+    expect(failure.action).toBe('fix AC-cart-total');
+  });
+
+  it('fails closed when the judge returns no ruling for an AC', async () => {
+    const judge = judgeReturning([
+      { criterion: 'AC-cart-total', falsified: false, evidence: { summary: 'no counterexample' } },
+    ]);
+    const result = await semanticVerifier(judge).verify(semanticInput());
+
+    expect(result.verdicts.map((verdict) => verdict.status)).toEqual(['pass', 'fail']);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]!.criterion).toBe('AC-cart-empty');
+    expect(result.failures[0]!.diagnosis).toContain('no semantic ruling');
+    expect(result.passed).toBe(false);
+  });
+
+  it('turns a thrown judge into structured failures, never a crash', async () => {
+    const judge: SemanticJudge = {
+      identity: judgeIdentity,
+      falsify: () => {
+        throw new Error('judge model offline');
+      },
+    };
+    const result = await semanticVerifier(judge).verify(semanticInput());
+
+    expect(result.passed).toBe(false);
+    expect(result.failures).toHaveLength(2);
+    expect(result.failures[0]!.evidence.summary).toContain('judge model offline');
+    expect(result.failures[0]!.diagnosis.length).toBeGreaterThan(0);
+    expect(result.failures[0]!.action.length).toBeGreaterThan(0);
+  });
+
+  it('refuses to pass a ruling that carried no evidence', async () => {
+    const judge = judgeReturning([
+      { criterion: 'AC-cart-total', falsified: false, evidence: undefined as unknown as CheckEvidence },
+    ]);
+    const result = await semanticVerifier(judge).verify(semanticInput({ criteria: ['AC-cart-total'] }));
+
+    expect(result.verdicts[0]!.status).toBe('fail');
+    expect(result.failures[0]!.diagnosis).toContain('no evidence');
+    expect(result.passed).toBe(false);
+  });
+
+  it('fails closed on an empty acceptance-criterion set', async () => {
+    const result = await semanticVerifier(judgeReturning([])).verify(semanticInput({ criteria: [] }));
+
+    expect(result.verdicts).toEqual([]);
+    expect(result.failures).toEqual([]);
+    expect(result.passed).toBe(false);
+  });
+
+  it('passes only when every AC survives falsification', async () => {
+    const judge = judgeReturning(passRulings(['AC-cart-total', 'AC-cart-empty']));
+    const result = await semanticVerifier(judge).verify(semanticInput());
+
+    expect(result.passed).toBe(true);
+    expect(result.failures).toEqual([]);
+    expect(result.verdicts.every((verdict) => verdict.status === 'pass')).toBe(true);
+  });
+});
+
+/** A real E5.1 run covering both ACs with a deterministic and a behavioral check. */
+async function greenRun(): Promise<VerificationRun> {
+  const engine = createVerificationEngine();
+  engine.registerCheck(passing('typecheck', 'deterministic', 'typecheck'));
+  engine.registerCheck(passing('playwright', 'behavioral', 'playwright'));
+  return engine.verify(baseChangeSet, {
+    criteria: ['AC-cart-total', 'AC-cart-empty'],
+    criterionChecks: { 'AC-cart-total': ['typecheck'], 'AC-cart-empty': ['playwright'] },
+  });
+}
+
+async function passedSemantic(): Promise<SemanticVerificationResult> {
+  return semanticVerifier(judgeReturning(passRulings(['AC-cart-total', 'AC-cart-empty']))).verify(
+    semanticInput(),
+  );
+}
+
+function generatorAttempt(overrides: Partial<Attempt> = {}): Attempt {
+  return makeAttempt({ id: 'attempt_1', taskId: 'task_1', outcome: 'success', artifactIds: ['art_1'], ...overrides });
+}
+
+async function greenBundleInput(): Promise<EvidenceBundleInput> {
+  return {
+    workOrder: makeWorkOrder(),
+    changeSet: baseChangeSet,
+    run: await greenRun(),
+    semantic: await passedSemantic(),
+    attempts: [generatorAttempt()],
+    now: '2026-09-30T12:00:00.000Z',
+  };
+}
+
+const EVIDENCE_BUNDLE_KEYS = [
+  'advisory',
+  'attempts',
+  'changeSetId',
+  'complete',
+  'createdAt',
+  'criteria',
+  'gates',
+  'id',
+  'provenance',
+  'tierSignOff',
+  'workOrderId',
+];
+
+describe('E5.2 Evidence Bundle: every AC maps to proof (spec §5.4/§14.4)', () => {
+  it('contains ac→proof, gates, provenance, tier sign-off and attempt history', async () => {
+    const bundle = buildEvidenceBundle(await greenBundleInput());
+
+    expect(Object.keys(bundle).sort()).toEqual(EVIDENCE_BUNDLE_KEYS);
+    expect(bundle.id.startsWith('eb_')).toBe(true);
+    expect(bundle.workOrderId).toBe('wo_1');
+    expect(bundle.changeSetId).toBe('cs_1');
+    expect(bundle.createdAt).toBe('2026-09-30T12:00:00.000Z');
+
+    expect(bundle.criteria.map((criterion) => [criterion.criterion, criterion.status])).toEqual([
+      ['AC-cart-total', 'pass'],
+      ['AC-cart-empty', 'pass'],
+    ]);
+    expect(bundle.criteria[0]!.proofs.map((proof) => [proof.tier, proof.verifier, proof.status])).toEqual([
+      ['deterministic', 'typecheck', 'pass'],
+      ['semantic', 'opencode-go/judge-1', 'pass'],
+    ]);
+
+    expect(bundle.gates).toEqual({ deterministic: true, behavioral: true, semantic: true, run: true });
+    expect(bundle.provenance).toEqual({
+      generator: generatorIdentity,
+      verifier: judgeIdentity,
+      prompt: promptProvenance,
+      modelDifferent: true,
+      familyDifferent: true,
+      freshContext: true,
+    });
+    expect(bundle.tierSignOff).toEqual([
+      { tier: 'deterministic', signedOff: true, verifiers: ['typecheck'] },
+      { tier: 'behavioral', signedOff: true, verifiers: ['playwright'] },
+      { tier: 'semantic', signedOff: true, verifiers: ['opencode-go/judge-1'] },
+    ]);
+    expect(bundle.attempts).toEqual([
+      {
+        attemptId: 'attempt_1',
+        model: 'provider/model',
+        outcome: 'success',
+        failureCount: 0,
+        artifactIds: ['art_1'],
+        createdAt: '2026-09-30T00:00:00.000Z',
+      },
+    ]);
+    expect(bundle.complete).toBe(true);
+  });
+
+  it('marks an AC with no proof as uncovered and fails the bundle closed', async () => {
+    const input = await greenBundleInput();
+    const bundle = buildEvidenceBundle({
+      ...input,
+      workOrder: makeWorkOrder({
+        acceptanceCriteria: ['AC-cart-total', 'AC-cart-empty', 'AC-untested'],
+      }),
+    });
+
+    expect(bundle.criteria.find((criterion) => criterion.criterion === 'AC-untested')).toEqual({
+      criterion: 'AC-untested',
+      status: 'uncovered',
+      proofs: [],
+    });
+    expect(bundle.criteria.map((criterion) => criterion.status)).toEqual(['pass', 'pass', 'uncovered']);
+    expect(bundle.complete).toBe(false);
+  });
+
+  it('gates on the run-level result, never a vacuously-passing per-category suite', async () => {
+    const emptyRun: VerificationRun = {
+      changeSetId: 'cs_1',
+      deterministic: { category: 'deterministic', checks: [], passed: true },
+      behavioral: { category: 'behavioral', checks: [], passed: true },
+      criteria: [],
+      failures: [],
+      passed: false,
+    };
+    const bundle = buildEvidenceBundle({ ...(await greenBundleInput()), run: emptyRun });
+
+    // Per-category `passed` is vacuously true; that is not tier coverage.
+    expect(emptyRun.deterministic.passed).toBe(true);
+    expect(emptyRun.behavioral.passed).toBe(true);
+    expect(bundle.gates.deterministic).toBe(false);
+    expect(bundle.gates.behavioral).toBe(false);
+    expect(bundle.gates.run).toBe(false);
+    expect(bundle.complete).toBe(false);
+  });
+
+  it('does not treat an empty acceptance-criterion set as complete', async () => {
+    const input = await greenBundleInput();
+    const bundle = buildEvidenceBundle({
+      ...input,
+      workOrder: makeWorkOrder({ acceptanceCriteria: [] }),
+      run: await createVerificationEngine().verify(baseChangeSet),
+      semantic: await semanticVerifier(judgeReturning([])).verify(semanticInput({ criteria: [] })),
+    });
+
+    expect(bundle.criteria).toEqual([]);
+    expect(bundle.complete).toBe(false);
+  });
+
+  it('refuses to assemble a bundle whose tiers describe a different change set', async () => {
+    const input = await greenBundleInput();
+    expect(() =>
+      buildEvidenceBundle({ ...input, changeSet: { ...baseChangeSet, id: 'cs_other' } }),
+    ).toThrow('change set');
+  });
+
+  it('records a curated attempt history, never the developer transcript', async () => {
+    const attempt = generatorAttempt({
+      diff: 'diff --git a/secret.ts b/secret.ts',
+      interactionIds: ['chat_1'],
+      failureHistory: [{ at: '2026-09-30T00:00:00.000Z', failure: 'flaky test' }],
+    });
+    const bundle = buildEvidenceBundle({ ...(await greenBundleInput()), attempts: [attempt] });
+
+    expect(Object.keys(bundle.attempts[0]!).sort()).toEqual([
+      'artifactIds',
+      'attemptId',
+      'createdAt',
+      'failureCount',
+      'model',
+      'outcome',
+    ]);
+    expect(bundle.attempts[0]!.failureCount).toBe(1);
+    expect(JSON.stringify(bundle)).not.toContain('secret.ts');
+    expect(JSON.stringify(bundle)).not.toContain('chat_1');
+  });
+
+  it('records the agent self-assessment as advisory and never gates on it', async () => {
+    const falsified = await semanticVerifier(
+      judgeReturning(falsifyingRulings(['AC-cart-total'])),
+    ).verify(semanticInput());
+
+    const bundle = buildEvidenceBundle({ ...(await greenBundleInput()), semantic: falsified });
+
+    expect(bundle.advisory.selfAssessment).toBe('success');
+    expect(bundle.complete).toBe(false);
+    expect(bundle.criteria.find((criterion) => criterion.criterion === 'AC-cart-total')!.status).toBe(
+      'fail',
+    );
+  });
+
+  it('is immutable once produced', async () => {
+    const bundle = buildEvidenceBundle(await greenBundleInput());
+
+    expect(Object.isFrozen(bundle)).toBe(true);
+    expect(Object.isFrozen(bundle.criteria)).toBe(true);
+    expect(Object.isFrozen(bundle.criteria[0])).toBe(true);
+    expect(Object.isFrozen(bundle.criteria[0]!.proofs)).toBe(true);
+    expect(Object.isFrozen(bundle.criteria[0]!.proofs[0]!.evidence)).toBe(true);
+    expect(Object.isFrozen(bundle.provenance)).toBe(true);
+    expect(Object.isFrozen(bundle.gates)).toBe(true);
+    expect(Object.isFrozen(bundle.attempts)).toBe(true);
+
+    expect(() =>
+      (bundle.criteria as CriterionProof[]).push({ criterion: 'x', status: 'pass', proofs: [] }),
+    ).toThrow();
+    expect(() => {
+      (bundle as { complete: boolean }).complete = false;
+    }).toThrow();
+    expect(() => {
+      (bundle.criteria[0] as { status: string }).status = 'fail';
+    }).toThrow();
+  });
+
+  it('copies its inputs, so later mutation cannot rewrite the receipt', async () => {
+    const input = await greenBundleInput();
+    const bundle = buildEvidenceBundle(input);
+    const before = structuredClone(bundle);
+
+    input.semantic.verdicts[0]!.evidence.summary = 'tampered';
+    input.run.criteria[0]!.status = 'fail';
+    input.attempts[0]!.artifactIds.push('injected');
+    input.changeSet.artifactIds.push('injected');
+
+    expect(bundle).toEqual(before);
+  });
+
+  it('does not mutate the implementation while assembling evidence', async () => {
+    const input = await greenBundleInput();
+    const snapshot = {
+      changeSet: structuredClone(input.changeSet),
+      run: structuredClone(input.run),
+      semantic: structuredClone(input.semantic),
+    };
+
+    buildEvidenceBundle(input);
+
+    expect(input.changeSet).toEqual(snapshot.changeSet);
+    expect(input.run).toEqual(snapshot.run);
+    expect(input.semantic).toEqual(snapshot.semantic);
   });
 });
