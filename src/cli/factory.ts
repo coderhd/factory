@@ -1,0 +1,483 @@
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { createFactoryClient } from '../factory/api/client';
+import { startFactoryServer, type FactoryServerDeps } from '../factory/api/server';
+import { createBackup, restoreBackup } from '../factory/backup/archive';
+import {
+  DEFAULT_FACTORY_CONFIG,
+  parseFactoryConfig,
+  resolveFactoryConfig,
+  serializeFactoryConfig,
+  type FactoryRuntimeConfig,
+} from '../factory/config/factoryConfig';
+import { openEventLog } from '../factory/events/log';
+import { createEmptyEvidenceReadPort } from '../factory/observatory/observatory';
+import { createScheduler } from '../factory/scheduler/scheduler';
+import { openStateStore } from '../factory/state/store';
+import { createHerdrWorker } from '../factory/workers/herdr';
+import { createWorkerManager } from '../factory/workers/manager';
+import { createWorktreeManager } from '../factory/worktrees/worktree';
+
+/**
+ * The E2 `factory` CLI (spec §20 operator interface): `init`, `start`, `stop`,
+ * `status`, `update`, `backup`, `restore`, plus `wo submit/status/answer` and
+ * `observatory`. Every client command goes through the API client — the CLI
+ * never touches the store directly — so the server stays the sole mutation
+ * authority. Lifecycle + backup/restore are operator/deployment operations on
+ * local files.
+ */
+
+export interface CliIO {
+  cwd?: string;
+  out: (line: string) => void;
+  err: (line: string) => void;
+  fetch?: typeof fetch;
+}
+
+interface ParsedArgs {
+  positionals: string[];
+  flags: Map<string, string[]>;
+}
+
+function parseArgs(argv: string[]): ParsedArgs {
+  const positionals: string[] = [];
+  const flags = new Map<string, string[]>();
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (!arg.startsWith('--')) {
+      positionals.push(arg);
+      continue;
+    }
+    const key = arg.slice(2);
+    const next = argv[i + 1];
+    const values = flags.get(key) ?? [];
+    if (next !== undefined && !next.startsWith('--')) {
+      values.push(next);
+      i += 1;
+    } else {
+      values.push('true');
+    }
+    flags.set(key, values);
+  }
+  return { positionals, flags };
+}
+
+const flag = (args: ParsedArgs, name: string): string | undefined => args.flags.get(name)?.[0];
+const hasFlag = (args: ParsedArgs, name: string): boolean => args.flags.has(name);
+
+function resolveDir(args: ParsedArgs, io: CliIO): string {
+  return resolve(flag(args, 'dir') ?? io.cwd ?? process.cwd());
+}
+
+const configPath = (dir: string): string => join(dir, 'factory.yaml');
+const runtimeFilePath = (dir: string): string => join(dir, '.factory', 'runtime.json');
+
+interface RuntimeFile {
+  pid: number;
+  url: string;
+  port: number;
+  dir: string;
+  startedAt: string;
+}
+
+function readRuntimeFile(dir: string): RuntimeFile | null {
+  const path = runtimeFilePath(dir);
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, 'utf8')) as RuntimeFile;
+  } catch {
+    return null;
+  }
+}
+
+function writeRuntimeFile(dir: string, info: RuntimeFile): void {
+  mkdirSync(join(dir, '.factory'), { recursive: true });
+  writeFileSync(runtimeFilePath(dir), `${JSON.stringify(info, null, 2)}\n`);
+}
+
+function clearRuntimeFile(dir: string): void {
+  rmSync(runtimeFilePath(dir), { force: true });
+}
+
+function timestamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+interface LoadedConfig {
+  text: string;
+  runtime: FactoryRuntimeConfig;
+}
+
+function loadConfig(dir: string, io: CliIO): LoadedConfig | null {
+  const path = configPath(dir);
+  if (!existsSync(path)) {
+    io.err(`factory.yaml not found at ${path}; run "factory init" first`);
+    return null;
+  }
+  const text = readFileSync(path, 'utf8');
+  const parsed = parseFactoryConfig(text);
+  if (!parsed.ok) {
+    for (const issue of parsed.issues) io.err(`${issue.path || 'factory.yaml'}: ${issue.message}`);
+    return null;
+  }
+  return { text, runtime: resolveFactoryConfig(parsed.config, { baseDir: dir }) };
+}
+
+function ensureStorageDirs(runtime: FactoryRuntimeConfig): void {
+  for (const path of [runtime.paths.state, runtime.paths.artifacts, runtime.paths.knowledge]) {
+    mkdirSync(path, { recursive: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Server lifecycle
+// ---------------------------------------------------------------------------
+
+function buildServerDeps(dir: string, runtime: FactoryRuntimeConfig): FactoryServerDeps {
+  const store = openStateStore(runtime.paths.db);
+  const events = openEventLog(store.db);
+  const workers = createWorkerManager({ store, events, spawn: () => createHerdrWorker() });
+  const worktrees = createWorktreeManager({
+    rootDir: join(dir, '.factory', 'worktrees'),
+    baseBranch: 'main',
+  });
+  // The scheduler is consumed for its read-side status projection (brief:
+  // "E3 scheduler (status)"). Driving the execution loop + worker runtime is
+  // the execution-integration phase, not E2.1, so its timer is not started.
+  const scheduler = createScheduler({ store, events, workers, worktrees });
+  return {
+    store,
+    events,
+    evidence: createEmptyEvidenceReadPort(),
+    scheduler,
+    version: runtime.factoryVersion,
+    schemaVersion: runtime.schemaVersion,
+  };
+}
+
+async function cmdInit(args: ParsedArgs, io: CliIO): Promise<number> {
+  const dir = resolveDir(args, io);
+  mkdirSync(dir, { recursive: true });
+  const path = configPath(dir);
+  if (existsSync(path)) {
+    const parsed = parseFactoryConfig(readFileSync(path, 'utf8'));
+    if (!parsed.ok) {
+      for (const issue of parsed.issues) io.err(`${issue.path || 'factory.yaml'}: ${issue.message}`);
+      return 1;
+    }
+    ensureStorageDirs(resolveFactoryConfig(parsed.config, { baseDir: dir }));
+    io.out(`factory.yaml already present and valid: ${path}`);
+    return 0;
+  }
+  writeFileSync(path, serializeFactoryConfig(DEFAULT_FACTORY_CONFIG));
+  ensureStorageDirs(resolveFactoryConfig(DEFAULT_FACTORY_CONFIG, { baseDir: dir }));
+  io.out(path);
+  return 0;
+}
+
+async function cmdStatus(args: ParsedArgs, io: CliIO): Promise<number> {
+  const dir = resolveDir(args, io);
+  const explicitUrl = flag(args, 'url');
+  const runtimeFile = readRuntimeFile(dir);
+  const url = explicitUrl ?? runtimeFile?.url;
+  if (!url) {
+    io.out(JSON.stringify({ status: 'stopped' }));
+    return 0;
+  }
+  try {
+    const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+    const health = await client.health();
+    io.out(
+      JSON.stringify({
+        status: 'running',
+        url,
+        instanceId: health.instanceId,
+        version: health.version,
+        schemaVersion: health.schemaVersion,
+      }),
+    );
+  } catch {
+    io.out(JSON.stringify({ status: 'stopped', url }));
+  }
+  return 0;
+}
+
+async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
+  const dir = resolveDir(args, io);
+  const loaded = loadConfig(dir, io);
+  if (!loaded) return 1;
+  const port = flag(args, 'port') !== undefined ? Number(flag(args, 'port')) : loaded.runtime.server.port;
+
+  const handle = startFactoryServer(buildServerDeps(dir, loaded.runtime), { port });
+  writeRuntimeFile(dir, {
+    pid: process.pid,
+    url: handle.url,
+    port: handle.port,
+    dir,
+    startedAt: new Date().toISOString(),
+  });
+  io.out(handle.url);
+
+  const shutdown = (): void => {
+    clearRuntimeFile(dir);
+    handle.stop();
+    process.exit(0);
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+  await new Promise<never>(() => {});
+  return 0;
+}
+
+async function cmdStart(args: ParsedArgs, io: CliIO): Promise<number> {
+  const dir = resolveDir(args, io);
+  const loaded = loadConfig(dir, io);
+  if (!loaded) return 1;
+  const port = flag(args, 'port') ?? String(loaded.runtime.server.port);
+
+  if (!hasFlag(args, 'detached')) {
+    return cmdServe({ ...args, flags: withFlag(args, 'port', port) }, io);
+  }
+
+  const cliFile = fileURLToPath(import.meta.url);
+  const child = Bun.spawn([process.execPath, cliFile, '__serve', '--dir', dir, '--port', port], {
+    stdio: ['ignore', 'ignore', 'ignore'],
+    env: process.env,
+  });
+  child.unref();
+
+  // The child writes runtime.json once it is listening; wait for it.
+  for (let i = 0; i < 50; i += 1) {
+    const runtimeFile = readRuntimeFile(dir);
+    if (runtimeFile) {
+      io.out(runtimeFile.url);
+      return 0;
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  }
+  io.err('server did not start within 5s');
+  return 1;
+}
+
+function withFlag(args: ParsedArgs, name: string, value: string): Map<string, string[]> {
+  const flags = new Map(args.flags);
+  flags.set(name, [value]);
+  return flags;
+}
+
+async function cmdStop(args: ParsedArgs, io: CliIO): Promise<number> {
+  const dir = resolveDir(args, io);
+  const runtimeFile = readRuntimeFile(dir);
+  if (!runtimeFile) {
+    io.out(JSON.stringify({ status: 'stopped', stopped: false }));
+    return 0;
+  }
+  try {
+    process.kill(runtimeFile.pid, 'SIGTERM');
+  } catch {
+    // Already gone — clearing the runtime file is still correct.
+  }
+  clearRuntimeFile(dir);
+  io.out(JSON.stringify({ status: 'stopped', stopped: true, pid: runtimeFile.pid }));
+  return 0;
+}
+
+async function cmdUpdate(args: ParsedArgs, io: CliIO): Promise<number> {
+  const dir = resolveDir(args, io);
+  const loaded = loadConfig(dir, io);
+  if (!loaded) return 1;
+  // Spec §20 upgrade procedure: mandatory pre-upgrade backup first.
+  const backup = join(dir, '.factory', 'backups', `pre-upgrade-${timestamp()}.tar.gz`);
+  createBackup({
+    stateDbPath: loaded.runtime.paths.db,
+    artifactsDir: loaded.runtime.paths.artifacts,
+    knowledgeDir: loaded.runtime.paths.knowledge,
+    configText: loaded.text,
+    outFile: backup,
+    factoryVersion: loaded.runtime.factoryVersion,
+    schemaVersion: loaded.runtime.schemaVersion,
+  });
+  io.out(
+    JSON.stringify({
+      configValid: true,
+      image: loaded.runtime.image.ref,
+      backup: resolve(backup),
+    }),
+  );
+  return 0;
+}
+
+async function cmdBackup(args: ParsedArgs, io: CliIO): Promise<number> {
+  const dir = resolveDir(args, io);
+  const loaded = loadConfig(dir, io);
+  if (!loaded) return 1;
+  const outFile = flag(args, 'out') ?? join(dir, '.factory', 'backups', `backup-${timestamp()}.tar.gz`);
+  createBackup({
+    stateDbPath: loaded.runtime.paths.db,
+    artifactsDir: loaded.runtime.paths.artifacts,
+    knowledgeDir: loaded.runtime.paths.knowledge,
+    configText: loaded.text,
+    outFile,
+    factoryVersion: loaded.runtime.factoryVersion,
+    schemaVersion: loaded.runtime.schemaVersion,
+  });
+  io.out(resolve(outFile));
+  return 0;
+}
+
+async function cmdRestore(args: ParsedArgs, io: CliIO): Promise<number> {
+  const archive = args.positionals[1];
+  const intoDir = flag(args, 'into');
+  if (!archive || !intoDir) {
+    io.err('usage: factory restore <archive> --into <dir>');
+    return 1;
+  }
+  restoreBackup({ archive, intoDir });
+  io.out(resolve(intoDir));
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Client commands (all go through the API)
+// ---------------------------------------------------------------------------
+
+function resolveUrl(args: ParsedArgs, io: CliIO): string | null {
+  const explicit = flag(args, 'url');
+  if (explicit) return explicit;
+  const runtimeFile = readRuntimeFile(resolveDir(args, io));
+  if (runtimeFile) return runtimeFile.url;
+  const loaded = loadConfig(resolveDir(args, io), { ...io, err: () => undefined });
+  return loaded?.runtime.server.url ?? null;
+}
+
+async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
+  const sub = args.positionals[1];
+  const url = resolveUrl(args, io);
+  if (!url) {
+    io.err('no server URL; pass --url or start the server first');
+    return 1;
+  }
+  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+
+  if (sub === 'submit') {
+    const intent = flag(args, 'intent');
+    if (!intent) {
+      io.err('usage: factory wo submit --intent <text> [--acceptance <criterion>] [--url <url>]');
+      return 1;
+    }
+    const workOrder = await client.submitWorkOrder({
+      intent,
+      acceptanceCriteria: args.flags.get('acceptance'),
+      repository: flag(args, 'repo'),
+    });
+    io.out(JSON.stringify(workOrder));
+    return 0;
+  }
+
+  if (sub === 'status') {
+    const id = args.positionals[2];
+    if (!id) {
+      io.err('usage: factory wo status <workOrderId>');
+      return 1;
+    }
+    io.out(JSON.stringify(await client.getWorkOrder(id)));
+    return 0;
+  }
+
+  if (sub === 'list') {
+    io.out(JSON.stringify(await client.listWorkOrders()));
+    return 0;
+  }
+
+  if (sub === 'answer') {
+    const id = args.positionals[2];
+    const response = args.positionals.slice(3).join(' ') || flag(args, 'response');
+    if (!id || !response) {
+      io.err('usage: factory wo answer <interactionId> <response>');
+      return 1;
+    }
+    io.out(JSON.stringify(await client.answerInteraction(id, response)));
+    return 0;
+  }
+
+  io.err(`unknown wo subcommand: ${sub ?? ''}`);
+  return 1;
+}
+
+async function cmdObservatory(args: ParsedArgs, io: CliIO): Promise<number> {
+  const url = resolveUrl(args, io);
+  if (!url) {
+    io.err('no server URL; pass --url or start the server first');
+    return 1;
+  }
+  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+  io.out(JSON.stringify(await client.observatory()));
+  return 0;
+}
+
+const HELP = [
+  'factory <command>',
+  '',
+  '  init [--dir <dir>]                     write/validate factory.yaml',
+  '  start [--dir <dir>] [--detached]       start the Factory server',
+  '  stop [--dir <dir>]                     stop the Factory server',
+  '  status [--dir <dir>] [--url <url>]     report server status',
+  '  update [--dir <dir>]                   validate config + pre-upgrade backup',
+  '  backup [--dir <dir>] [--out <file>]    write a backup archive',
+  '  restore <archive> --into <dir>         restore a backup archive',
+  '  wo submit --intent <text> [--url]      create a Work Order (DRAFT)',
+  '  wo status <workOrderId> [--url]        read Work Order status',
+  '  wo answer <interactionId> <response>   answer a QUESTION',
+  '  observatory [--url]                    read Observatory projections',
+].join('\n');
+
+export async function runCli(argv: string[], io: CliIO): Promise<number> {
+  const args = parseArgs(argv);
+  const command = args.positionals[0];
+  try {
+    switch (command) {
+      case 'init':
+        return await cmdInit(args, io);
+      case 'start':
+        return await cmdStart(args, io);
+      case '__serve':
+        return await cmdServe(args, io);
+      case 'stop':
+        return await cmdStop(args, io);
+      case 'status':
+        return await cmdStatus(args, io);
+      case 'update':
+        return await cmdUpdate(args, io);
+      case 'backup':
+        return await cmdBackup(args, io);
+      case 'restore':
+        return await cmdRestore(args, io);
+      case 'wo':
+        return await cmdWo(args, io);
+      case 'observatory':
+        return await cmdObservatory(args, io);
+      case 'help':
+      case undefined:
+        io.out(HELP);
+        return 0;
+      default:
+        io.err(`unknown command: ${command}`);
+        io.out(HELP);
+        return 1;
+    }
+  } catch (error) {
+    io.err(error instanceof Error ? error.message : String(error));
+    return 1;
+  }
+}
+
+if (import.meta.main) {
+  const code = await runCli(process.argv.slice(2), {
+    cwd: process.cwd(),
+    out: (line) => console.log(line),
+    err: (line) => console.error(line),
+  });
+  if (code !== 0) process.exit(code);
+}
