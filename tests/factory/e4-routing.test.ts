@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createTask, createWorkOrder, type WorkOrderDeps } from '../../src/factory/domain/workOrder';
-import { openEventLog } from '../../src/factory/events/log';
+import { openEventLog, type EventLog } from '../../src/factory/events/log';
 import { openStateStore } from '../../src/factory/state/store';
 import type {
   BudgetState,
@@ -26,6 +26,12 @@ import {
   selectModel,
   toRoutingDecisionRecord,
 } from '../../src/factory/routing/rules';
+import { formatRoutingLogLine } from '../../src/factory/routing/log';
+import { persistRoutingDecision, ROUTING_DECISION_RECORDED } from '../../src/factory/routing/persist';
+import {
+  TICKET_ROUTING_FIELD_NAMES,
+  validateTicketRoutingFields,
+} from '../../src/factory/routing/ticketFields';
 
 /** Build a RouteInput with defaults for the dimensions a case does not care about. */
 const ri = (
@@ -35,10 +41,16 @@ const ri = (
   context: RouteInput['context'] = 'small',
 ): RouteInput => ({ task, complexity, risk, context });
 
-const ROUTING_RUNTIME_SOURCES = [
-  fileURLToPath(new URL('../../src/factory/routing/decisionModel.ts', import.meta.url)),
-  fileURLToPath(new URL('../../src/factory/routing/rules.ts', import.meta.url)),
-];
+/**
+ * Every runtime source under `src/factory/routing/` is scanned for provider
+ * tokens; new E4.2 files (persist, log formatter, ticket fields) are covered
+ * automatically by the glob.
+ */
+const ROUTING_RUNTIME_DIR = fileURLToPath(new URL('../../src/factory/routing', import.meta.url));
+const ROUTING_RUNTIME_SOURCES = readdirSync(ROUTING_RUNTIME_DIR)
+  .filter((name) => name.endsWith('.ts'))
+  .sort()
+  .map((name) => join(ROUTING_RUNTIME_DIR, name));
 
 /**
  * Provider tokens that must never appear in runtime semantics. The dev router
@@ -272,7 +284,6 @@ describe('E4.1 routing decision provenance', () => {
     expect(decision.selected).toBe('reviewer');
 
     const record = toRoutingDecisionRecord(decision, {
-      source: 'rules',
       workOrderId: 'wo_1',
       taskId: 'task_1',
       id: 'rd_1',
@@ -298,7 +309,7 @@ describe('E4.1 routing decision provenance', () => {
 
   it('defaults provenance ids and times when not supplied', () => {
     const decision = applyOverride(ri('planning'), 'frontier');
-    const record = toRoutingDecisionRecord(decision, { source: 'override' });
+    const record = toRoutingDecisionRecord(decision, {});
     expect(record.id).toMatch(/^rd_/);
     expect(record.workOrderId).toBeNull();
     expect(record.taskId).toBeNull();
@@ -308,9 +319,10 @@ describe('E4.1 routing decision provenance', () => {
   });
 
   it('stub-persists to the E1 routing_decisions table with full provenance', () => {
-    // #17 (E4.2) owns the concrete writer (state row + event + routing.log).
-    // Here the record only has to round-trip through E1's existing seams,
-    // keyed by a real Work Order and Task created in the deps-first shape.
+    // Kept from E4.1: proves the record round-trips through E1's raw
+    // StateStore seam, keyed by a real Work Order and Task created in the
+    // deps-first shape. The concrete writer is covered by E4.2's
+    // persistRoutingDecision describe below.
     const store = openStateStore(dbPath);
     const events = openEventLog(store.db);
     const deps: WorkOrderDeps = { store, events };
@@ -319,7 +331,6 @@ describe('E4.1 routing decision provenance', () => {
 
     const decision = selectModel(ri('planning', 'complex', 'medium', 'medium'), FULL_BUDGET, ['planner']);
     const record = toRoutingDecisionRecord(decision, {
-      source: 'rules',
       workOrderId: workOrder.id,
       taskId: task.id,
     });
@@ -327,5 +338,284 @@ describe('E4.1 routing decision provenance', () => {
     store.set('routing_decisions', record.id, record);
     expect(store.get<RoutingDecisionRecord>('routing_decisions', record.id)).toEqual(record);
     store.close();
+  });
+});
+
+/** A record with every provenance dimension fixed, reused across E4.2 tests. */
+function fullRecord(overrides: Partial<RoutingDecisionRecord> = {}): RoutingDecisionRecord {
+  const decision = selectModel(ri('documentation', 'complex', 'medium', 'large'), FULL_BUDGET, [
+    'explorer',
+  ]);
+  return {
+    ...toRoutingDecisionRecord(decision, {
+      workOrderId: 'wo_doc_1',
+      taskId: 'task_doc_1',
+      id: 'rd_doc_1',
+      createdAt: '2026-09-30T09:00:00.000Z',
+    }),
+    ...overrides,
+  };
+}
+
+describe('E4.2 structured decision source (override marker)', () => {
+  it('marks rules selections as rules', () => {
+    expect(selectModel(ri('planning')).source).toBe('rules');
+    // The cheapest-unblocked last resort is still a rules decision.
+    const blocked = selectModel(ri('security-review'), {
+      monthlyRemaining: 0,
+      weeklyRemaining: 0,
+      fiveHourRemaining: 0,
+    });
+    expect(blocked.reason).toContain('last-resort');
+    expect(blocked.source).toBe('rules');
+  });
+
+  it('marks an applied override as override, structured not reason-string', () => {
+    const decision = applyOverride(ri('architecture'), 'frontier');
+    expect(decision.selected).toBe('frontier');
+    expect(decision.source).toBe('override');
+  });
+
+  it('marks the override-fallback path as rules so a naive source label cannot misattribute it', () => {
+    // Carried-in finding: when the override model is unavailable the decision
+    // comes from the rules; `source: override ? 'override' : 'rules'` would
+    // call this an override. The structured marker says rules.
+    const input = ri('planning'); // [planner, reviewer, frontier]
+    const decision = applyOverride(input, 'planner', FULL_BUDGET, ['planner']);
+    expect(decision.selected).toBe('reviewer');
+    expect(decision.source).toBe('rules');
+
+    // RoutingProvenance carries no source at all, so the caller's mislabel
+    // is structurally impossible: the record inherits rules.
+    const record = toRoutingDecisionRecord(decision, {});
+    expect(record.source).toBe('rules');
+  });
+
+  it('derives the record source from the decision, not from a caller label', () => {
+    const rulesRecord = toRoutingDecisionRecord(selectModel(ri('planning')), {});
+    expect(rulesRecord.source).toBe('rules');
+
+    const overrideRecord = toRoutingDecisionRecord(applyOverride(ri('planning'), 'frontier'), {});
+    expect(overrideRecord.source).toBe('override');
+  });
+});
+
+describe('E4.2 persistRoutingDecision', () => {
+  let workDir: string;
+  let dbPath: string;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), 'factory-e42-'));
+    dbPath = join(workDir, 'factory.db');
+  });
+
+  afterEach(() => {
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  /** An EventLog whose append fails, to prove the writer rolls back. */
+  function failingEvents(): EventLog {
+    return {
+      appendEvent() {
+        throw new Error('event log unavailable');
+      },
+      readEvents: () => [],
+      count: () => 0,
+    };
+  }
+
+  it('writes the record to routing_decisions keyed by real Work Order/Task ids', () => {
+    const store = openStateStore(dbPath);
+    const events = openEventLog(store.db);
+    const deps: WorkOrderDeps = { store, events };
+    const workOrder = createWorkOrder(deps, { intent: 'route this work' });
+    const task = createTask(deps, { workOrderId: workOrder.id, title: 'Document routing' });
+
+    const decision = selectModel(ri('documentation', 'complex', 'medium', 'large'));
+    const record = toRoutingDecisionRecord(decision, {
+      workOrderId: workOrder.id,
+      taskId: task.id,
+    });
+    const persisted = persistRoutingDecision(deps, record);
+
+    expect(persisted).toEqual(record);
+    expect(store.get<RoutingDecisionRecord>('routing_decisions', record.id)).toEqual(record);
+    expect(store.list<RoutingDecisionRecord>('routing_decisions')).toEqual([record]);
+    store.close();
+  });
+
+  it('appends a routing.decision_recorded event carrying the full record', () => {
+    const store = openStateStore(dbPath);
+    const events = openEventLog(store.db);
+    const deps: WorkOrderDeps = { store, events };
+
+    persistRoutingDecision(deps, fullRecord());
+
+    const logged = events.readEvents({ aggregateType: 'routing_decision' });
+    expect(logged).toHaveLength(1);
+    expect(logged[0].type).toBe(ROUTING_DECISION_RECORDED);
+    expect(logged[0].aggregateId).toBe('rd_doc_1');
+    expect(logged[0].payload).toEqual({ record: fullRecord() });
+    store.close();
+  });
+
+  it('accepts a standalone decision record with no Work Order or Task', () => {
+    const store = openStateStore(dbPath);
+    const events = openEventLog(store.db);
+    const deps: WorkOrderDeps = { store, events };
+
+    const record = fullRecord({ workOrderId: null, taskId: null });
+    persistRoutingDecision(deps, record);
+
+    expect(store.get<RoutingDecisionRecord>('routing_decisions', record.id)).toEqual(record);
+    store.close();
+  });
+
+  it('is atomic: a failing event append rolls the state row back', () => {
+    const store = openStateStore(dbPath);
+    try {
+      expect(() => persistRoutingDecision({ store, events: failingEvents() }, fullRecord())).toThrow(
+        'event log unavailable',
+      );
+      expect(store.list('routing_decisions')).toHaveLength(0);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe('E4.2 routing.log line format', () => {
+  /** Documented key order (factory-docs/architecture/routing-decision-log.md §Format). */
+  const LOG_KEYS = [
+    'id',
+    'workOrderId',
+    'taskId',
+    'source',
+    'task',
+    'complexity',
+    'risk',
+    'context',
+    'selected',
+    'candidates',
+    'reason',
+    'unavailable',
+    'budget',
+    'createdAt',
+  ];
+
+  /**
+   * The documented example line (factory-docs/architecture/routing-decision-log.md
+   * §Format); the docs test below asserts the doc contains exactly this line.
+   */
+  const EXAMPLE_LINE =
+    '{"id":"rd_doc_1","workOrderId":"wo_doc_1","taskId":"task_doc_1","source":"rules",' +
+    '"task":"documentation","complexity":"complex","risk":"medium","context":"large",' +
+    '"selected":"implementer","candidates":["implementer","generalist","explorer"],' +
+    '"reason":"task=documentation, complexity=complex, risk=medium, context=large -> implementer (cheap tier; budget m=100%/w=100%/5h=100%).",' +
+    '"unavailable":["explorer"],"budget":{"monthlyRemaining":1,"weeklyRemaining":1,"fiveHourRemaining":1},' +
+    '"createdAt":"2026-09-30T09:00:00.000Z"}';
+
+  it('formats one deterministic compact JSON line per decision, in the documented key order', () => {
+    const record = fullRecord();
+    const line = formatRoutingLogLine(record);
+
+    expect(line).toBe(EXAMPLE_LINE);
+    expect(line.split('\n')).toHaveLength(1);
+    expect(line.endsWith('\n')).toBe(false);
+    // Deterministic: same record, same line; survives a JSON round-trip.
+    expect(formatRoutingLogLine(record)).toBe(line);
+    expect(JSON.parse(line)).toEqual(record);
+    expect(Object.keys(JSON.parse(line))).toEqual(LOG_KEYS);
+  });
+
+  it('is stable under key insertion order: hand-built records format identically', () => {
+    // A record assembled in a different field order must produce the same line.
+    const reordered = {
+      createdAt: '2026-09-30T09:00:00.000Z',
+      budget: { monthlyRemaining: 1, weeklyRemaining: 1, fiveHourRemaining: 1 },
+      ...fullRecord(),
+    };
+    expect(formatRoutingLogLine(reordered)).toBe(EXAMPLE_LINE);
+  });
+
+  it('documents the format with an example line in the E4.2 doc', () => {
+    const doc = readFileSync(
+      fileURLToPath(new URL('../../factory-docs/architecture/routing-decision-log.md', import.meta.url)),
+      'utf8',
+    );
+    // The documented example line is exactly what the formatter produces.
+    expect(doc).toContain(`\`${EXAMPLE_LINE}\``);
+    // Every documented field name appears in the format spec.
+    for (const key of LOG_KEYS) {
+      expect(doc.includes(`\`${key}\``), `docs document \`${key}\``).toBe(true);
+    }
+    // Override and appeal paths are documented.
+    expect(doc).toContain('override');
+    expect(doc).toContain('appeal');
+  });
+});
+
+describe('E4.2 ticket routing fields (validated by test)', () => {
+  const valid = {
+    complexity: 'complex',
+    model: 'deployment/capability-a', // opaque, deployment-defined ModelId
+    confidence: 0.77,
+    disputed: false,
+    'router-version': 's1s2-2026-09-29',
+  };
+
+  it('accepts a complete ticket routing block', () => {
+    expect(validateTicketRoutingFields(valid)).toEqual({ ok: true, errors: [] });
+    // Boundary values: confidence 0 and 1 are valid, disputed true is valid.
+    expect(validateTicketRoutingFields({ ...valid, confidence: 0 }).ok).toBe(true);
+    expect(validateTicketRoutingFields({ ...valid, confidence: 1 }).ok).toBe(true);
+    expect(validateTicketRoutingFields({ ...valid, disputed: true }).ok).toBe(true);
+    for (const complexity of ['trivial', 'simple', 'normal', 'complex']) {
+      expect(validateTicketRoutingFields({ ...valid, complexity }).ok, complexity).toBe(true);
+    }
+  });
+
+  it('rejects malformed ticket routing blocks with field-level errors', () => {
+    const { confidence: _noConf, ...withoutConfidence } = valid;
+    const { 'router-version': _noVersion, ...withoutRouterVersion } = valid;
+    const cases: Array<[unknown, string]> = [
+      [{ ...valid, confidence: undefined }, 'confidence'],
+      [withoutConfidence, 'confidence'], // dropped entirely
+      [{ ...valid, confidence: 1.5 }, 'confidence'],
+      [{ ...valid, confidence: -0.1 }, 'confidence'],
+      [{ ...valid, confidence: '0.77' }, 'confidence'],
+      [{ ...valid, complexity: 'hard' }, 'complexity'],
+      [{ ...valid, complexity: undefined }, 'complexity'],
+      [withoutRouterVersion, 'router-version'],
+      [{ ...valid, 'router-version': '' }, 'router-version'],
+      [{ ...valid, model: '' }, 'model'],
+      [{ ...valid, model: 42 }, 'model'],
+      [{ ...valid, disputed: 'no' }, 'disputed'], // tracker prose is not a boolean
+      [{ ...valid, disputed: undefined }, 'disputed'],
+      [null, 'ticket'],
+      ['complex', 'ticket'],
+    ];
+    for (const [value, expectedField] of cases) {
+      const result = validateTicketRoutingFields(value);
+      expect(result.ok, JSON.stringify(value)).toBe(false);
+      expect(
+        result.errors.some((error) => error.includes(expectedField)),
+        `error mentions ${expectedField}: ${result.errors.join('; ')}`,
+      ).toBe(true);
+    }
+  });
+
+  it('stays in sync with the tracker\'s documented ticket template', () => {
+    const tracker = readFileSync(
+      fileURLToPath(new URL('../../docs/agents/issue-tracker.md', import.meta.url)),
+      'utf8',
+    );
+    const templateLine = tracker
+      .split('\n')
+      .find((line) => line.includes('Ticket body fields'));
+    expect(templateLine, 'issue-tracker.md documents a ticket body fields line').toBeDefined();
+    for (const field of TICKET_ROUTING_FIELD_NAMES) {
+      expect(templateLine!.includes(`${field}:`), `template documents ${field}:`).toBe(true);
+    }
   });
 });

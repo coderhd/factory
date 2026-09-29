@@ -65,11 +65,21 @@ export interface RouteInput {
   context: ContextSize;
 }
 
-/** One routing decision plus the snapshot it was made from. */
+/**
+ * One routing decision plus the snapshot it was made from.
+ *
+ * `source` is the structured provenance marker (E4.2, carried in from the
+ * E4.1 review): it says *how* the decision was made, so callers never have
+ * to parse `reason` strings. An override whose model was unavailable falls
+ * back to the rules, and that decision is marked `rules` — a naive
+ * `source: override ? 'override' : 'rules'` at the call site would
+ * mislabel it.
+ */
 export interface RouteDecision {
   selected: ModelId;
   candidates: ModelId[];
   reason: string;
+  source: RoutingDecisionSource;
   metadata: {
     task: TaskType;
     complexity: Complexity;
@@ -98,8 +108,9 @@ export type RoutingDecisionSource = 'rules' | 'override';
  * (spec §8 "Routing recommendations are recorded"). Carries the full
  * task/complexity/risk/context/budget snapshot plus the recommendation it
  * came from, so every assignment can be audited and later fed back into
- * routing. E4.2 owns the concrete writer (state row + event); E8 telemetry
- * consumes these records.
+ * routing. `source` is copied from the decision's structured marker (see
+ * `RouteDecision`), never from a caller's label. E4.2 owns the concrete
+ * writer (state row + event); E8 telemetry consumes these records.
  */
 export interface RoutingDecisionRecord {
   id: string;

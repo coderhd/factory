@@ -5,7 +5,6 @@ import type {
   RouteDecision,
   RouteInput,
   RoutingDecisionRecord,
-  RoutingDecisionSource,
 } from './decisionModel';
 
 /**
@@ -178,6 +177,7 @@ export function selectModel(
       selected: model,
       candidates,
       reason: explainSelection(input, model, budget),
+      source: 'rules',
       metadata: { ...input, unavailable: [...unavailable], budget: { ...budget } },
     };
   }
@@ -189,6 +189,7 @@ export function selectModel(
     selected,
     candidates,
     reason: `All candidates blocked by availability/budget; last-resort ${selected}.`,
+    source: 'rules',
     metadata: { ...input, unavailable: [...unavailable], budget: { ...budget } },
   };
 }
@@ -218,9 +219,11 @@ export function parseRouteOverride(
 /**
  * Apply a manual override: it always wins over the rules recommendation
  * unless the model is unavailable, in which case selection falls back to the
- * deterministic rules. Overrides are not budget-gated — a human asking for a
- * specific model is a priced exception, and the decision still records the
- * full snapshot so the cost is auditable.
+ * deterministic rules. The structured `source` marker distinguishes the two
+ * outcomes: `override` only when the override model was actually applied,
+ * `rules` when selection fell back. Overrides are not budget-gated — a human
+ * asking for a specific model is a priced exception, and the decision still
+ * records the full snapshot so the cost is auditable.
  */
 export function applyOverride(
   input: RouteInput,
@@ -235,13 +238,18 @@ export function applyOverride(
     selected: override,
     candidates: candidatesFor(input),
     reason: `manual override -> ${override} (wins over rules recommendation)`,
+    source: 'override',
     metadata: { ...input, unavailable: [...unavailable], budget: { ...budget } },
   };
 }
 
-/** Provenance supplied alongside a decision when it becomes a record. */
+/**
+ * Provenance supplied alongside a decision when it becomes a record.
+ * Deliberately carries no `source`: a caller-supplied label would
+ * misattribute the override-fallback path (E4.1 review finding), so the
+ * record's `source` derives solely from the decision's structured marker.
+ */
 export interface RoutingProvenance {
-  source: RoutingDecisionSource;
   workOrderId?: string | null;
   taskId?: string | null;
   id?: string;
@@ -250,9 +258,10 @@ export interface RoutingProvenance {
 
 /**
  * Fold a decision into the durable `RoutingDecisionRecord` shape. Pure: no
- * I/O, no persistence — E4.2 owns the concrete writer that stores the record
- * and appends its event; this seam guarantees every record carries the full
- * task/complexity/risk/context/budget snapshot with provenance.
+ * I/O, no persistence — E4.2's `persistRoutingDecision` stores the record and
+ * appends its event; this seam guarantees every record carries the full
+ * task/complexity/risk/context/budget snapshot with provenance. `source` is
+ * read from the decision itself, never from the caller's label.
  */
 export function toRoutingDecisionRecord(
   decision: RouteDecision,
@@ -262,7 +271,7 @@ export function toRoutingDecisionRecord(
     id: provenance.id ?? `rd_${crypto.randomUUID()}`,
     workOrderId: provenance.workOrderId ?? null,
     taskId: provenance.taskId ?? null,
-    source: provenance.source,
+    source: decision.source,
     ...decision.metadata,
     selected: decision.selected,
     candidates: decision.candidates,
