@@ -53,6 +53,12 @@ export interface CreateBackupOptions {
 export interface RestoreBackupOptions {
   archive: string;
   intoDir: string;
+  /**
+   * Allow restoring into a directory that already has contents. Without this
+   * the restore refuses a non-empty target before touching disk, so a mistyped
+   * `--into` cannot silently clobber a live install.
+   */
+  force?: boolean;
 }
 
 export interface RestoredBackup {
@@ -77,6 +83,46 @@ function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
 
+/** Every backup must carry these entries; a manifest claiming otherwise is rejected. */
+const REQUIRED_ENTRIES = ['manifest.json', 'config/factory.yaml', 'state/factory.db'] as const;
+
+/**
+ * Read and validate `manifest.json` straight out of the archive (via
+ * `tar -xOf`, which writes nothing to disk). Rejects a corrupt archive or a
+ * wrong-format/incomplete manifest before any extraction happens.
+ */
+function peekManifest(archive: string): BackupManifest {
+  let manifestText: string;
+  try {
+    manifestText = execFileSync('tar', ['-xOf', archive, 'manifest.json'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    throw new Error(`backup archive is unreadable or corrupt: ${archive}`);
+  }
+  let manifest: BackupManifest;
+  try {
+    manifest = JSON.parse(manifestText) as BackupManifest;
+  } catch {
+    throw new Error(`backup archive has an invalid manifest: ${archive}`);
+  }
+  if (manifest.format !== BACKUP_FORMAT) {
+    throw new Error(
+      `unsupported backup format: ${String(manifest.format)} (expected ${BACKUP_FORMAT})`,
+    );
+  }
+  if (!Array.isArray(manifest.entries)) {
+    throw new Error(`backup archive manifest is missing entries: ${archive}`);
+  }
+  for (const entry of REQUIRED_ENTRIES) {
+    if (!manifest.entries.includes(entry)) {
+      throw new Error(`backup archive is missing required entry: ${entry}`);
+    }
+  }
+  return manifest;
+}
+
 /**
  * Snapshot state + artifacts + knowledge + config + versions into `outFile`.
  * The SQLite copy uses `VACUUM INTO`, which yields a consistent standalone
@@ -84,6 +130,14 @@ function escapeSqlLiteral(value: string): string {
  */
 export function createBackup(options: CreateBackupOptions): BackupManifest {
   const now = options.now ?? (() => new Date().toISOString());
+  // Refuse to mint a backup from a state DB that does not exist: opening it
+  // would create a zero-byte database and archive empty state, masking the
+  // operator's mistake instead of reporting it.
+  if (!existsSync(options.stateDbPath)) {
+    throw new Error(
+      `state database not found: ${options.stateDbPath}; run "factory init" or start the server first`,
+    );
+  }
   const staging = mkdtempSync(join(tmpdir(), 'factory-backup-'));
   try {
     mkdirSync(join(staging, 'config'), { recursive: true });
@@ -127,21 +181,26 @@ export function createBackup(options: CreateBackupOptions): BackupManifest {
   }
 }
 
-/** Extract an archive onto a fresh directory and return its restored layout. */
+/** Extract an archive onto a target directory and return its restored layout. */
 export function restoreBackup(options: RestoreBackupOptions): RestoredBackup {
   if (!existsSync(options.archive)) {
     throw new Error(`backup archive not found: ${options.archive}`);
   }
+  const archive = resolve(options.archive);
   const intoDir = resolve(options.intoDir);
-  mkdirSync(intoDir, { recursive: true });
-  execFileSync('tar', ['-xzf', resolve(options.archive), '-C', intoDir]);
 
-  const manifest = JSON.parse(
-    readFileSync(join(intoDir, 'manifest.json'), 'utf8'),
-  ) as BackupManifest;
-  if (manifest.format !== BACKUP_FORMAT) {
-    throw new Error(`unsupported backup format: ${String(manifest.format)}`);
+  // Refuse to clobber a live install unless the operator opts in. This runs
+  // before anything is written, so a mistyped `--into` is a no-op.
+  if (!options.force && existsSync(intoDir) && readdirSync(intoDir).length > 0) {
+    throw new Error(`restore target is not empty: ${intoDir}; pass --force to restore anyway`);
   }
+
+  // Validate the archive (readable, right format, required entries) before
+  // extracting, so a corrupt/wrong-format archive leaves nothing behind.
+  const manifest = peekManifest(archive);
+
+  mkdirSync(intoDir, { recursive: true });
+  execFileSync('tar', ['-xzf', archive, '-C', intoDir]);
 
   return {
     intoDir,

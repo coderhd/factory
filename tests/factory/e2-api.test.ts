@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -650,6 +658,28 @@ describe('E2 Observatory projections', () => {
 // T6 — backup -> restore (state + artifacts + knowledge + config + versions)
 // ---------------------------------------------------------------------------
 
+/** Build a valid backup archive from a self-contained state dir under `base`. */
+function makeBackupArchive(outFile: string, base: string): void {
+  const runtime = resolveFactoryConfig(DEFAULT_FACTORY_CONFIG, { baseDir: base });
+  mkdirSync(runtime.paths.state, { recursive: true });
+  mkdirSync(runtime.paths.artifacts, { recursive: true });
+  mkdirSync(runtime.paths.knowledge, { recursive: true });
+  const store = openStateStore(runtime.paths.db);
+  const events = openEventLog(store.db);
+  createWorkOrder({ store, events }, { intent: 'guard me' });
+  store.close();
+  writeFileSync(join(runtime.paths.knowledge, 'notes.md'), '# knowledge\n');
+  createBackup({
+    stateDbPath: runtime.paths.db,
+    artifactsDir: runtime.paths.artifacts,
+    knowledgeDir: runtime.paths.knowledge,
+    configText: serializeFactoryConfig(DEFAULT_FACTORY_CONFIG),
+    outFile,
+    factoryVersion: runtime.factoryVersion,
+    schemaVersion: runtime.schemaVersion,
+  });
+}
+
 describe('E2 backup/restore', () => {
   it('round-trips state, artifacts, knowledge, config and versions onto a fresh directory', () => {
     const runtime = resolveFactoryConfig(DEFAULT_FACTORY_CONFIG, { baseDir: workDir });
@@ -710,6 +740,90 @@ describe('E2 backup/restore', () => {
 
   it('fails loudly when the archive does not exist', () => {
     expect(() => restoreBackup({ archive: join(workDir, 'nope.tar.gz'), intoDir: workDir })).toThrow();
+  });
+
+  it('refuses to restore into a non-empty directory without --force', () => {
+    const archive = join(workDir, 'guard.tar.gz');
+    makeBackupArchive(archive, join(workDir, 'guard-src'));
+
+    const occupied = join(workDir, 'occupied');
+    mkdirSync(occupied, { recursive: true });
+    writeFileSync(join(occupied, 'keep.txt'), 'do not clobber');
+
+    expect(() => restoreBackup({ archive, intoDir: occupied })).toThrow(/not empty/);
+    // Nothing was extracted over the existing files.
+    expect(readdirSync(occupied)).toEqual(['keep.txt']);
+    expect(existsSync(join(occupied, 'manifest.json'))).toBe(false);
+    expect(existsSync(join(occupied, 'state', 'factory.db'))).toBe(false);
+  });
+
+  it('restores into a non-empty directory when --force is given', () => {
+    const archive = join(workDir, 'force.tar.gz');
+    makeBackupArchive(archive, join(workDir, 'force-src'));
+
+    const occupied = join(workDir, 'force-occupied');
+    mkdirSync(occupied, { recursive: true });
+    writeFileSync(join(occupied, 'keep.txt'), 'stays');
+
+    const restored = restoreBackup({ archive, intoDir: occupied, force: true });
+    expect(existsSync(restored.stateDbPath)).toBe(true);
+    expect(existsSync(join(occupied, 'config', 'factory.yaml'))).toBe(true);
+    expect(existsSync(join(occupied, 'keep.txt'))).toBe(true);
+  });
+
+  it('rejects a wrong-format archive without writing anything', () => {
+    const staging = join(workDir, 'wrong-format-src');
+    mkdirSync(staging, { recursive: true });
+    writeFileSync(
+      join(staging, 'manifest.json'),
+      JSON.stringify({ format: 'not-a-factory-backup', entries: ['manifest.json'] }),
+    );
+    const archive = join(workDir, 'wrong-format.tar.gz');
+    execFileSync('tar', ['-czf', archive, '-C', staging, '.']);
+
+    const into = join(workDir, 'wrong-format-out');
+    expect(() => restoreBackup({ archive, intoDir: into })).toThrow(/unsupported backup format/);
+    expect(existsSync(into)).toBe(false);
+  });
+
+  it('rejects a manifest missing required entries without writing anything', () => {
+    const staging = join(workDir, 'missing-entry-src');
+    mkdirSync(staging, { recursive: true });
+    writeFileSync(
+      join(staging, 'manifest.json'),
+      JSON.stringify({ format: 'factory-backup/v1', entries: ['manifest.json'] }),
+    );
+    const archive = join(workDir, 'missing-entry.tar.gz');
+    execFileSync('tar', ['-czf', archive, '-C', staging, '.']);
+
+    const into = join(workDir, 'missing-entry-out');
+    expect(() => restoreBackup({ archive, intoDir: into })).toThrow(/missing required entry/);
+    expect(existsSync(into)).toBe(false);
+  });
+
+  it('rejects a corrupt archive without writing anything', () => {
+    const archive = join(workDir, 'corrupt.tar.gz');
+    writeFileSync(archive, 'not a real tarball');
+
+    const into = join(workDir, 'corrupt-out');
+    expect(() => restoreBackup({ archive, intoDir: into })).toThrow(/unreadable or corrupt/);
+    expect(existsSync(into)).toBe(false);
+  });
+
+  it('refuses to create a backup when the state database is missing', () => {
+    const outFile = join(workDir, 'no-state.tar.gz');
+    expect(() =>
+      createBackup({
+        stateDbPath: join(workDir, 'missing-state', 'factory.db'),
+        artifactsDir: join(workDir, 'no-artifacts'),
+        knowledgeDir: join(workDir, 'no-knowledge'),
+        configText: serializeFactoryConfig(DEFAULT_FACTORY_CONFIG),
+        outFile,
+        factoryVersion: DEFAULT_FACTORY_CONFIG.factoryVersion,
+        schemaVersion: '1',
+      }),
+    ).toThrow(/state database not found/);
+    expect(existsSync(outFile)).toBe(false);
   });
 });
 
@@ -806,6 +920,70 @@ describe('E2 CLI', () => {
       expect(restoredStore.get<WorkOrder>('work_orders', wo.id)?.intent).toBe('cli backup');
     } finally {
       restoredStore.close();
+    }
+  });
+
+  it('restore refuses a non-empty target unless --force is passed', async () => {
+    const dir = join(workDir, 'restore-force');
+    mkdirSync(dir, { recursive: true });
+    expect(await runCli(['init', '--dir', dir], capture(dir).io)).toBe(0);
+    const runtime = resolveFactoryConfig(DEFAULT_FACTORY_CONFIG, { baseDir: dir });
+    mkdirSync(runtime.paths.state, { recursive: true });
+    openStateStore(runtime.paths.db).close();
+
+    const archive = join(workDir, 'restore-force.tar.gz');
+    expect(await runCli(['backup', '--dir', dir, '--out', archive], capture(dir).io)).toBe(0);
+
+    const into = join(workDir, 'restore-force-out');
+    mkdirSync(into, { recursive: true });
+    writeFileSync(join(into, 'keep.txt'), 'keep');
+
+    const refused = capture(dir);
+    expect(await runCli(['restore', archive, '--into', into], refused.io)).toBe(1);
+    expect(refused.err()).toMatch(/not empty/);
+    expect(readdirSync(into)).toEqual(['keep.txt']);
+
+    const forced = capture(dir);
+    expect(await runCli(['restore', archive, '--into', into, '--force'], forced.io)).toBe(0);
+    expect(existsSync(join(into, 'state', 'factory.db'))).toBe(true);
+    expect(existsSync(join(into, 'keep.txt'))).toBe(true);
+  });
+
+  it('refuses a detached start when runtime.json points at a live process', async () => {
+    const dir = join(workDir, 'busy');
+    mkdirSync(join(dir, '.factory'), { recursive: true });
+    expect(await runCli(['init', '--dir', dir], capture(dir).io)).toBe(0);
+    writeFileSync(
+      join(dir, '.factory', 'runtime.json'),
+      `${JSON.stringify({ pid: process.pid, url: 'http://127.0.0.1:9', port: 9, dir, startedAt: new Date().toISOString() })}\n`,
+    );
+
+    const cap = capture(dir);
+    expect(await runCli(['start', '--dir', dir, '--detached', '--port', '0'], cap.io)).toBe(1);
+    expect(cap.err()).toMatch(/already running/);
+  });
+
+  it('clears a stale runtime.json before a detached start', async () => {
+    const dir = join(workDir, 'stale');
+    mkdirSync(join(dir, '.factory'), { recursive: true });
+    expect(await runCli(['init', '--dir', dir], capture(dir).io)).toBe(0);
+    writeFileSync(
+      join(dir, '.factory', 'runtime.json'),
+      `${JSON.stringify({ pid: 2147483646, url: 'http://127.0.0.1:1', port: 1, dir, startedAt: '2000-01-01T00:00:00.000Z' })}\n`,
+    );
+
+    const cap = capture(dir);
+    try {
+      expect(await runCli(['start', '--dir', dir, '--detached', '--port', '0'], cap.io)).toBe(0);
+      // Not the stale URL: the stale file was cleared and the fresh child reported its own.
+      expect(cap.out()).not.toContain('http://127.0.0.1:1');
+      const info = JSON.parse(readFileSync(join(dir, '.factory', 'runtime.json'), 'utf8')) as {
+        pid: number;
+      };
+      expect(info.pid).not.toBe(2147483646);
+    } finally {
+      // Safety net: never leak a detached server if an assertion fails.
+      await runCli(['stop', '--dir', dir], capture(dir).io);
     }
   });
 

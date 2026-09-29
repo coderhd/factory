@@ -101,6 +101,16 @@ function clearRuntimeFile(dir: string): void {
   rmSync(runtimeFilePath(dir), { force: true });
 }
 
+/** True when a process with `pid` currently exists (signal 0 probe). */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function timestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, '-');
 }
@@ -241,6 +251,20 @@ async function cmdStart(args: ParsedArgs, io: CliIO): Promise<number> {
     return cmdServe({ ...args, flags: withFlag(args, 'port', port) }, io);
   }
 
+  // Guard on an existing runtime.json: a live server must not be shadowed by a
+  // second doomed child (port EADDRINUSE reported as success), and a stale pid
+  // file must not be mistaken for the server we are about to start.
+  const existing = readRuntimeFile(dir);
+  if (existing) {
+    if (isProcessAlive(existing.pid)) {
+      io.err(
+        `factory server already running at ${existing.url} (pid ${existing.pid}); run "factory stop" first`,
+      );
+      return 1;
+    }
+    clearRuntimeFile(dir);
+  }
+
   const cliFile = fileURLToPath(import.meta.url);
   const child = Bun.spawn([process.execPath, cliFile, '__serve', '--dir', dir, '--port', port], {
     stdio: ['ignore', 'ignore', 'ignore'],
@@ -331,10 +355,10 @@ async function cmdRestore(args: ParsedArgs, io: CliIO): Promise<number> {
   const archive = args.positionals[1];
   const intoDir = flag(args, 'into');
   if (!archive || !intoDir) {
-    io.err('usage: factory restore <archive> --into <dir>');
+    io.err('usage: factory restore <archive> --into <dir> [--force]');
     return 1;
   }
-  restoreBackup({ archive, intoDir });
+  restoreBackup({ archive, intoDir, force: hasFlag(args, 'force') });
   io.out(resolve(intoDir));
   return 0;
 }
@@ -426,7 +450,7 @@ const HELP = [
   '  status [--dir <dir>] [--url <url>]     report server status',
   '  update [--dir <dir>]                   validate config + pre-upgrade backup',
   '  backup [--dir <dir>] [--out <file>]    write a backup archive',
-  '  restore <archive> --into <dir>         restore a backup archive',
+  '  restore <archive> --into <dir> [--force]  restore a backup archive',
   '  wo submit --intent <text> [--url]      create a Work Order (DRAFT)',
   '  wo status <workOrderId> [--url]        read Work Order status',
   '  wo answer <interactionId> <response>   answer a QUESTION',
