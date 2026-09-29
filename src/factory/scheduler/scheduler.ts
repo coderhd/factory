@@ -55,6 +55,10 @@ export interface SchedulerDeps {
 }
 
 export interface SchedulerStatus {
+  /** True while the interval tick loop is running (`start()`ed, not `stop()`ed). */
+  running: boolean;
+  /** Configured tick cadence, surfaced so a resolved `factory.yaml` is observable. */
+  tickIntervalMs: number;
   concurrency: { current: number; max: number };
   workers: { idle: number; busy: number; reclaimed: number };
   provisioning: { enabled: boolean; min: number; max: number };
@@ -460,6 +464,8 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     );
 
     return {
+      running: timer !== null,
+      tickIntervalMs: cfg.tickIntervalMs,
       concurrency: { current, max: cfg.maxConcurrentTasks },
       workers: {
         idle: workers.filter((worker) => worker.runtimeState === 'IDLE').length,

@@ -13,6 +13,8 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 
+import { parseFactoryConfig, resolveFactoryConfig } from '../config/factoryConfig';
+
 /**
  * E2 Factory-level backup/restore (spec §20). A backup is a self-contained
  * `tar.gz` archive containing Factory state, evidence/artifacts, knowledge,
@@ -21,8 +23,10 @@ import { dirname, join, relative, resolve } from 'node:path';
  *
  * This is an operator/deployment artifact, not a Factory state mutation: the
  * running server owns execution state, while backup/restore read and
- * materialize files on disk. The mechanism is real and testable on OS temp
- * dirs; no Docker daemon is required.
+ * materialize files on disk. `restoreBackup` additionally lays the bundle out
+ * as a bootable deployment (config at the root + storage under the configured
+ * paths), so a fresh machine can `factory start` the restored instance. The
+ * mechanism is real and testable on OS temp dirs; no Docker daemon is required.
  */
 
 export const BACKUP_FORMAT = 'factory-backup/v1';
@@ -199,15 +203,61 @@ export function restoreBackup(options: RestoreBackupOptions): RestoredBackup {
   // extracting, so a corrupt/wrong-format archive leaves nothing behind.
   const manifest = peekManifest(archive);
 
-  mkdirSync(intoDir, { recursive: true });
-  execFileSync('tar', ['-xzf', archive, '-C', intoDir]);
+  // Unpack into a throwaway staging dir first, then materialize the deployment.
+  // Nothing lands in `intoDir` until both gates above have passed.
+  const staging = mkdtempSync(join(tmpdir(), 'factory-restore-'));
+  try {
+    execFileSync('tar', ['-xzf', archive, '-C', staging]);
+    const configText = readFileSync(join(staging, 'config', 'factory.yaml'), 'utf8');
+    const paths = resolveRestoredPaths(intoDir, configText);
 
+    // A restored backup must boot: write the config at the target root and the
+    // state/artifacts/knowledge under the configured storage paths, so
+    // `factory start --dir <intoDir>` starts the restored instance unchanged.
+    mkdirSync(intoDir, { recursive: true });
+    writeFileSync(join(intoDir, 'factory.yaml'), configText);
+    copyIfExists(join(staging, 'manifest.json'), join(intoDir, 'manifest.json'));
+    for (const [source, destination] of [
+      [join(staging, 'state'), paths.state],
+      [join(staging, 'artifacts'), paths.artifacts],
+      [join(staging, 'knowledge'), paths.knowledge],
+    ] as const) {
+      copyIfExists(source, destination);
+    }
+
+    return {
+      intoDir,
+      manifest,
+      configText,
+      stateDbPath: paths.db,
+      artifactsDir: paths.artifacts,
+      knowledgeDir: paths.knowledge,
+    };
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+/** Resolve where a restored backup's storage lives relative to `intoDir`. */
+function resolveRestoredPaths(
+  intoDir: string,
+  configText: string,
+): { state: string; artifacts: string; knowledge: string; db: string } {
+  const parsed = parseFactoryConfig(configText);
+  if (!parsed.ok) {
+    throw new Error('backup archive has an invalid config/factory.yaml');
+  }
+  const runtime = resolveFactoryConfig(parsed.config, { baseDir: intoDir });
   return {
-    intoDir,
-    manifest,
-    configText: readFileSync(join(intoDir, 'config', 'factory.yaml'), 'utf8'),
-    stateDbPath: join(intoDir, 'state', 'factory.db'),
-    artifactsDir: join(intoDir, 'artifacts'),
-    knowledgeDir: join(intoDir, 'knowledge'),
+    state: runtime.paths.state,
+    artifacts: runtime.paths.artifacts,
+    knowledge: runtime.paths.knowledge,
+    db: runtime.paths.db,
   };
+}
+
+function copyIfExists(source: string, destination: string): void {
+  if (!existsSync(source)) return;
+  mkdirSync(dirname(destination), { recursive: true });
+  cpSync(source, destination, { recursive: true });
 }

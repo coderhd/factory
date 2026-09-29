@@ -110,7 +110,15 @@ const GATE_TRANSITIONS: Record<GateDecision, WorkOrderState> = {
 /**
  * Answer a PENDING §12 interaction and resume its Task (spec §12). The answer
  * is persisted and the Task transitions `WAITING_INPUT → RUNNING` through E1's
- * Factory-owned transition; a Work Order waiting on it returns to EXECUTING.
+ * Factory-owned transition; the scheduler then collects the still-open Attempt
+ * on a later tick.
+ *
+ * This is the durable, state-level resume. There is deliberately no WO-level
+ * `WAITING_INPUT` here: a Work Order only asks through its Tasks, so the resume
+ * unit is the Task (spec §5.2). The live-runtime channel is also absent — E3's
+ * `WorkerAdapter` has no `deliverAnswer`, so the human's response is recorded
+ * but not yet pushed into the running worker. That channel is an E3 follow-up
+ * (documented finding); the durable answer + Task resume is what E2 owns.
  */
 function answerInteraction(
   deps: FactoryServerDeps,
@@ -148,7 +156,7 @@ function answerInteraction(
     updatedAt: now,
   };
   let updatedTask = task;
-  let workOrder = deps.store.get<WorkOrder>('work_orders', task.workOrderId) ?? null;
+  const workOrder = deps.store.get<WorkOrder>('work_orders', task.workOrderId) ?? null;
 
   deps.store.db.transaction(() => {
     deps.store.set('interactions', interactionId, answered);
@@ -162,12 +170,6 @@ function answerInteraction(
       to: 'RUNNING',
       reason: 'human answered interaction',
     });
-    if (workOrder?.state === 'WAITING_INPUT') {
-      workOrder = transitionWorkOrder(deps, workOrder.id, {
-        to: 'EXECUTING',
-        reason: 'human answered interaction',
-      });
-    }
   })();
 
   return { interaction: answered, task: updatedTask, workOrder };

@@ -153,10 +153,16 @@ function buildServerDeps(dir: string, runtime: FactoryRuntimeConfig): FactorySer
     rootDir: join(dir, '.factory', 'worktrees'),
     baseBranch: 'main',
   });
-  // The scheduler is consumed for its read-side status projection (brief:
-  // "E3 scheduler (status)"). Driving the execution loop + worker runtime is
-  // the execution-integration phase, not E2.1, so its timer is not started.
-  const scheduler = createScheduler({ store, events, workers, worktrees });
+  // The resolved `factory.yaml` scheduler config drives the real E3 scheduler,
+  // so an edited desired config changes the running instance. The serve path
+  // owns the loop lifecycle (start/stop around the listener).
+  const scheduler = createScheduler(
+    { store, events, workers, worktrees },
+    {
+      maxConcurrentTasks: runtime.scheduler.maxConcurrentTasks,
+      tickIntervalMs: runtime.scheduler.tickIntervalMs,
+    },
+  );
   return {
     store,
     events,
@@ -220,7 +226,10 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   if (!loaded) return 1;
   const port = flag(args, 'port') !== undefined ? Number(flag(args, 'port')) : loaded.runtime.server.port;
 
-  const handle = startFactoryServer(buildServerDeps(dir, loaded.runtime), { port });
+  const deps = buildServerDeps(dir, loaded.runtime);
+  const handle = startFactoryServer(deps, { port });
+  // Actually run the E3 scheduler loop for the life of the server (spec §7.2).
+  deps.scheduler?.start();
   writeRuntimeFile(dir, {
     pid: process.pid,
     url: handle.url,
@@ -231,6 +240,7 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   io.out(handle.url);
 
   const shutdown = (): void => {
+    deps.scheduler?.stop();
     clearRuntimeFile(dir);
     handle.stop();
     process.exit(0);

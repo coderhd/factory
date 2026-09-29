@@ -447,7 +447,7 @@ interface SchedulerHarness {
   stop(): void;
 }
 
-function schedulerHarness(): SchedulerHarness {
+function schedulerHarness(config: { tickIntervalMs?: number } = {}): SchedulerHarness {
   const store = openStateStore(join(workDir, 'factory.db'));
   const events = openEventLog(store.db);
   const adapters: FakeHerdr[] = [];
@@ -465,7 +465,7 @@ function schedulerHarness(): SchedulerHarness {
     rootDir: join(workDir, 'worktrees'),
     baseBranch: 'main',
   });
-  const scheduler = createScheduler({ store, events, workers, worktrees, repoPath });
+  const scheduler = createScheduler({ store, events, workers, worktrees, repoPath }, config);
   const server = startFactoryServer(
     { store, events, evidence: new FakeEvidence(), scheduler, version: '0.1.0', schemaVersion: '1' },
     { port: 0, hostname: '127.0.0.1' },
@@ -550,12 +550,45 @@ describe('E2 WAITING_INPUT answer/resume', () => {
     }
   });
 
-  it('exposes the E3 scheduler status projection', async () => {
+  it('drives the loop from its own timer (start/stop), no manual ticks', async () => {
+    const h = schedulerHarness({ tickIntervalMs: 5 });
+    try {
+      const wo = createWorkOrder({ store: h.store, events: h.events }, { intent: 'timer loop' });
+      transitionWorkOrder({ store: h.store, events: h.events }, wo.id, { to: 'READY' });
+      transitionWorkOrder({ store: h.store, events: h.events }, wo.id, { to: 'PLANNING' });
+      const dag = commitDAG({ store: h.store, events: h.events }, wo.id, {
+        nodes: [{ nodeId: 'a', title: 'A' }],
+      });
+      transitionWorkOrder({ store: h.store, events: h.events }, wo.id, { to: 'EXECUTING' });
+      const taskId = dag.nodes[0].taskId;
+
+      // No tick() calls: the started interval must drive unblock → provision → assign.
+      h.scheduler.start();
+      for (let i = 0; i < 200; i += 1) {
+        if (h.store.get<Task>('tasks', taskId)?.state === 'RUNNING') break;
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+      }
+      expect(h.store.get<Task>('tasks', taskId)?.state).toBe('RUNNING');
+      expect(h.adapters.some((adapter) => adapter.envelope?.taskId === taskId)).toBe(true);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('exposes the E3 scheduler status projection (config + loop state)', async () => {
     const h = schedulerHarness();
     try {
       const { scheduler } = await h.client.schedulerStatus();
       expect(scheduler.concurrency.max).toBe(3);
       expect(scheduler.provisioning.enabled).toBe(true);
+      // The interval loop is not started for an in-process test scheduler.
+      expect(scheduler.running).toBe(false);
+      expect(scheduler.tickIntervalMs).toBe(1000);
+
+      h.scheduler.start();
+      const running = await h.client.schedulerStatus();
+      expect(running.scheduler.running).toBe(true);
+      h.scheduler.stop();
     } finally {
       h.stop();
     }
@@ -622,12 +655,20 @@ describe('E2 Observatory projections', () => {
       expect(stages).toContain('work_order');
       expect(stages).toContain('task');
       expect(stages).toContain('attempt');
+
+      // The drill-down is served from the stub port; the E5 stages stay stubs.
+      const byStage = new Map(drillDown.chain.map((step) => [step.stage, step]));
+      expect(byStage.get('trace')?.status).toBe('stub');
+      expect(byStage.get('evidence')?.status).toBe('stub');
+
+      // An unknown Work Order has no drill-down (404, not an empty chain).
+      await expect(h.client.drillDown('wo_missing')).rejects.toMatchObject({ status: 404 });
     } finally {
       h.stop();
     }
   });
 
-  it('projects a Work Order -> Task -> Attempt drill-down chain (stub for E5 stages)', () => {
+  it('projects the full spec §23 drill-down chain with E5/E8 stages marked stub', () => {
     const store = openStateStore(join(workDir, 'factory.db'));
     try {
       const events = openEventLog(store.db);
@@ -639,14 +680,33 @@ describe('E2 Observatory projections', () => {
       );
       const port = new FakeEvidence();
       port.changes = [change({ workOrderId: wo.id, taskId: task.id, attemptId: attempt.id })];
+      store.set('interactions', 'interaction_1', {
+        id: 'interaction_1',
+        taskId: task.id,
+        status: 'PENDING',
+      });
 
       const drillDown = projectDrillDown(port, store, wo.id);
       expect(drillDown).not.toBeNull();
+      // Spec §23 order: WO → Task → Attempt → trace → verification → evidence → decision.
+      expect(drillDown!.chain.map((step) => step.stage)).toEqual([
+        'work_order',
+        'task',
+        'attempt',
+        'trace',
+        'verification',
+        'evidence',
+        'human_decision',
+      ]);
       const byStage = new Map(drillDown!.chain.map((step) => [step.stage, step]));
       expect(byStage.get('work_order')?.refs).toEqual([wo.id]);
       expect(byStage.get('task')?.refs).toEqual([task.id]);
       expect(byStage.get('attempt')?.refs).toEqual([attempt.id]);
-      // E5-owned stages are honest stubs today, not fabricated evidence.
+      expect(byStage.get('human_decision')?.refs).toEqual(['interaction_1']);
+      // Verification is Factory-owned and resolves once changes exist; trace and
+      // evidence are E8/E5-owned, so they stay honest stubs (never fabricated).
+      expect(byStage.get('verification')?.status).toBe('available');
+      expect(byStage.get('trace')?.status).toBe('stub');
       expect(byStage.get('evidence')?.status).toBe('stub');
     } finally {
       store.close();
@@ -735,7 +795,14 @@ describe('E2 backup/restore', () => {
       'all green',
     );
     expect(readFileSync(join(restored.knowledgeDir, 'notes.md'), 'utf8')).toBe('# knowledge\n');
-    expect(existsSync(join(restored.intoDir, 'config', 'factory.yaml'))).toBe(true);
+
+    // The restore materializes a *bootable* deployment: factory.yaml at the
+    // target root + state/artifacts/knowledge under the configured paths.
+    expect(existsSync(join(restored.intoDir, 'factory.yaml'))).toBe(true);
+    expect(restored.stateDbPath).toBe(join(restored.intoDir, '.factory', 'state', 'factory.db'));
+    expect(restored.artifactsDir).toBe(join(restored.intoDir, '.factory', 'artifacts'));
+    expect(restored.knowledgeDir).toBe(join(restored.intoDir, '.factory', 'knowledge'));
+    expect(readFileSync(join(restored.intoDir, 'factory.yaml'), 'utf8')).toBe(configText);
   });
 
   it('fails loudly when the archive does not exist', () => {
@@ -754,7 +821,7 @@ describe('E2 backup/restore', () => {
     // Nothing was extracted over the existing files.
     expect(readdirSync(occupied)).toEqual(['keep.txt']);
     expect(existsSync(join(occupied, 'manifest.json'))).toBe(false);
-    expect(existsSync(join(occupied, 'state', 'factory.db'))).toBe(false);
+    expect(existsSync(join(occupied, '.factory', 'state', 'factory.db'))).toBe(false);
   });
 
   it('restores into a non-empty directory when --force is given', () => {
@@ -767,7 +834,7 @@ describe('E2 backup/restore', () => {
 
     const restored = restoreBackup({ archive, intoDir: occupied, force: true });
     expect(existsSync(restored.stateDbPath)).toBe(true);
-    expect(existsSync(join(occupied, 'config', 'factory.yaml'))).toBe(true);
+    expect(existsSync(join(occupied, 'factory.yaml'))).toBe(true);
     expect(existsSync(join(occupied, 'keep.txt'))).toBe(true);
   });
 
@@ -915,7 +982,7 @@ describe('E2 CLI', () => {
     const into = join(workDir, 'cli-fresh');
     const restoreCode = await runCli(['restore', archive, '--into', into], capture(dir).io);
     expect(restoreCode).toBe(0);
-    const restoredStore = openStateStore(join(into, 'state', 'factory.db'));
+    const restoredStore = openStateStore(join(into, '.factory', 'state', 'factory.db'));
     try {
       expect(restoredStore.get<WorkOrder>('work_orders', wo.id)?.intent).toBe('cli backup');
     } finally {
@@ -945,8 +1012,123 @@ describe('E2 CLI', () => {
 
     const forced = capture(dir);
     expect(await runCli(['restore', archive, '--into', into, '--force'], forced.io)).toBe(0);
-    expect(existsSync(join(into, 'state', 'factory.db'))).toBe(true);
+    expect(existsSync(join(into, '.factory', 'state', 'factory.db'))).toBe(true);
+    expect(existsSync(join(into, 'factory.yaml'))).toBe(true);
     expect(existsSync(join(into, 'keep.txt'))).toBe(true);
+  });
+
+  it('restores onto a fresh dir and boots a clean server that reads the restored state', async () => {
+    const src = join(workDir, 'boot-src');
+    mkdirSync(src, { recursive: true });
+    expect(await runCli(['init', '--dir', src], capture(src).io)).toBe(0);
+
+    const runtime = resolveFactoryConfig(DEFAULT_FACTORY_CONFIG, { baseDir: src });
+    mkdirSync(runtime.paths.state, { recursive: true });
+    const store = openStateStore(runtime.paths.db);
+    const events = openEventLog(store.db);
+    const wo = createWorkOrder({ store, events }, { intent: 'survives restore' });
+    createArtifactStore(runtime.paths.artifacts).put('attempt_1/verification.log', 'all green');
+    writeFileSync(join(runtime.paths.knowledge, 'notes.md'), '# knowledge\n');
+    store.close();
+
+    const archive = join(workDir, 'boot-backup.tar.gz');
+    expect(await runCli(['backup', '--dir', src, '--out', archive], capture(src).io)).toBe(0);
+
+    const fresh = join(workDir, 'boot-fresh');
+    expect(await runCli(['restore', archive, '--into', fresh], capture(fresh).io)).toBe(0);
+    // Fresh machine layout: a bootable factory.yaml + .factory storage.
+    expect(existsSync(join(fresh, 'factory.yaml'))).toBe(true);
+    expect(existsSync(join(fresh, '.factory', 'state', 'factory.db'))).toBe(true);
+
+    const startCap = capture(fresh);
+    expect(await runCli(['start', '--dir', fresh, '--detached', '--port', '0'], startCap.io)).toBe(0);
+    try {
+      const client = createFactoryClient({ baseUrl: startCap.out().trim() });
+      const health = await client.health();
+      expect(health.status).toBe('ok');
+      // The restored instance's server reads the restored Work Order.
+      const snapshot = await client.getWorkOrder(wo.id);
+      expect(snapshot.workOrder.intent).toBe('survives restore');
+      // State + evidence/artifacts + knowledge all booted from the fresh dir.
+      expect(readFileSync(join(fresh, '.factory', 'artifacts', 'attempt_1', 'verification.log'), 'utf8')).toBe(
+        'all green',
+      );
+      expect(readFileSync(join(fresh, '.factory', 'knowledge', 'notes.md'), 'utf8')).toBe(
+        '# knowledge\n',
+      );
+    } finally {
+      // Safety net: never leak a detached server if an assertion fails.
+      await runCli(['stop', '--dir', fresh], capture(fresh).io);
+    }
+  });
+
+  it('answers a QUESTION through CLI `wo answer` and resumes the Task', async () => {
+    const h = schedulerHarness();
+    try {
+      const wo = createWorkOrder({ store: h.store, events: h.events }, { intent: 'cli answer' });
+      transitionWorkOrder({ store: h.store, events: h.events }, wo.id, { to: 'READY' });
+      transitionWorkOrder({ store: h.store, events: h.events }, wo.id, { to: 'PLANNING' });
+      const dag = commitDAG({ store: h.store, events: h.events }, wo.id, {
+        nodes: [{ nodeId: 'a', title: 'A' }],
+      });
+      transitionWorkOrder({ store: h.store, events: h.events }, wo.id, { to: 'EXECUTING' });
+      const taskId = dag.nodes[0].taskId;
+      h.scheduler.tick();
+      const adapter = h.adapters.find((a) => a.envelope?.taskId === taskId)!;
+      adapter.result = waitingResult('which base branch?');
+      await settle();
+      h.scheduler.tick();
+      await settle();
+      const pending = await h.client.listInteractions('PENDING');
+      expect(pending).toHaveLength(1);
+
+      const cap = capture(workDir);
+      const code = await runCli(
+        ['wo', 'answer', pending[0].id, 'use main', '--url', h.server.url],
+        cap.io,
+      );
+      expect(code).toBe(0);
+      const answered = JSON.parse(cap.out()) as {
+        interaction: { status: string; response: string };
+        task: { state: string };
+      };
+      expect(answered.interaction.status).toBe('ANSWERED');
+      expect(answered.interaction.response).toBe('use main');
+      expect(answered.task.state).toBe('RUNNING');
+      expect(h.store.get<Task>('tasks', taskId)?.state).toBe('RUNNING');
+
+      // The CLI surfaces a server error and exits non-zero (no shell mutation).
+      const bad = capture(workDir);
+      expect(await runCli(['wo', 'answer', 'interaction_missing', 'x', '--url', h.server.url], bad.io)).toBe(1);
+      expect(bad.err()).toMatch(/interaction not found/);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('applies the resolved scheduler config from factory.yaml to the running server', async () => {
+    const dir = join(workDir, 'scheduler-config');
+    mkdirSync(dir, { recursive: true });
+    expect(await runCli(['init', '--dir', dir], capture(dir).io)).toBe(0);
+
+    // Edit the desired config; the serve path must resolve it into the scheduler.
+    const text = readFileSync(join(dir, 'factory.yaml'), 'utf8')
+      .replace('maxConcurrentTasks: 3', 'maxConcurrentTasks: 7')
+      .replace('tickIntervalMs: 1000', 'tickIntervalMs: 250');
+    writeFileSync(join(dir, 'factory.yaml'), text);
+
+    const startCap = capture(dir);
+    expect(await runCli(['start', '--dir', dir, '--detached', '--port', '0'], startCap.io)).toBe(0);
+    try {
+      const client = createFactoryClient({ baseUrl: startCap.out().trim() });
+      const { scheduler } = await client.schedulerStatus();
+      expect(scheduler.concurrency.max).toBe(7);
+      expect(scheduler.tickIntervalMs).toBe(250);
+      // The serve path started the tick loop itself (no manual tick).
+      expect(scheduler.running).toBe(true);
+    } finally {
+      await runCli(['stop', '--dir', dir], capture(dir).io);
+    }
   });
 
   it('refuses a detached start when runtime.json points at a live process', async () => {
