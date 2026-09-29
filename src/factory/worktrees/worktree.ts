@@ -1,8 +1,7 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 
-import { FactoryError } from '../domain/errors';
 import type { ArtifactStore } from '../state/store';
 
 /**
@@ -35,11 +34,11 @@ function git(args: string[], cwd: string): string {
 
 /** The main repo that owns a worktree, discovered from the worktree itself. */
 function repoOf(worktreePath: string): string {
-  const commonDir = git(
-    ['-C', worktreePath, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
-    worktreePath,
-  );
-  return dirname(commonDir);
+  // `--git-common-dir` may be relative on older git; resolve it ourselves rather
+  // than relying on `--path-format=absolute` (git ≥ 2.31).
+  const commonDir = git(['-C', worktreePath, 'rev-parse', '--git-common-dir'], worktreePath);
+  const absolute = isAbsolute(commonDir) ? commonDir : resolve(worktreePath, commonDir);
+  return dirname(absolute);
 }
 
 /**
@@ -55,9 +54,28 @@ export function createWorktreeManager(config: WorktreeManagerConfig): WorktreeMa
       const branch = `factory/task-${taskId}`;
       const worktreePath = join(rootDir, taskId);
 
+      // A leftover worktree/branch from a crashed assignment must not starve
+      // this Task forever (F-E3.2-5): clean the stale artefacts, then retry.
+      // The uncommitted diff of a crashed run is E7's §18.4 recovery concern.
       if (existsSync(worktreePath)) {
-        throw new FactoryError('WORKTREE_EXISTS', `worktree already exists: ${worktreePath}`);
+        try {
+          git(['worktree', 'remove', '--force', worktreePath], repoPath);
+        } catch {
+          // Not a registered worktree for this repo (crash mid-add): drop the dir.
+          rmSync(worktreePath, { recursive: true, force: true });
+        }
       }
+      try {
+        git(['worktree', 'prune'], repoPath);
+      } catch {
+        // Prune is best-effort; a registration pointing at a missing path is inert.
+      }
+      try {
+        git(['branch', '-D', branch], repoPath);
+      } catch {
+        // The branch may not exist; that is the normal first-create path.
+      }
+
       mkdirSync(rootDir, { recursive: true });
       git(['worktree', 'add', '-b', branch, worktreePath, baseCommit], repoPath);
 

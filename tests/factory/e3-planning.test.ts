@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -27,13 +27,14 @@ import {
   type DAGProposalPayload,
   type ProposalNode,
 } from '../../src/factory/planning/dag';
-import { createScheduler } from '../../src/factory/scheduler/scheduler';
+import { createScheduler, INTERACTION_CREATED, type InteractionRecord } from '../../src/factory/scheduler/scheduler';
 import { createArtifactStore, openStateStore } from '../../src/factory/state/store';
-import type {
-  ExecutionEnvelope,
-  WorkerAdapter,
-  WorkerResult,
-  WorkerStatus,
+import {
+  createHerdrWorker,
+  type ExecutionEnvelope,
+  type WorkerAdapter,
+  type WorkerResult,
+  type WorkerStatus,
 } from '../../src/factory/workers/herdr';
 import {
   assign,
@@ -101,7 +102,7 @@ class FakeHerdr implements WorkerAdapter {
   }
   async pause(): Promise<void> {}
   async resume(): Promise<void> {}
-  status(): WorkerStatus {
+  async status(): Promise<WorkerStatus> {
     return { state: this.result ? 'completed' : 'running', lastHeartbeatAt: new Date().toISOString() };
   }
   async execute(envelope: ExecutionEnvelope): Promise<void> {
@@ -170,7 +171,11 @@ interface Harness {
   clock: ReturnType<typeof makeClock>;
 }
 
-function harness(opts: { maxConcurrentTasks?: number; withArtifacts?: boolean } = {}): Harness {
+function harness(opts: {
+  maxConcurrentTasks?: number;
+  withArtifacts?: boolean;
+  tickIntervalMs?: number;
+} = {}): Harness {
   const store = openStateStore(dbPath);
   const events = openEventLog(store.db);
   const clock = makeClock();
@@ -196,7 +201,10 @@ function harness(opts: { maxConcurrentTasks?: number; withArtifacts?: boolean } 
       repoPath,
       artifacts: opts.withArtifacts ? createArtifactStore(join(workDir, 'artifacts')) : undefined,
     },
-    { maxConcurrentTasks: opts.maxConcurrentTasks ?? 3 },
+    {
+      maxConcurrentTasks: opts.maxConcurrentTasks ?? 3,
+      tickIntervalMs: opts.tickIntervalMs ?? 1000,
+    },
   );
   return { store, events, workers, worktrees, scheduler, adapters, clock };
 }
@@ -324,6 +332,23 @@ describe('E3 DAG propose / validate / commit', () => {
         true,
       );
       expect(h.events.readEvents().filter((e) => e.type === TASK_CREATED)).toHaveLength(4);
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('reports DAG_WO_STATE for an unknown Work Order without writing anything', () => {
+    const h = harness();
+    try {
+      const validation = validateDAG(deps(h), 'wo_missing', VALID_PAYLOAD);
+      expect(validation.ok).toBe(false);
+      if (!validation.ok) {
+        expect(validation.reasons).toHaveLength(1);
+        expect(validation.reasons[0].rule).toBe('DAG_WO_STATE');
+        expect(validation.reasons[0].message).toContain('not found');
+      }
+      expect(h.events.readEvents()).toHaveLength(0);
+      expect(h.store.list('tasks')).toHaveLength(0);
     } finally {
       h.store.close();
     }
@@ -658,6 +683,46 @@ describe('E3 scheduler capacity + policy', () => {
       h.store.close();
     }
   });
+
+  it('start() drives the interval timer idempotently and stop() clears it', async () => {
+    const h = harness({ maxConcurrentTasks: 1, tickIntervalMs: 5 });
+    try {
+      const { dag } = plan(h, [
+        { nodeId: 'a', title: 'A' },
+        { nodeId: 'b', title: 'B', dependsOn: ['a'] },
+      ]);
+      const a = nodeTask(dag, 'a');
+      const b = nodeTask(dag, 'b');
+
+      // A double start must not stack timers; the timer alone assigns the task.
+      h.scheduler.start();
+      h.scheduler.start();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(stateOf(h, a)).toBe('RUNNING');
+      expect(h.workers.listWorkers()).toHaveLength(1);
+
+      h.scheduler.stop();
+      h.scheduler.stop();
+
+      // Take A to VERIFIED, then prove no timer remains: B is unblocked only by
+      // an explicit tick, so an unstopped (stacked) timer would make this fail.
+      transitionTask(deps(h), a, { to: 'WAITING_INPUT' });
+      transitionTask(deps(h), a, { to: 'RUNNING' });
+      transitionTask(deps(h), a, { to: 'SUCCESS' });
+      transitionTask(deps(h), a, { to: 'VERIFYING' });
+      transitionTask(deps(h), a, { to: 'VERIFIED' });
+
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(stateOf(h, b)).toBe('PLANNED');
+
+      h.scheduler.tick();
+      await settle();
+      expect(stateOf(h, b)).toBe('RUNNING');
+    } finally {
+      h.scheduler.stop();
+      h.store.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -705,6 +770,41 @@ describe('E3 worktree isolation', () => {
     } finally {
       h.store.close();
     }
+  });
+
+  it('cleans a leftover worktree/branch from a crashed assignment instead of starving (WORKTREE_EXISTS)', () => {
+    const worktrees = createWorktreeManager({ rootDir: worktreeRoot, baseBranch: 'main' });
+
+    // Simulate a crashed assignment: the worktree + branch are left behind.
+    const crashed = worktrees.createTaskWorktree('task_crash', repoPath);
+    expect(existsSync(crashed.worktreePath)).toBe(true);
+
+    const retried = worktrees.createTaskWorktree('task_crash', repoPath);
+    expect(retried.taskId).toBe('task_crash');
+    expect(retried.branch).toBe('factory/task-task_crash');
+    expect(retried.worktreePath).toBe(crashed.worktreePath);
+    expect(retried.baseCommit).toBe(baseCommit);
+    expect(existsSync(retried.worktreePath)).toBe(true);
+
+    // A branch left behind without its worktree is cleaned too.
+    git(['branch', 'factory/task-orphan', baseCommit], repoPath);
+    const orphan = worktrees.createTaskWorktree('orphan', repoPath);
+    expect(orphan.branch).toBe('factory/task-orphan');
+    expect(existsSync(orphan.worktreePath)).toBe(true);
+  });
+
+  it('removes a worktree + branch and preserves the diff as evidence (§18.4)', () => {
+    const worktrees = createWorktreeManager({ rootDir: worktreeRoot, baseBranch: 'main' });
+    const evidence = createArtifactStore(join(workDir, 'evidence'));
+    const task = worktrees.createTaskWorktree('task_cleanup', repoPath);
+    writeFileSync(join(task.worktreePath, 'README.md'), '# changed\n');
+
+    worktrees.removeTaskWorktree(task, evidence);
+
+    expect(existsSync(task.worktreePath)).toBe(false);
+    expect(git(['branch', '--list', 'factory/task-task_cleanup'], repoPath)).toBe('');
+    const diff = Buffer.from(evidence.get('task_cleanup/diff.patch')).toString('utf8');
+    expect(diff).toContain('README.md');
   });
 });
 
@@ -841,7 +941,37 @@ describe('E3 assignment + completion rules', () => {
     }
   });
 
-  it('keeps a waiting_input worker BUSY with an open assignment (never reclaimed)', async () => {
+  it('stores worker artifacts through the ArtifactStore and links the ids on the Attempt', async () => {
+    const h = harness({ withArtifacts: true });
+    try {
+      const { dag } = plan(h, [{ nodeId: 'a', title: 'A' }]);
+      const a = nodeTask(dag, 'a');
+      h.scheduler.tick();
+
+      adapterForTask(h, a).result = completedResult({
+        artifacts: [{ name: 'verification.log', data: 'all checks green' }],
+      });
+      await settle();
+      h.scheduler.tick();
+      await settle();
+
+      expect(stateOf(h, a)).toBe('SUCCESS');
+      const attempt = h.store.list<{ outcome: string | null; artifactIds: string[] }>('attempts')[0];
+      expect(attempt.outcome).toBe('success');
+      expect(attempt.artifactIds).toHaveLength(1);
+
+      // The id is the ArtifactStore ref; the bytes live on the filesystem
+      // (large artifacts never go into the database).
+      const id = attempt.artifactIds[0];
+      expect(h.store.list('artifacts')).toHaveLength(0);
+      expect(existsSync(join(workDir, 'artifacts', id))).toBe(true);
+      expect(readFileSync(join(workDir, 'artifacts', id), 'utf8')).toBe('all checks green');
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('persists a durable §12 interaction and keeps a waiting_input worker BUSY (never reclaimed)', async () => {
     const h = harness();
     try {
       const { dag } = plan(h, [{ nodeId: 'a', title: 'A' }]);
@@ -857,6 +987,21 @@ describe('E3 assignment + completion rules', () => {
       const worker = h.workers.listWorkers()[0];
       expect(worker.runtimeState).toBe('BUSY');
       expect(openAssignments(h)).toHaveLength(1);
+
+      // The question is durable, linked to the open Attempt and the Task, so
+      // E2's answer loop has something to resume from.
+      const interactions = h.store.list<InteractionRecord>('interactions');
+      expect(interactions).toHaveLength(1);
+      expect(interactions[0].type).toBe('QUESTION');
+      expect(interactions[0].taskId).toBe(a);
+      expect(interactions[0].attemptId).toBe(worker.lease?.attemptId);
+      expect(interactions[0].workerId).toBe(worker.id);
+      expect(interactions[0].question).toBe('which base branch?');
+      expect(interactions[0].status).toBe('PENDING');
+      expect(interactions[0].response).toBeNull();
+      expect(
+        h.events.readEvents().filter((e) => e.type === INTERACTION_CREATED),
+      ).toHaveLength(1);
 
       h.clock.advance(11 * 60_000);
       h.scheduler.tick();
@@ -934,6 +1079,99 @@ describe('E3 assignment + completion rules', () => {
       expect(workerOf(h, worker.id).lease?.taskId).toBe(a);
     } finally {
       h.store.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T10 — Herdr adapter wire protocol (NDJSON read-back)
+// ---------------------------------------------------------------------------
+
+describe('E3 Herdr adapter wire protocol', () => {
+  function stubScript(name: string, body: string): string {
+    const scriptPath = join(workDir, name);
+    writeFileSync(scriptPath, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    return scriptPath;
+  }
+
+  const envelope: ExecutionEnvelope = {
+    workOrderId: 'wo',
+    taskId: 'task',
+    attemptId: 'attempt',
+    repository: repoPath,
+    baseCommit,
+    branch: 'b',
+    worktree: worktreeRoot,
+    authorizationCapabilities: [],
+    initialContext: 'x',
+    retrievalEndpoint: null,
+    skills: [],
+    requiredVerification: [],
+  };
+
+  it('reads the NDJSON WorkerResult report back from the runtime stdout', async () => {
+    const report: WorkerResult = {
+      status: 'completed',
+      commits: [{ sha: 'abc123', message: 'via stub' }],
+      artifacts: [],
+      interactions: [],
+      observations: ['one observation'],
+      verificationRequests: ['typecheck'],
+      diff: 'diff --git a/x b/x',
+      failure: null,
+    };
+    const script = stubScript(
+      'herdr-report.sh',
+      `read -r line\necho '${JSON.stringify(report)}'`,
+    );
+    const adapter = createHerdrWorker({ command: script });
+    try {
+      await adapter.provision();
+      await adapter.start();
+      await adapter.execute(envelope);
+
+      const result = await adapter.collectArtifacts();
+      expect(result.status).toBe('completed');
+      expect(result.commits).toEqual([{ sha: 'abc123', message: 'via stub' }]);
+      expect(result.verificationRequests).toEqual(['typecheck']);
+      expect(result.observations).toEqual(['one observation']);
+      expect((await adapter.status()).state).toBe('completed');
+    } finally {
+      await adapter.destroy();
+    }
+  });
+
+  it('ignores non-JSON stdout noise and ingests the next valid report line', async () => {
+    const script = stubScript(
+      'herdr-noise.sh',
+      `read -r line\necho 'not a report'\necho '{"status":"failed","failure":"boom"}'`,
+    );
+    const adapter = createHerdrWorker({ command: script });
+    try {
+      await adapter.start();
+      await adapter.execute(envelope);
+
+      const result = await adapter.collectArtifacts();
+      expect(result.status).toBe('failed');
+      expect(result.failure).toBe('boom');
+    } finally {
+      await adapter.destroy();
+    }
+  });
+
+  it('fails loudly when the runtime exits without emitting a report', async () => {
+    const script = stubScript('herdr-silent.sh', `read -r line\nexit 3`);
+    const adapter = createHerdrWorker({ command: script });
+    try {
+      await adapter.start();
+      await adapter.execute(envelope);
+
+      const result = await adapter.collectArtifacts();
+      expect(result.status).toBe('failed');
+      expect(result.failure).toContain('without emitting a report');
+      expect((await adapter.status()).state).toBe('failed');
+    } finally {
+      await adapter.destroy();
     }
   });
 });

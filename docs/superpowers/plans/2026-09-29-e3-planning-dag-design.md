@@ -443,6 +443,12 @@ export function createHerdrWorker(opts: HerdrOptions): WorkerAdapter;
 
 v0.1 Herdr is a thin **process boundary** (spawn/stop a `herdr` runtime per worker). E3.2 pins the interface and the envelope; the concrete Herdr invocation is E3.2's to fill behind it. **Tests never spawn real Herdr** — they substitute a fake `WorkerAdapter` (Ruling R5: hermetic tests; OS temp dirs; never mutate this repo's worktrees).
 
+**Herdr wire protocol (v0.1).** The process boundary is newline-delimited JSON (NDJSON), not a hidden convention:
+
+- **Factory → runtime.** `createHerdrWorker` spawns `herdr start` and `execute(envelope)` writes exactly one JSON `ExecutionEnvelope` followed by `\n` to the runtime's stdin.
+- **runtime → Factory.** The runtime writes NDJSON to stdout; each line is a `WorkerResult` report (§17 worker → Factory: status, commits, artifacts, interactions, observations, verification requests, diff, failure). `collectArtifacts()` reads back the next valid report line (blocking until it arrives); malformed lines are ignored as runtime log noise.
+- **No report is loud.** If the runtime exits without emitting a valid report, `collectArtifacts()` returns a failed `WorkerResult` naming the absence of a report — never a silent success and never a hung collector. (Richer Herdr report schemas are E5/E7's; v0.1 pins this minimal read-back.)
+
 ### 6.2 Worker records, provisioning, leases
 
 Workers are documents in E1's `workers` collection (JSON doc store; no schema change — the collection already exists in `DOCUMENT_COLLECTIONS` and has no generated FK columns, so additive fields are free). `manager.ts` exposes a **`WorkerManager` façade object** (this is the `workers` member of `SchedulerDeps`, §5.1); the plan's `provisionWorker(profile)` surface is the façade method:

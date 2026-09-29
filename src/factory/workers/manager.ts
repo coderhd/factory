@@ -9,7 +9,7 @@ import {
 import type { EventLog } from '../events/log';
 import type { SchedulerDeps } from '../scheduler/scheduler';
 import type { StateStore } from '../state/store';
-import type { ExecutionEnvelope, WorkerAdapter, WorkerResult } from './herdr';
+import type { ExecutionEnvelope, WorkerAdapter, WorkerResult, WorkerStatus } from './herdr';
 
 /**
  * E3.2 WorkerManager façade (spec §15/§16). Workers are durable JSON documents
@@ -66,8 +66,22 @@ export interface WorkerManager {
     leaseTtlMs: number,
   ): WorkerRecord;
   listWorkers(): WorkerRecord[];
+  status(workerId: string): Promise<WorkerStatus>;
   execute(workerId: string, envelope: ExecutionEnvelope): Promise<void>;
   collectArtifacts(workerId: string): Promise<WorkerResult>;
+}
+
+/**
+ * The single live Assignment for a Worker, shared by the manager's reclaim
+ * guard and the scheduler's collect/completion passes (`closedAt: null` = open;
+ * closed rows are retained as provenance).
+ */
+export function openAssignmentFor(store: StateStore, workerId: string): AssignmentRecord | null {
+  return (
+    store
+      .list<AssignmentRecord>('assignments')
+      .find((assignment) => assignment.workerId === workerId && assignment.closedAt === null) ?? null
+  );
 }
 
 const DEFAULT_NOW = (): string => new Date().toISOString();
@@ -95,15 +109,6 @@ export function createWorkerManager(deps: WorkerManagerDeps): WorkerManager {
   const dispatchFailures = new Map<string, string>();
 
   const listWorkers = (): WorkerRecord[] => deps.store.list<WorkerRecord>('workers');
-
-  function openAssignmentFor(workerId: string): AssignmentRecord | null {
-    return (
-      deps.store
-        .list<AssignmentRecord>('assignments')
-        .find((assignment) => assignment.workerId === workerId && assignment.closedAt === null) ??
-      null
-    );
-  }
 
   return {
     provisionWorker(profile): WorkerRecord {
@@ -145,7 +150,7 @@ export function createWorkerManager(deps: WorkerManagerDeps): WorkerManager {
       for (const worker of listWorkers()) {
         if (worker.runtimeState !== 'IDLE') continue;
         // An open assignment protects a worker (a waiting_input assignment is open).
-        if (openAssignmentFor(worker.id)) continue;
+        if (openAssignmentFor(deps.store, worker.id)) continue;
         if (nowMs - Date.parse(worker.lastActiveAt) <= idleTimeoutMs) continue;
 
         const updated: WorkerRecord = {
@@ -189,6 +194,12 @@ export function createWorkerManager(deps: WorkerManagerDeps): WorkerManager {
     },
 
     listWorkers,
+
+    async status(workerId): Promise<WorkerStatus> {
+      const adapter = adapters.get(workerId);
+      if (!adapter) throw new FactoryError('WORKER_NOT_FOUND', `worker not found: ${workerId}`);
+      return adapter.status();
+    },
 
     async execute(workerId, envelope): Promise<void> {
       const adapter = adapters.get(workerId);
