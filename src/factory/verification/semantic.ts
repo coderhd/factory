@@ -141,7 +141,13 @@ export interface SemanticVerifyInput {
 }
 
 export interface SemanticVerifier {
-  readonly identity: ModelIdentity;
+  /**
+   * The verifier's frozen identity snapshot. Frozen because it is the same
+   * object `verify` reads `modelDifferent` from: an externally mutable identity
+   * would let a caller re-record the independence attestation after the
+   * construction-time writer ≠ verifier check already passed.
+   */
+  readonly identity: Readonly<ModelIdentity>;
   verify(input: SemanticVerifyInput): Promise<SemanticVerificationResult>;
 }
 
@@ -307,14 +313,22 @@ export function createSemanticVerifier(options: SemanticVerifierOptions): Semant
   }
   assertIdentity(judge.identity, 'verifier');
 
-  // Snapshot every option: a caller mutating its own objects after construction
-  // must not be able to forge provenance or swap the rubric mid-flight.
-  const generator = cloneIdentity(options.generator);
-  const verifier = cloneIdentity(judge.identity);
+  // Snapshot and FREEZE every option: a caller mutating its own objects after
+  // construction must not be able to forge provenance or swap the rubric
+  // mid-flight. Freezing the verifier snapshot matters most: it is the object
+  // exposed as `identity`, and `verify` recomputes `modelDifferent` from it, so
+  // an unfrozen snapshot would let a later `instance.identity.model = ...`
+  // re-record the independence attestation after the construction-time check
+  // already passed. The check must stay true, not merely have been true once.
+  const generator = Object.freeze(cloneIdentity(options.generator));
+  const verifier = Object.freeze(cloneIdentity(judge.identity));
   assertIndependent(generator, verifier);
 
   const verifierKey = modelKey(verifier);
-  const promptProvenance: PromptProvenance = { id: prompt.id, version: prompt.version };
+  const promptProvenance: Readonly<PromptProvenance> = Object.freeze({
+    id: prompt.id,
+    version: prompt.version,
+  });
   const rubricItems = [...rubric];
 
   async function verify(input: SemanticVerifyInput): Promise<SemanticVerificationResult> {

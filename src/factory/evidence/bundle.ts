@@ -21,8 +21,11 @@ import {
  * criterion is mapped to concrete proof drawn from the verification tiers, with
  * the gates, model/prompt provenance, per-tier sign-off and attempt history.
  * An acceptance criterion with no proof is an explicit gap (`uncovered`), not a
- * silent pass. The bundle is deep-frozen once produced and is a copy of its
- * inputs, so neither the caller nor a later mutation can rewrite the receipt.
+ * silent pass. `complete` also fails closed on the §9 Writer ≠ Verifier
+ * attestation: a receipt whose semantic result does not attest
+ * `provenance.modelDifferent` is never promotion-grade, whatever its gates say.
+ * The bundle is deep-frozen once produced and is a copy of its inputs, so
+ * neither the caller nor a later mutation can rewrite the receipt.
  *
  * The run-level gate is E5.1's `run.passed`. A per-category `SuiteResult.passed`
  * is only meaningful when that suite actually executed checks, so tier gates
@@ -94,7 +97,13 @@ export interface EvidenceBundle {
   attempts: AttemptHistoryEntry[];
   /** Context only, never a gate: the agent's self-assessment is advisory (spec §14.4). */
   advisory: { selfAssessment: string | null };
-  /** True only when every AC is covered by passing proof and both run and semantic gates pass. */
+  /**
+   * True only when every AC is covered by passing proof, both run and semantic
+   * gates pass, and the semantic result attests writer ≠ verifier
+   * (`provenance.modelDifferent`). The bundle is the durable receipt the
+   * promotion gate consumes, so a result that does not attest an independent
+   * verifier fails closed here rather than certifying a self-signed change.
+   */
   complete: boolean;
 }
 
@@ -261,7 +270,11 @@ export function buildEvidenceBundle(input: EvidenceBundleInput): Readonly<Eviden
     criteria.length > 0 &&
     criteria.every((criterion) => criterion.status === 'pass') &&
     gates.run &&
-    gates.semantic;
+    gates.semantic &&
+    // Fail closed on the §9 Writer ≠ Verifier attestation, exactly as the tiers
+    // fail closed on vacuous passes: `gates.semantic` records that the judge
+    // passed, not that it was independent of the writer.
+    semantic.provenance.modelDifferent;
 
   const bundle: EvidenceBundle = {
     id: input.id ?? `eb_${crypto.randomUUID()}`,

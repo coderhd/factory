@@ -783,6 +783,32 @@ describe('E5.2 writer ≠ verifier (spec §9)', () => {
     expect(result.generator.model).toBe('writer-1');
     expect(result.provenance.modelDifferent).toBe(true);
   });
+
+  it('freezes the verifier identity, so post-construction mutation cannot weaken the attestation', async () => {
+    const verifier = semanticVerifier(
+      judgeReturning(passRulings(['AC-cart-total', 'AC-cart-empty'])),
+    );
+
+    expect(Object.isFrozen(verifier.identity)).toBe(true);
+    const before = { ...verifier.identity };
+
+    // `identity` is the very object `verify` recomputes `modelDifferent` from:
+    // forging it to the writer must be refused, not silently re-recorded.
+    expect(() => {
+      (verifier.identity as ModelIdentity).model = generatorIdentity.model;
+    }).toThrow();
+
+    expect({ ...verifier.identity }).toEqual(before);
+
+    const result = await verifier.verify(semanticInput());
+    expect(result.verifier).toEqual(judgeIdentity);
+    expect(result.provenance).toEqual({
+      modelDifferent: true,
+      familyDifferent: true,
+      freshContext: true,
+    });
+    expect(result.passed).toBe(true);
+  });
 });
 
 describe('E5.2 semantic falsification (spec §14.3)', () => {
@@ -1015,6 +1041,27 @@ describe('E5.2 Evidence Bundle: every AC maps to proof (spec §5.4/§14.4)', () 
     });
 
     expect(bundle.criteria).toEqual([]);
+    expect(bundle.complete).toBe(false);
+  });
+
+  it('fails closed when the semantic result does not attest writer ≠ verifier', async () => {
+    const input = await greenBundleInput();
+    // A wiring mistake that fabricates a passing semantic result literal but
+    // records modelDifferent: false must not yield a promotion-grade receipt:
+    // the bundle is the receipt the promotion gate consumes.
+    const forged: SemanticVerificationResult = {
+      ...input.semantic,
+      provenance: { ...input.semantic.provenance, modelDifferent: false },
+    };
+
+    const bundle = buildEvidenceBundle({ ...input, semantic: forged });
+
+    // Every other gate the receipt considers is green...
+    expect(bundle.gates.run).toBe(true);
+    expect(bundle.gates.semantic).toBe(true);
+    expect(bundle.criteria.every((criterion) => criterion.status === 'pass')).toBe(true);
+    // ...and the reason it fails closed is visible on the receipt.
+    expect(bundle.provenance.modelDifferent).toBe(false);
     expect(bundle.complete).toBe(false);
   });
 
