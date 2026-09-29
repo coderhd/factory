@@ -12,5 +12,6 @@
 10. Qualification, Authorization and Activation are distinct — Accepted
 11. Staging is the qualification environment — Accepted
 12. Root is earned from real Factories — Accepted
+13. The DecisionModel seam stays generic; challengers stay shadow-only — Accepted
 
 The detailed Software Factory ADRs remain governed by its existing authoritative design document.

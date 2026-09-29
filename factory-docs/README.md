@@ -16,3 +16,8 @@ Final architecture capture for the Root / Factory ecosystem. The existing `2026-
 11. `architecture/quant-factory-boundary.md`
 12. `decisions/adr-index.md`
 13. `implementation/roadmap.md`
+
+## Routing (Factory Server v0.1, E4)
+
+- `architecture/decision-model-routing-core.md` — E4.1: generic DecisionModel seam, capability matrix, budget gates
+- `architecture/routing-decision-log.md` — E4.2: decision persistence, `routing.log` format + example line, override/appeal paths, ticket routing fields
