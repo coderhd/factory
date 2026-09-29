@@ -1,0 +1,23 @@
+# Factory Server MVP runtime (spec §20). Docker Compose is the MVP runtime;
+# persistent volumes hold Factory state, artifacts/evidence, and knowledge.
+# Images use explicit versions, never `latest`.
+services:
+  factory:
+    image: ghcr.io/coderhd/factory:0.1.0
+    ports:
+      - "8787:8787"
+    volumes:
+      - factory-state:/var/lib/factory/state
+      - factory-artifacts:/var/lib/factory/artifacts
+      - factory-knowledge:/var/lib/factory/knowledge
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8787/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  factory-state:
+  factory-artifacts:
+  factory-knowledge:

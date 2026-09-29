@@ -1,0 +1,23 @@
+apiVersion: factory/v0.1
+factoryVersion: 0.1.0
+server:
+  hostname: 127.0.0.1
+  port: 8787
+storage:
+  state: .factory/state
+  artifacts: .factory/artifacts
+  knowledge: .factory/knowledge
+scheduler:
+  maxConcurrentTasks: 3
+  tickIntervalMs: 1000
+workers:
+  profiles:
+    - herdr
+image:
+  repository: ghcr.io/coderhd/factory
+  tag: "0.1.0"
+compose:
+  healthcheck:
+    intervalSeconds: 10
+    timeoutSeconds: 5
+    retries: 3

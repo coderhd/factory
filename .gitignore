@@ -12,3 +12,8 @@ __pycache__/
 .factory/span-trial.log
 .factory/routing.log
 .factory/*.json
+.factory/state/
+.factory/artifacts/
+.factory/knowledge/
+.factory/backups/
+.factory/worktrees/
