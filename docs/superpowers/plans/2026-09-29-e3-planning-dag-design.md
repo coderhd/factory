@@ -22,6 +22,7 @@ Scheduler tick (in-process, event- + timer-driven)
    ↓  assign pass         READY task + IDLE worker + capacity + policy → worktree + assign + start
 Worker (Herdr adapter) executes in an isolated branch+worktree+baseCommit
    ↓  collect             status/commits/artifacts → completeAttempt + Factory transitions
+   ↓  release             worker → IDLE, lastActiveAt updated, lease cleared, assignment closed (§6.4 release rule)
    ↓  SUCCESS → VERIFYING → VERIFIED   (verification is E5; E3 only reacts to Task states)
    ↓  dependency VERIFIED → dependents unblocked on the next tick
 REPLAN (failure / missing information) → proposeDAG → commitDAG → DAG v2 (v1 preserved, never overwritten)
@@ -168,7 +169,7 @@ export function commitDAG(
   2. Mint one `TaskDependency` row per edge (`{ id, taskId, dependsOnTaskId, createdAt, updatedAt }`) — written **after all task rows** so the schema's real foreign keys (`task_dependencies.task_id`/`depends_on_task_id` → `tasks.id`) enforce endpoint existence at the database level as a belt-and-suspenders under R6.
   3. Append one `dag.committed` event (payload `{ dag: DAGVersion }`, aggregate `work_order`).
 - Returns the `DAGVersion`. Version number = last committed version for this Work Order + 1 (from durable state; `proposedVersion` is not trusted).
-- **Work Order transition is deliberately not applied here.** `commitDAG` commits planning artifacts only; the orchestrator (E2 server / CLI / E3.2 test) applies `transitionWorkOrder(deps, woId, { to: 'EXECUTING' })` (E1, deps-first per Ruling R9) immediately after the v1 commit. The crash window between the two is benign: the scheduler only runs passes for Work Orders already in `EXECUTING`/`WAITING_INPUT` (§5.3), and E7 reconciliation owns the window. This keeps `commitDAG` single-responsibility and avoids relying on nested transactions.
+- **Work Order transition is deliberately not applied here.** `commitDAG` commits planning artifacts only; the orchestrator (E2 server / CLI / E3.2 test) applies `transitionWorkOrder(deps, woId, { to: 'EXECUTING' })` (E1, deps-first per Ruling R9) immediately after the v1 commit. The crash window between the two is benign: the scheduler's task passes (unblock/assign — §5.3 scope; the worker passes are Work-Order-agnostic and never touch tasks) only consider Work Orders already in `EXECUTING`/`WAITING_INPUT`, and E7 reconciliation owns the window. This keeps `commitDAG` single-responsibility and avoids relying on nested transactions.
 - `commitDAG` does **not** call E1's `createTask` per node: it needs full-graph atomicity and resolved cross-references, so it mints the rows and `TASK_CREATED` events itself in E1's exact shapes.
 
 ### 3.3 Valid example (V1)
@@ -331,7 +332,7 @@ Deliberate boundary: v0.1 has no "resume same task across versions" (nodeId-stab
 
 ### 5.1 Shape
 
-In-process, tick-driven (KISS: in-process queue; no Redis — deferred). One `Scheduler` instance owns all passes. A tick is triggered (a) explicitly by the orchestrator after any Factory transition (`tick()` call), and (b) by a timer (`start()` sets the interval; `stop()` clears it) for idle reclaim and lease expiry. The queue is **derived state** (READY tasks of active versions) — rebuilt each tick from `StateStore`, so a crash loses nothing.
+In-process, tick-driven (KISS: in-process queue; no Redis — deferred). One `Scheduler` instance owns all passes. A tick is triggered (a) explicitly by the orchestrator after any Factory transition (`tick()` call), and (b) by a timer (`start()` sets the interval; `stop()` clears it) for worker-report collection, idle reclaim, and lease expiry. The queue is **derived state** (READY tasks of active versions) — rebuilt each tick from `StateStore`, so a crash loses nothing.
 
 ```ts
 /** src/factory/scheduler/scheduler.ts (E3.2) */
@@ -340,7 +341,7 @@ export interface SchedulerConfig {
   maxConcurrentTasks: number;        // default 3 (spec §7.2 MVP band 2–3; tests exercise 2 and 3)
   provisioning: {                    // spec §16
     enabled: boolean;                // default true
-    min: number;                     // default 0  — zero workers at rest
+    min: number;                     // default 0 — the only supported value in v0.1 (§5.3 pass 3: no floor-keeping; zero at rest)
     max: number;                     // default 5  — capacity ceiling, not an initial count
     idleTimeoutMs: number;           // default 10 * 60_000 (§16 idle_timeout: 10m)
     defaultProfile: WorkerProfile;   // 'herdr'
@@ -353,7 +354,7 @@ export interface SchedulerDeps {
   workers: WorkerManager;           // §6.2
   worktrees: WorktreeManager;       // §6.3
   policy?: SchedulerPolicy;         // default allow-all seam; E7 plugs `check()` in
-  now?: () => string;                // injectable clock — deterministic idle-reclaim tests
+  now?: () => string;                // the single injected clock — threaded into the WorkerManager and assign (§6.2, §6.4); one injection point
 }
 
 export function createScheduler(deps: SchedulerDeps, config?: Partial<SchedulerConfig>): Scheduler;
@@ -377,13 +378,15 @@ export interface SchedulerPolicy {
 
 v0.1 ships an allow-all default (the seam, not the policy). `DENY`/`REQUIRE_HUMAN` skip the task this tick and surface it in `status().blockedPolicy` for E2/E7. Full policy/risk enforcement (risk tiers, capability checks, high-risk gating) is E7 (#19); the seam is where it plugs in — the scheduler is policy-*aware* from day one.
 
-### 5.3 The tick — four passes, in order
+### 5.3 The tick — collect, then four passes, in order
 
-The scheduler considers only Work Orders in `EXECUTING` or `WAITING_INPUT` and only tasks in the **active** version's node set.
+Each tick opens with a **collect step** — the driver of §6.4's completion rules: the scheduler polls every `BUSY` worker holding an open assignment (the same heartbeat poll that renews the lease, §6.2) and routes each terminal `WorkerResult` into §6.4's completion path, whose release rule returns the worker to `IDLE` and frees the concurrency slot before the passes below run. The four passes then run in order.
+
+**Task scope.** The scheduler's *task* work — pass 1 (unblock), pass 4's candidates, and the demand signal pass 3 counts (the same candidate set pass 4 could actually assign) — considers only Work Orders in `EXECUTING` or `WAITING_INPUT` and only tasks in the **active** version's node set. The reclaim and provision passes are otherwise **Work-Order-agnostic**: they act on the worker population, not the Work-Order-scoped task set, so idle workers are still reclaimed (and the population still returns to zero) once every Work Order has left `EXECUTING`/`WAITING_INPUT` (e.g. all tasks `VERIFIED`, the Work Order in `VERIFYING` — S4 depends on this).
 
 1. **Unblock pass.** For each active-version task in `PLANNED` whose `dependsOn` tasks are **all `VERIFIED`** (terminal success — `SUCCESS`/`VERIFYING` do *not* unblock; spec §5.2): apply E1 `transitionTask(deps, taskId, { to: 'READY', reason: 'dependencies verified' })`. Dependents stay `PLANNED` (blocked) until then.
-2. **Reclaim pass.** Workers with `runtimeState: 'IDLE'`, no assignment, and `now() - lastActiveAt > idleTimeoutMs` → `destroy()` the adapter and mark `runtimeState: 'RECLAIMED'` (+ `worker.reclaimed` event; row retained — §6.2). Result at rest: active population 0.
-3. **Provision pass.** Demand-driven: `readyDemand = READY tasks (policy-allowed)`; `idle = IDLE workers`. If `readyDemand > idle` and `activePopulation < max (5)`, provision `min(readyDemand - idle, max - activePopulation)` workers of `defaultProfile` (§6.2). `min: 0` means the Factory never pre-provisions; it starts with zero workers and returns to zero.
+2. **Reclaim pass.** Workers with `runtimeState: 'IDLE'`, **no open assignment** (no `AssignmentRecord` with this `workerId` and `closedAt: null`; an assignment is **open** while `closedAt` is `null` and **closed** once the §6.4 release rule stamps it — closed rows are retained as provenance, and a `waiting_input` assignment is open, so its worker is never reclaimed), and `now() - lastActiveAt > idleTimeoutMs` → `destroy()` the adapter and mark `runtimeState: 'RECLAIMED'` (+ `worker.reclaimed` event; row retained — §6.2). This pass is Work-Order-agnostic (scope above). Result at rest: active population 0.
+3. **Provision pass.** Demand-driven: `readyDemand` = policy-allowed `READY` tasks in the scoped candidate set (scope above); `idle` = `IDLE` workers. If `readyDemand > idle` and `activePopulation < max (5)`, provision `min(readyDemand - idle, max - activePopulation)` workers of `defaultProfile` (§6.2). **`min` is accepted but unused in v0.1** — the formula reads only demand and `max`, and the reclaim pass still zeroes the population, so a non-zero `min` would be floor-keeping that contradicts zero-at-rest: **`min ≠ 0` is unsupported** (it has no effect; only `min: 0` behaves as configured, and the Factory never pre-provisions). The field exists so the config shape is forward-compatible (§7.2).
 4. **Assign pass.** While `assignedOrRunning < maxConcurrentTasks` and a policy-allowed `READY` task exists and an `IDLE` worker exists: pick the task (deterministic FIFO by `createdAt`, tie-break `id`), ensure its worktree (§6.3), then `assign` + `start` (§6.4). Per-task errors (e.g. worktree creation failure) skip that task for this tick and leave it `READY` — retried next tick.
 
 Selection fairness beyond FIFO (complexity/risk-weighted ordering) is deferred; the seam is the ordered candidate list.
@@ -392,11 +395,11 @@ Selection fairness beyond FIFO (complexity/risk-weighted ordering) is deferred; 
 
 **S1 — 3 independent tasks, capacity 3.** DAGv1 = three dependency-free nodes (V1-style minus edges). Tick: unblock 3 → `READY`; provision 3 (demand 3, ceiling 5); assign+start 3 → three workers executing concurrently. `status().concurrency = { current: 3, max: 3 }`, population 3.
 
-**S2 — capacity 2, 3 independent tasks.** First tick: 2 assigned + started, 1 stays `READY` (capacity bound). When one finishes execution (leaves `RUNNING`, i.e. `SUCCESS`), the next tick assigns the queued one — concurrency never exceeds 2.
+**S2 — capacity 2, 3 independent tasks.** First tick: 2 assigned + started, 1 stays `READY` (capacity bound). When one finishes execution (leaves `RUNNING`, i.e. `SUCCESS`), the next tick's collect step routes its report, the §6.4 release rule frees the worker and the slot, and the assign pass assigns the queued one — concurrency never exceeds 2.
 
 **S3 — blocked dependent.** DAGv1: `A` (no deps) → `B` (depends on `A`). Ticks while `A` is `RUNNING`, then `SUCCESS`, then `VERIFYING`: `B` remains `PLANNED` — not `READY`, never assignable. The tick after `A` is `VERIFIED`: `B` → `READY` → assigned (with a worker provisioned on demand). This is "dependent tasks remain blocked" (§7.2).
 
-**S4 — idle reclaim, zero at rest.** All tasks terminal (`VERIFIED`); every worker `IDLE`. Injected clock advances past `idleTimeoutMs` (10m): reclaim pass marks all workers `RECLAIMED` (adapters destroyed) → active population 0. The `workers` rows remain as provenance (attempts FK `RESTRICT`).
+**S4 — idle reclaim, zero at rest (reachable end-to-end).** Every task reached `SUCCESS` — its Attempt completed, so the §6.4 release rule fired per worker: `IDLE`, `lastActiveAt` updated, lease cleared, assignment closed (row retained) — and then `VERIFIED`; the Work Order has moved on to `VERIFYING` (E5's driving; E3 only reacts), which is why the reclaim pass is Work-Order-agnostic (§5.3 scope). Every worker is therefore `IDLE` with no open assignment. Injected clock advances past `idleTimeoutMs` (10m): reclaim pass marks all workers `RECLAIMED` (adapters destroyed) → active population 0. The `workers` rows and closed `assignments` rows remain as provenance (attempts FK `RESTRICT`).
 
 **S5 — REPLAN.** DAGv1's task fails and settles (`FAILED`); Work Order is `EXECUTING`. Planner proposes v2 (fresh node set); `commitDAG` validates (R1/R2 pass) → `DAGv2` committed. v1's version doc, task rows, edges, and events are untouched; `getActiveDAG` now returns v2; the scheduler's passes consider only v2's tasks. An invalid REPLAN (live task `RUNNING`) is rejected per I8.
 
@@ -447,7 +450,11 @@ Workers are documents in E1's `workers` collection (JSON doc store; no schema ch
 ```ts
 /** src/factory/workers/manager.ts (E3.2) */
 export type WorkerProfile = 'herdr';
-export type WorkerRuntimeState = 'PROVISIONED' | 'IDLE' | 'BUSY' | 'RECLAIMED';
+/** Worker lifecycle: IDLE → BUSY (assign, §6.4) → IDLE (release rule, §6.4) → RECLAIMED.
+ *  There is no separate `PROVISIONED` runtime state: `provisionWorker` provisions and
+ *  starts the adapter in one call and records IDLE — the provision fact lives in the
+ *  `worker.provisioned` event, not in the runtime state. */
+export type WorkerRuntimeState = 'IDLE' | 'BUSY' | 'RECLAIMED';
 
 export interface WorkerLease {   // consumed by E7 (plan Task 6: "E3 worker leases")
   attemptId: string;
@@ -473,7 +480,7 @@ export interface WorkerManagerDeps {
   store: StateStore;
   events: EventLog;
   spawn: SpawnWorker;
-  now?: () => string;             // injectable clock — deterministic reclaim/lease tests
+  now?: () => string;             // the scheduler's single clock, threaded in at composition (§5.1) — not a second injection point
 }
 
 export interface WorkerManager {
@@ -488,7 +495,7 @@ export interface WorkerManager {
 export function createWorkerManager(deps: WorkerManagerDeps): WorkerManager;
 ```
 
-- `provisionWorker` appends `worker.provisioned` and returns an `IDLE` record (adapter provisioned+started). Population accounting counts `PROVISIONED|IDLE|BUSY` only — `RECLAIMED` rows are history.
+- `provisionWorker` appends `worker.provisioned` and returns an `IDLE` record (adapter provisioned+started; there is no `PROVISIONED` runtime state — the provision fact is the event, not the state). Population accounting (pass 3's `activePopulation`, §5.3) counts `IDLE|BUSY` only — `RECLAIMED` rows are history.
 - `reclaimIdleWorkers` marks `RECLAIMED` and destroys the adapter. **Worker rows are never deleted**: once an Attempt references a worker, `attempts.worker_id` is `ON DELETE RESTRICT` — deletion would throw. Reclaim = stop runtime + mark state.
 - Leases: `startTask` (§6.4) grants via `renewLease(workerId, { attemptId, taskId }, ttl)`; heartbeats (adapter `status()` on tick) re-grant with the same binding. Expiry facts are queryable via `listWorkers()` (each record's `lease.expiresAt`); **E7 owns reconciliation** (§18.3/§18.5: `SUSPECT`/`UNREACHABLE`, grace, retry/replan/escalate). E3 records the lease and the expiry fact; it does not act on it.
 
@@ -532,17 +539,19 @@ export interface AssignmentIntent {
   worktree: TaskWorktree;
 }
 
-/** E1 Assignment { id, taskId, workerId, createdAt, updatedAt } + the worktree triple.
- *  Additive JSON fields are safe: the assignments FK columns read only
- *  `$.taskId` / `$.workerId`, which are kept. */
+/** E1 Assignment { id, taskId, workerId, createdAt, updatedAt } + the worktree triple
+ *  + the closure stamp. Additive JSON fields are safe: the assignments FK columns read
+ *  only `$.taskId` / `$.workerId`, which are kept. */
 export interface AssignmentRecord extends Assignment {
   branch: string;
   worktreePath: string;
   baseCommit: string;
+  closedAt: string | null;        // null = open; stamped by the release rule below on
+                                  // Attempt completion — rows are retained as provenance
 }
 
 export function assign(
-  deps: { store: StateStore; events: EventLog; now?: () => string },
+  deps: { store: StateStore; events: EventLog; now?: () => string },  // now = the scheduler's single clock (§5.1)
   intent: AssignmentIntent,
 ): AssignmentRecord;
 
@@ -551,11 +560,12 @@ export function startTask(deps: SchedulerDeps, assignment: AssignmentRecord): Ex
 
 - `assign` guards: task exists and is `READY` (else `FactoryError('TASK_NOT_READY', …)`), worker exists and is `IDLE` (else `'WORKER_NOT_IDLE', …`) — **single active assignment per task** and per worker (the second reading of "single-assignment": one task, one worker, one live Assignment). Then, in **one outer `store.db.transaction`** (the guards are evaluated inside it, closing the validate-outside-transaction TOCTOU window E1 left open): E1 `transitionTask(deps, taskId, { to: 'ASSIGNED' })`, write the `AssignmentRecord` (collection `assignments`), mark the worker `BUSY`, append `assignment.created` (payload `{ assignment: AssignmentRecord }`).
   Atomicity note: Bun nests `db.transaction` as savepoints (empirically verified on bun 1.4.2 for this design: an outer transaction rolls back inner E1-style transaction writes on failure), so E1's per-call transactions compose under the outer transaction. E3.2 keeps this case in its test.
-- `startTask` (scheduler's assign pass, after `assign`): E1 `createAttempt(deps, { taskId, workerId, model: null, environment })` → E1 `transitionTask(deps, taskId, { to: 'RUNNING' })` → grant the worker's lease via `renewLease` (§6.2) → `worker.execute(envelope)` (async dispatch; the tick returns, worker reports arrive through the report path below).
+- `startTask` (scheduler's assign pass, after `assign`): E1 `createAttempt(deps, { taskId, workerId, model: null, environment })` → E1 `transitionTask(deps, taskId, { to: 'RUNNING' })` → grant the worker's lease via `renewLease` (§6.2) → `worker.execute(envelope)` (async dispatch; the tick returns — reports are **collected by a later tick's collect step**, §5.3, which polls `BUSY` workers holding open assignments and routes terminal `WorkerResult`s into the completion rules below).
 - **Completion is Factory-governed** (E1's `TASK_EDGES` are the law: `RUNNING → WAITING_INPUT | SUCCESS`):
   - Report `completed` **with evidence** (non-empty diff/commits — invariant 24: no success claim without evidence): E1 `completeAttempt(deps, attemptId, { outcome: 'success', diff, artifactIds, … })` (artifacts stored via `ArtifactStore.put`, ids into the Attempt) → E1 `transitionTask(deps, taskId, { to: 'SUCCESS' })`. `SUCCESS → VERIFYING → VERIFIED` is E5's engine driving the same E1 transitions; E3 only *reacts* to `VERIFIED` by unblocking dependents (§5.3 pass 1).
   - Report `failed`, missing evidence, or a dispatch rejection: E1 `completeAttempt(deps, attemptId, { outcome: 'failed', failureHistory: [{ at, failure }] })` and the task **remains `RUNNING`** — invariant 9: failed Attempts do not automatically fail durable Work. A task reaches `FAILED` only via `VERIFYING → FAILED` (E5's verdict). Recovery (new Attempt from a clean known baseline, §18.4; bounded retries, escalation) is **E7's**; E3 records the failed Attempt and leaves the task `RUNNING`.
   - Report `waiting_input` (a question): E1 `transitionTask(deps, taskId, { to: 'WAITING_INPUT' })` + an interaction record; the §12 human answer loop (resume `WAITING_INPUT → RUNNING`) lands with E2 — the E1 edge already exists.
+  - **Release rule — runs on every Attempt completion, success *or* failure** (it is what returns a worker from `BUSY` to `IDLE`, and it is driven by the tick's collect step, §5.3): in the same transaction as the `completeAttempt` call, the Factory (a) marks the worker `runtimeState: 'IDLE'` (clearing `BUSY`); (b) sets the worker's `lastActiveAt = now()`; (c) clears the lease (`lease = null`); and (d) closes the live Assignment by stamping its `closedAt = now()` (`AssignmentRecord.closedAt`). The `AssignmentRecord` row is **retained** as provenance — never deleted — so §5.3 pass 2's "**no assignment**" means **no *open* assignment** (`closedAt: null`); *closed* rows (`closedAt` stamped) are history. `waiting_input` is **not** a completion: the worker stays `BUSY`, the lease stays live, and the assignment stays open (a resume is `WAITING_INPUT → RUNNING` via the §12 loop), so the reclaim pass never touches it. A **failed** completion releases the worker and closes the assignment too, even though the Task itself remains `RUNNING` (invariant 9): the Task still occupies its concurrency slot, and E7 owns the retry/replan that re-opens execution with a fresh Assignment. Every execution path that reaches terminal success (`SUCCESS`) or terminal failure therefore leaves its worker `IDLE` with no open assignment — which is exactly the predicate S4/T6 rely on.
 
 ### 6.5 Execution envelope (§17)
 
@@ -602,17 +612,19 @@ All E3.2 module functions follow E1's deps-first shape (Ruling R9): `proposeDAG(
 
 ```yaml
 scheduler:
-  maxConcurrentTasks: 3      # spec §7.2 MVP band 2–3; tests cover 2 and 3
-workers:
-  provisioning:
+  maxConcurrentTasks: 3        # spec §7.2 MVP band 2–3; tests cover 2 and 3
+  provisioning:                # loaded 1:1 into SchedulerConfig.provisioning (§5.1)
     enabled: true
-    capacity: { min: 0, max: 5 }
-    idle_timeout: 10m
-    default_profile: herdr
+    min: 0                     # only supported value in v0.1 (§5.3 pass 3)
+    max: 5                     # capacity ceiling, not an initial count (spec §16)
+    idleTimeoutMs: 600000      # spec §16 idle_timeout: 10m
+    defaultProfile: herdr      # spec §16 default_profile
 worktrees:
   rootDir: <dataDir>/worktrees
-  baseBranch: main           # see finding F2
+  baseBranch: main             # see finding F2
 ```
+
+The `provisioning` keys are **flat** — `min` / `max` / `idleTimeoutMs` / `defaultProfile` — exactly matching the flat field names of `SchedulerConfig.provisioning` (§5.1); `status().provisioning` (§5.5) reports the same `enabled`/`min`/`max` subset. There is no nested `capacity` object. The spec §16 example writes the same two bounds as `workers.capacity: { min, max }` with `workers.idle_timeout` / `workers.default_profile` as siblings; the loader maps those spec names onto these keys (`workers.provisioning` → `SchedulerConfig.provisioning`, `capacity.min`/`capacity.max` → `min`/`max`, `idle_timeout` → `idleTimeoutMs`, `default_profile` → `defaultProfile`). E3.2 reads **one** shape: `SchedulerConfig`.
 
 ### 7.3 Test matrix for `tests/factory/e3-planning.test.ts` (plan Task 2 Step 1)
 
@@ -625,7 +637,7 @@ All tests hermetic (Ruling R5): `mkdtempSync(join(tmpdir(), 'factory-e3-…'))` 
 | T3 | 3 independent, `maxConcurrentTasks: 3` | 3 tasks `RUNNING` concurrently; population 3 ≤ 5 |
 | T4 | 3 independent, `maxConcurrentTasks: 2` | 2 `RUNNING`, 1 `READY` queued; after one leaves `RUNNING` (`SUCCESS`), the third assigns; concurrency never exceeds 2 |
 | T5 | dependent blocked | B stays `PLANNED` while A `RUNNING`/`SUCCESS`/`VERIFYING`; B `READY` only after A `VERIFIED` |
-| T6 | provisioning + zero at rest | starts at 0 workers; provisions on demand only; never exceeds max 5; after all tasks terminal + clock > 10m → all `RECLAIMED`, active population 0 |
+| T6 | provisioning + zero at rest | starts at 0 workers; provisions on demand only; never exceeds max 5; each completion's §6.4 release rule returns the worker to `IDLE` and closes its assignment (row retained); after all tasks terminal + clock > 10m → reclaim pass marks all `RECLAIMED`, active population 0 |
 | T7 | worktree isolation | per task: unique `factory/task-<id>` branch, distinct worktree path, recorded `baseCommit`; created under the temp root |
 | T8 | versioning + replay | commit v1, REPLAN v2 (S5); v1 event/doc unchanged (log immutability); `getActiveDAG` → v2; `projectDAGVersions(events)` reproduces both; store ≡ log |
 | T9 | assign guards + atomicity + worker failure | double-assign rejected (`TASK_NOT_READY`/`WORKER_NOT_IDLE`); a failure inside `assign`'s outer transaction rolls back task state + assignment + worker state together (savepoint nesting case); a worker `failed`/evidence-less report completes the Attempt `outcome: 'failed'` and leaves the task `RUNNING` (invariant 9) |
