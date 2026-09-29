@@ -75,6 +75,31 @@ export interface Task {
   updatedAt: string;
 }
 
+/**
+ * A DAG edge between two Tasks (spec §19 `task_dependencies`). `taskId` and
+ * `dependsOnTaskId` are the JSON keys the schema's foreign keys are generated
+ * from.
+ */
+export interface TaskDependency {
+  id: string;
+  taskId: string;
+  dependsOnTaskId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Binds a Task to a Worker (spec §19 `assignments`). `taskId` and `workerId`
+ * are the JSON keys the schema's foreign keys are generated from.
+ */
+export interface Assignment {
+  id: string;
+  taskId: string;
+  workerId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /** Provenance for one execution of a Task (spec §5.3). */
 export interface Attempt {
   id: string;
@@ -122,13 +147,17 @@ export function createWorkOrder(
     updatedAt: now,
   };
 
-  deps.store.set('work_orders', workOrder.id, workOrder);
-  deps.events.appendEvent({
-    type: WORK_ORDER_CREATED,
-    aggregateType: 'work_order',
-    aggregateId: workOrder.id,
-    payload: { intent: workOrder.intent, riskTier: workOrder.riskTier },
-  });
+  // State and log must agree: persist the DRAFT record and its creation event
+  // in one transaction so a failure cannot leave an unlogged Work Order.
+  deps.store.db.transaction(() => {
+    deps.store.set('work_orders', workOrder.id, workOrder);
+    deps.events.appendEvent({
+      type: WORK_ORDER_CREATED,
+      aggregateType: 'work_order',
+      aggregateId: workOrder.id,
+      payload: { intent: workOrder.intent, riskTier: workOrder.riskTier },
+    });
+  })();
 
   return workOrder;
 }

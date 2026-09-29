@@ -11,7 +11,7 @@ import {
   createWorkOrder,
   type WorkOrder,
 } from '../../src/factory/domain/workOrder';
-import { openEventLog, replayEvents } from '../../src/factory/events/log';
+import { openEventLog, replayEvents, type EventLog } from '../../src/factory/events/log';
 import {
   SCHEMA_TABLES,
   createArtifactStore,
@@ -232,5 +232,94 @@ describe('E1.1 Work Order creation + in-process MessageBus', () => {
     bus.publish('work_order.created', 'wo_2');
 
     expect(seen).toEqual(['wo_1']);
+  });
+});
+
+describe('E1.1 referential integrity + atomic writes', () => {
+  it('rejects child rows whose foreign key does not exist', () => {
+    const store = openStateStore(dbPath);
+    try {
+      store.set('work_orders', 'wo_parent', { id: 'wo_parent', intent: 'parent' });
+      store.set('workers', 'worker_1', { id: 'worker_1', name: 'worker one' });
+
+      // Valid parent-then-child inserts succeed.
+      store.set('tasks', 'task_a', { id: 'task_a', workOrderId: 'wo_parent' });
+      store.set('tasks', 'task_b', { id: 'task_b', workOrderId: 'wo_parent' });
+      store.set('attempts', 'attempt_1', {
+        id: 'attempt_1',
+        taskId: 'task_a',
+        workerId: 'worker_1',
+      });
+      store.set('assignments', 'assignment_1', {
+        id: 'assignment_1',
+        taskId: 'task_a',
+        workerId: 'worker_1',
+      });
+      store.set('task_dependencies', 'dep_1', {
+        id: 'dep_1',
+        taskId: 'task_a',
+        dependsOnTaskId: 'task_b',
+      });
+      expect(store.get('tasks', 'task_a')).not.toBeNull();
+
+      // Missing parent work order is rejected.
+      expect(() =>
+        store.set('tasks', 'task_orphan', { id: 'task_orphan', workOrderId: 'wo_missing' }),
+      ).toThrow();
+
+      // Missing task endpoints are rejected for attempts and DAG edges.
+      expect(() =>
+        store.set('attempts', 'attempt_orphan', { id: 'attempt_orphan', taskId: 'task_missing' }),
+      ).toThrow();
+      expect(() =>
+        store.set('task_dependencies', 'dep_orphan', {
+          id: 'dep_orphan',
+          taskId: 'task_a',
+          dependsOnTaskId: 'task_missing',
+        }),
+      ).toThrow();
+
+      // Missing worker references are rejected.
+      expect(() =>
+        store.set('assignments', 'assignment_orphan', {
+          id: 'assignment_orphan',
+          taskId: 'task_a',
+          workerId: 'worker_missing',
+        }),
+      ).toThrow();
+
+      // A Worker referenced by durable Attempt history cannot be deleted.
+      expect(() => store.delete('workers', 'worker_1')).toThrow();
+
+      // ON DELETE CASCADE keeps no orphaned children behind.
+      store.delete('work_orders', 'wo_parent');
+      expect(store.list('tasks')).toHaveLength(0);
+      expect(store.list('task_dependencies')).toHaveLength(0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('rolls back Work Order creation when appending the event fails', () => {
+    const store = openStateStore(dbPath);
+    const failingEvents: EventLog = {
+      appendEvent() {
+        throw new Error('event log unavailable');
+      },
+      readEvents() {
+        return [];
+      },
+      count() {
+        return 0;
+      },
+    };
+    try {
+      expect(() =>
+        createWorkOrder({ store, events: failingEvents }, { intent: 'must not persist' }),
+      ).toThrow('event log unavailable');
+      expect(store.list<WorkOrder>('work_orders')).toHaveLength(0);
+    } finally {
+      store.close();
+    }
   });
 });
