@@ -359,18 +359,27 @@ export function resolveChain(
     if (matching.length === 0) continue;
     participated = true;
 
+    // Only rules whose set-dims actually cover the resource speak to it (§3.3-4/
+    // §3.3-5). Folding every selector-matching rule would let one branch-scoped
+    // DENY poison sibling ALLOWs for other branches (e.g. `{ALLOW@wo-*/**,
+    // DENY@main}` must not deny a `wo-1/impl` write). A level that speaks (its
+    // selectors match) but has no covering rule still fails closed: it grants
+    // nothing, so the resource is outside that level's scope.
+    const covering = matching.filter((rule) => coversSetDims(rule.scope, resource));
+    if (covering.length === 0) {
+      covered = false;
+      continue;
+    }
+
     let levelDecision: PolicyVerdict | null = null;
-    let levelCovered = false;
-    for (const rule of matching) {
+    for (const rule of covering) {
       let effective = rule.decision;
       if (VERDICT_RANK[effective] < VERDICT_RANK[ceiling]) {
         effective = ceiling;
         rules.push(`${name}:${capability}@ceiling-violation`);
       }
-      if (coversSetDims(rule.scope, resource)) levelCovered = true;
       levelDecision = levelDecision === null ? effective : tighter(levelDecision, effective);
     }
-    if (!levelCovered) covered = false;
 
     if (decision !== null && levelDecision !== null && VERDICT_RANK[levelDecision] < VERDICT_RANK[decision]) {
       rules.push(`${name}:${capability}@widening-attempt`);
@@ -543,21 +552,23 @@ function resolveAttemptId(deps: PolicyCheckDeps, taskId: string | null): string 
   return attempts.length > 0 ? attempts[attempts.length - 1].id : null;
 }
 
-function hasPriorDecision(
+function findPriorDecision(
   deps: PolicyCheckDeps,
   subject: TaskRef,
   attemptId: string | null,
   action: PolicyAction,
   decision: PolicyVerdict,
-): boolean {
-  return deps.store.list<PolicyDecisionRecord>('policy_decisions').some(
-    (record) =>
-      record.workOrderId === subject.workOrderId &&
-      record.task === subject.taskId &&
-      record.attemptId === attemptId &&
-      record.action.capability === action.capability &&
-      resourceKey(record.action.resource) === resourceKey(action.resource) &&
-      record.decision === decision,
+): PolicyDecisionRecord | null {
+  return (
+    deps.store.list<PolicyDecisionRecord>('policy_decisions').find(
+      (record) =>
+        record.workOrderId === subject.workOrderId &&
+        record.task === subject.taskId &&
+        record.attemptId === attemptId &&
+        record.action.capability === action.capability &&
+        resourceKey(record.action.resource) === resourceKey(action.resource) &&
+        record.decision === decision,
+    ) ?? null
   );
 }
 
@@ -621,14 +632,43 @@ function spendApproval(deps: PolicyCheckDeps, approvalId: string, decisionId: st
 }
 
 /**
+ * The resolved decision as the enforcement entry point reports it. Callers that
+ * only need the verdict use `check`; callers that must bind the authorization to
+ * its resolver (the E6 merge gate) use `checkDetailed`.
+ */
+export interface PolicyDecisionOutcome {
+  verdict: PolicyVerdict;
+  resolvedBy: Evaluation['resolvedBy'];
+  /** The consumed approval instance, when the verdict came from one. */
+  spentApprovalId: string | null;
+  /** The human whose APPROVAL authorized the verdict (`null` otherwise). */
+  approvalActor: string | null;
+}
+
+function approvalActorFor(deps: PolicyCheckDeps, approvalId: string | null | undefined): string | null {
+  if (!approvalId) return null;
+  const approval = deps.store.get<ApprovalRecord>('interactions', approvalId);
+  return approval?.response?.actor ?? null;
+}
+
+/**
  * The enforcement entry point (design §2). Evaluates purely, then records the
  * verdict durably under the §5.1 write rule: a decision instance with an
  * identical verdict writes nothing; a first evaluation or a verdict change
  * writes a `policy_decisions` row + `policy.decision` event — plus an approval
  * create/reuse on park, a spend on stage-4 consumption, and the §6.3 tier
  * ratchet — in one transaction.
+ *
+ * Returns the verdict plus the resolver identity (`resolvedBy`), the consumed
+ * approval instance (`spentApprovalId`) and the human who authorized it
+ * (`approvalActor`), so a caller can bind an `ALLOW` to the operator whose
+ * `APPROVAL` produced it rather than trusting a caller-supplied actor.
  */
-export function check(deps: PolicyCheckDeps, subject: TaskRef, action: PolicyAction): PolicyVerdict {
+export function checkDetailed(
+  deps: PolicyCheckDeps,
+  subject: TaskRef,
+  action: PolicyAction,
+): PolicyDecisionOutcome {
   const now = deps.now ?? (() => new Date().toISOString());
   const wo = deps.store.get<WorkOrder>('work_orders', subject.workOrderId);
   if (!wo) {
@@ -637,7 +677,7 @@ export function check(deps: PolicyCheckDeps, subject: TaskRef, action: PolicyAct
   const chain = createPolicyChain(deps, subject.workOrderId);
   const attemptId = action.attemptId !== undefined ? action.attemptId : resolveAttemptId(deps, subject.taskId);
 
-  return deps.store.db.transaction((): PolicyVerdict => {
+  return deps.store.db.transaction((): PolicyDecisionOutcome => {
     const evaluation = evaluate({
       chain,
       wo,
@@ -647,9 +687,14 @@ export function check(deps: PolicyCheckDeps, subject: TaskRef, action: PolicyAct
       emergencyStopped: isEmergencyStopped(deps),
     });
 
-    const prior = hasPriorDecision(deps, subject, attemptId, action, evaluation.decision);
+    const prior = findPriorDecision(deps, subject, attemptId, action, evaluation.decision);
     if (prior) {
-      return evaluation.decision;
+      return {
+        verdict: evaluation.decision,
+        resolvedBy: prior.resolvedBy,
+        spentApprovalId: prior.interactionId ?? null,
+        approvalActor: approvalActorFor(deps, prior.interactionId),
+      };
     }
 
     const t = now();
@@ -690,8 +735,18 @@ export function check(deps: PolicyCheckDeps, subject: TaskRef, action: PolicyAct
       );
     }
 
-    return evaluation.decision;
+    return {
+      verdict: evaluation.decision,
+      resolvedBy: evaluation.resolvedBy,
+      spentApprovalId: evaluation.spentApprovalId ?? null,
+      approvalActor: approvalActorFor(deps, evaluation.spentApprovalId),
+    };
   })();
+}
+
+/** The verdict-only enforcement entry point (see {@link checkDetailed}). */
+export function check(deps: PolicyCheckDeps, subject: TaskRef, action: PolicyAction): PolicyVerdict {
+  return checkDetailed(deps, subject, action).verdict;
 }
 
 /** Build the resolved chain for a Work Order from deployment + durable state. */

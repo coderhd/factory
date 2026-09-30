@@ -919,7 +919,7 @@ async function passedSemantic(): Promise<SemanticVerificationResult> {
 }
 
 function generatorAttempt(overrides: Partial<Attempt> = {}): Attempt {
-  return makeAttempt({ id: 'attempt_1', taskId: 'task_1', outcome: 'success', artifactIds: ['art_1'], ...overrides });
+  return makeAttempt({ id: 'attempt_1', taskId: 'task_1', model: generatorIdentity.model, outcome: 'success', artifactIds: ['art_1'], ...overrides });
 }
 
 async function greenBundleInput(): Promise<EvidenceBundleInput> {
@@ -983,7 +983,7 @@ describe('E5.2 Evidence Bundle: every AC maps to proof (spec §5.4/§14.4)', () 
     expect(bundle.attempts).toEqual([
       {
         attemptId: 'attempt_1',
-        model: 'provider/model',
+        model: generatorIdentity.model,
         outcome: 'success',
         failureCount: 0,
         artifactIds: ['art_1'],
@@ -1070,6 +1070,127 @@ describe('E5.2 Evidence Bundle: every AC maps to proof (spec §5.4/§14.4)', () 
     expect(() =>
       buildEvidenceBundle({ ...input, changeSet: { ...baseChangeSet, id: 'cs_other' } }),
     ).toThrow('change set');
+  });
+
+  it('refuses to certify provenance when the generating Attempt model differs from the semantic generator', async () => {
+    const input = await greenBundleInput();
+    // The generating Attempt records a different model than the caller-supplied
+    // semantic generator: the receipt would attest a writer that did not write
+    // the change. Fail loudly rather than certify mis-attributed provenance.
+    const foreignAttempt = generatorAttempt({ model: 'someone/else' });
+
+    expect(() => buildEvidenceBundle({ ...input, attempts: [foreignAttempt] })).toThrow(
+      VerificationConfigurationError,
+    );
+    expect(() => buildEvidenceBundle({ ...input, attempts: [foreignAttempt] })).toThrow(
+      /does not match the semantic generator/,
+    );
+  });
+
+  it('accepts a generating Attempt that records the fully-qualified generator key', async () => {
+    const input = await greenBundleInput();
+    // A manager that stamps `provider/model` onto the Attempt matches the
+    // semantic generator's qualified key.
+    const qualified = generatorAttempt({ model: `${generatorIdentity.provider}/${generatorIdentity.model}` });
+    const bundle = buildEvidenceBundle({ ...input, attempts: [qualified] });
+    expect(bundle.complete).toBe(true);
+  });
+
+  it('requires the behavioral tier for a YELLOW Work Order (no deterministic + semantic shortcut)', async () => {
+    const input = await greenBundleInput();
+    const engine = createVerificationEngine();
+    engine.registerCheck(passing('typecheck', 'deterministic', 'typecheck'));
+    const deterministicOnly = await engine.verify(baseChangeSet, {
+      criteria: ['AC-cart-total', 'AC-cart-empty'],
+      criterionChecks: { 'AC-cart-total': ['typecheck'], 'AC-cart-empty': ['typecheck'] },
+    });
+    // Re-derive the semantic result against the deterministic-only run so the
+    // semantic gates stay green; only the behavioral tier is missing.
+    const semantic = await semanticVerifier(
+      judgeReturning(passRulings(['AC-cart-total', 'AC-cart-empty'])),
+    ).verify(
+      semanticInput({ deterministic: deterministicOnly.deterministic, behavioral: deterministicOnly.behavioral }),
+    );
+
+    const bundle = buildEvidenceBundle({
+      ...input,
+      run: deterministicOnly,
+      semantic,
+      workOrder: makeWorkOrder({ riskTier: 'YELLOW' }),
+    });
+
+    expect(bundle.gates.run).toBe(true);
+    expect(bundle.gates.semantic).toBe(true);
+    expect(bundle.gates.behavioral).toBe(false);
+    expect(bundle.complete).toBe(false);
+  });
+
+  it('requires at least one security-kind check for a RED Work Order', async () => {
+    const input = await greenBundleInput();
+
+    // Green/behavioral-only proof (no security check) is not promotion-grade at RED.
+    const engine = createVerificationEngine();
+    engine.registerCheck(passing('typecheck', 'deterministic', 'typecheck'));
+    engine.registerCheck(passing('playwright', 'behavioral', 'playwright'));
+    const noSecurity = await engine.verify(baseChangeSet, {
+      criteria: ['AC-cart-total', 'AC-cart-empty'],
+      criterionChecks: { 'AC-cart-total': ['typecheck'], 'AC-cart-empty': ['playwright'] },
+    });
+    const semantic = await semanticVerifier(
+      judgeReturning(passRulings(['AC-cart-total', 'AC-cart-empty'])),
+    ).verify(
+      semanticInput({ deterministic: noSecurity.deterministic, behavioral: noSecurity.behavioral }),
+    );
+    const red = makeWorkOrder({ riskTier: 'RED' });
+    const missingSecurity = buildEvidenceBundle({ ...input, run: noSecurity, semantic, workOrder: red });
+    expect(missingSecurity.gates.behavioral).toBe(true);
+    expect(missingSecurity.complete).toBe(false);
+
+    // Add a security-kind check and the same RED Work Order becomes promotion-grade.
+    const withSecurity = createVerificationEngine();
+    withSecurity.registerCheck(passing('typecheck', 'deterministic', 'typecheck'));
+    withSecurity.registerCheck(passing('security', 'deterministic', 'security'));
+    withSecurity.registerCheck(passing('playwright', 'behavioral', 'playwright'));
+    const runWithSecurity = await withSecurity.verify(baseChangeSet, {
+      criteria: ['AC-cart-total', 'AC-cart-empty'],
+      criterionChecks: { 'AC-cart-total': ['typecheck'], 'AC-cart-empty': ['playwright'] },
+    });
+    const semantic2 = await semanticVerifier(
+      judgeReturning(passRulings(['AC-cart-total', 'AC-cart-empty'])),
+    ).verify(
+      semanticInput({
+        deterministic: runWithSecurity.deterministic,
+        behavioral: runWithSecurity.behavioral,
+      }),
+    );
+    const secured = buildEvidenceBundle({ ...input, run: runWithSecurity, semantic: semantic2, workOrder: red });
+    expect(secured.complete).toBe(true);
+  });
+
+  it('keeps a GREEN Work Order free of the behavioral/security floor', async () => {
+    const input = await greenBundleInput();
+    const engine = createVerificationEngine();
+    engine.registerCheck(passing('typecheck', 'deterministic', 'typecheck'));
+    const deterministicOnly = await engine.verify(baseChangeSet, {
+      criteria: ['AC-cart-total', 'AC-cart-empty'],
+      criterionChecks: { 'AC-cart-total': ['typecheck'], 'AC-cart-empty': ['typecheck'] },
+    });
+    const semantic = await semanticVerifier(
+      judgeReturning(passRulings(['AC-cart-total', 'AC-cart-empty'])),
+    ).verify(
+      semanticInput({
+        deterministic: deterministicOnly.deterministic,
+        behavioral: deterministicOnly.behavioral,
+      }),
+    );
+    const bundle = buildEvidenceBundle({
+      ...input,
+      run: deterministicOnly,
+      semantic,
+      workOrder: makeWorkOrder({ riskTier: 'GREEN' }),
+    });
+    expect(bundle.gates.behavioral).toBe(false);
+    expect(bundle.complete).toBe(true);
   });
 
   it('records a curated attempt history, never the developer transcript', async () => {

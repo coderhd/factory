@@ -317,8 +317,7 @@ describe('E1.1 referential integrity + atomic writes', () => {
     }
   });
 
-  it('rolls back Work Order creation when appending the event fails', () => {
-    const store = openStateStore(dbPath);
+  it('rolls back Work Order creation when appending the event fails', () => {    const store = openStateStore(dbPath);
     const failingEvents: EventLog = {
       appendEvent() {
         throw new Error('event log unavailable');
@@ -604,6 +603,40 @@ describe('E1.2 Factory-owned Task lifecycle', () => {
         code = (error as FactoryError).code;
       }
       expect(code).toBe('TASK_NOT_FOUND');
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('rejects createTask for a missing Work Order with a typed WORK_ORDER_NOT_FOUND', () => {
+    const deps = openDeps();
+    try {
+      let caught: unknown;
+      try {
+        createTask(deps, { workOrderId: 'wo_missing', title: 'orphan' });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(FactoryError);
+      expect((caught as FactoryError).code).toBe('WORK_ORDER_NOT_FOUND');
+      expect(deps.store.list('tasks')).toHaveLength(0);
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('rejects createAttempt for a missing Task with a typed TASK_NOT_FOUND', () => {
+    const deps = openDeps();
+    try {
+      let caught: unknown;
+      try {
+        createAttempt(deps, { taskId: 'task_missing', model: 'm' });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(FactoryError);
+      expect((caught as FactoryError).code).toBe('TASK_NOT_FOUND');
+      expect(deps.store.list('attempts')).toHaveLength(0);
     } finally {
       deps.store.close();
     }

@@ -2,6 +2,7 @@ import { FactoryError } from '../domain/errors';
 import type { Attempt, RiskTier, Task, WorkOrder } from '../domain/workOrder';
 import type { EventLog } from '../events/log';
 import type { EvidenceBundle } from '../evidence/bundle';
+import type { PolicyDecisionRecord } from '../policy/policy';
 import {
   projectObservatory,
   type DailyThroughput,
@@ -24,7 +25,7 @@ import type { VerificationRun } from '../verification/engine';
  * runtime observables E1 does not persist (tool calls, model/tool cost). The
  * decision layer records the *why*: which model and why (E4), which skill and
  * what context (E1 Attempt provenance), the risk assigned (E1 Work Order),
- * allow/deny (E7's `policy_decisions`, an honest stub until E7 records), when
+ * allow/deny (E7's `policy_decisions`), when
  * replanning occurred (E1 `failureHistory`) and human gate decisions (E1
  * events).
  *
@@ -143,9 +144,11 @@ export interface ContextWhy {
 /** One allow/deny policy decision (E7 `policy_decisions`, read structurally). */
 export interface AllowDenyWhy {
   ref: string;
+  /** The capability the decision binds to (`action.capability`). */
   action: string | null;
   decision: string | null;
-  reason: string | null;
+  /** The E7 rule trail recorded with the decision. */
+  rules: string[];
 }
 
 /** One replan/recovery the Attempt recorded (E1 `failureHistory`). */
@@ -169,7 +172,7 @@ export interface DecisionTelemetry {
   context: ContextWhy;
   risk: RiskTier | null;
   allowDeny: AllowDenyWhy[];
-  /** `stub` when no policy decision exists for this Attempt (E7 does not record yet). */
+  /** `stub` when no policy decision exists for this Attempt. */
   allowDenyStatus: 'available' | 'stub';
   replan: ReplanWhy[];
   gate: GateWhy[];
@@ -247,20 +250,18 @@ function routingDecisionsFor(store: StateStore, attempt: Attempt, workOrder: Wor
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
-function policyDecisionsFor(store: StateStore, attempt: Attempt) {
-  const rows = store.list<unknown>('policy_decisions');
+function policyDecisionsFor(store: StateStore, attempt: Attempt): AllowDenyWhy[] {
   const matched: AllowDenyWhy[] = [];
-  for (const raw of rows) {
-    const row = asRecord(raw);
-    if (!row) continue;
-    const attemptId = nonEmpty(row.attemptId);
-    const taskId = nonEmpty(row.taskId);
-    if (attemptId !== attempt.id && taskId !== attempt.taskId) continue;
+  for (const row of store.list<PolicyDecisionRecord>('policy_decisions')) {
+    // E7's durable record keys the Task as `task` (not `taskId`) and the
+    // capability under `action.capability`; read the real shape so drift is a
+    // type error, not a silently empty decision layer.
+    if (row.attemptId !== attempt.id && row.task !== attempt.taskId) continue;
     matched.push({
-      ref: nonEmpty(row.id) ?? `policy_${matched.length}`,
-      action: nonEmpty(row.action),
-      decision: nonEmpty(row.decision),
-      reason: nonEmpty(row.reason),
+      ref: row.id,
+      action: row.action?.capability ?? null,
+      decision: row.decision ?? null,
+      rules: [...(row.rules ?? [])],
     });
   }
   return matched;

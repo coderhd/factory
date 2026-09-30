@@ -16,8 +16,10 @@ import type {
 } from '../../src/factory/routing/decisionModel';
 import {
   BUDGET_GATES,
+  CAPABILITY_POOL,
   FULL_BUDGET,
   MODEL_TIER,
+  RoutingBlockedError,
   RulesDecisionModel,
   applyOverride,
   budgetAllows,
@@ -224,6 +226,21 @@ describe('E4.1 availability fallback', () => {
     expect(decision.selected).toBe('explorer');
     expect(MODEL_TIER[decision.selected]).toBe('cheap');
     expect(decision.reason).toContain('last-resort');
+  });
+
+  it('refuses selection (blocked) when the entire pool is blocked, never substituting', () => {
+    // Every pool member is unavailable: the caller must map to WAITING_RESOURCE,
+    // never silently run a blocked model.
+    let caught: unknown;
+    try {
+      selectModel(ri('implementation'), FULL_BUDGET, [...CAPABILITY_POOL]);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(RoutingBlockedError);
+    expect((caught as RoutingBlockedError).code).toBe('ROUTING_BLOCKED');
+    // The error carries the blocked pool so the caller can park on it.
+    expect((caught as RoutingBlockedError).unavailable).toEqual([...CAPABILITY_POOL]);
   });
 });
 

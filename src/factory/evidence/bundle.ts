@@ -266,11 +266,40 @@ export function buildEvidenceBundle(input: EvidenceBundleInput): Readonly<Eviden
 
   const generatorAttempt = attempts.find((attempt) => attempt.id === changeSet.attemptId) ?? null;
 
+  // Generator ↔ Attempt cross-check (spec §9 attestation). `provenance.generator`
+  // is the caller-supplied semantic generator; if the generating Attempt records
+  // a different model, the receipt would attest to a generator that never wrote
+  // the change. Fail loudly rather than certify mis-attributed provenance.
+  if (generatorAttempt?.model) {
+    const generatorModel = semantic.generator.model;
+    if (
+      generatorAttempt.model !== generatorModel &&
+      generatorAttempt.model !== modelKey(semantic.generator)
+    ) {
+      throw new VerificationConfigurationError(
+        `cannot assemble evidence: generating Attempt model "${generatorAttempt.model}" does not match the semantic generator "${modelKey(semantic.generator)}"`,
+      );
+    }
+  }
+
+  // Tier-appropriate verification mix (spec §13.1/§14.4): Yellow and Red Work
+  // Orders cannot be promotion-grade on a deterministic + semantic ruling alone —
+  // behavioral proof is required. Red additionally requires at least one
+  // `security`-kind check. Green keeps the base requirement (no behavioral floor).
+  const requiresBehavioral = workOrder.riskTier === 'YELLOW' || workOrder.riskTier === 'RED';
+  const behavioralSatisfied = !requiresBehavioral || gates.behavioral;
+  const hasSecurityCheck =
+    run.deterministic.checks.some((check) => check.kind === 'security') ||
+    run.behavioral.checks.some((check) => check.kind === 'security');
+  const securitySatisfied = workOrder.riskTier !== 'RED' || hasSecurityCheck;
+
   const complete =
     criteria.length > 0 &&
     criteria.every((criterion) => criterion.status === 'pass') &&
     gates.run &&
     gates.semantic &&
+    behavioralSatisfied &&
+    securitySatisfied &&
     // Fail closed on the §9 Writer ≠ Verifier attestation, exactly as the tiers
     // fail closed on vacuous passes: `gates.semantic` records that the judge
     // passed, not that it was independent of the writer.

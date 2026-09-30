@@ -81,6 +81,13 @@ export interface Scheduler {
 export const INTERACTION_CREATED = 'interaction.created';
 
 /**
+ * Diagnostic event appended when an assign→start attempt is compensated: the
+ * Assignment is closed, the Worker released and the Task reverted to READY
+ * because `startTask` threw after `assign` had committed.
+ */
+export const ASSIGNMENT_START_FAILED = 'assignment.start_failed';
+
+/**
  * A persisted §12 interaction: the durable question a `waiting_input` Attempt
  * asks. It is the record E2's answer loop resumes from — the Task's
  * `WAITING_INPUT` state alone carries no question. `attemptId`/`taskId` bind it
@@ -139,6 +146,15 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
 
   const completions: Completion[] = [];
   const pending = new Set<string>();
+  /**
+   * Route-time settle guard: the exact `WorkerResult` object already routed for
+   * a worker. A resumed Task (WAITING_INPUT → RUNNING) would otherwise re-collect
+   * the adapter's still-settled report and re-ask the same question forever. The
+   * object identity is stable across polls (the adapter returns the same settled
+   * report until the next `execute`), so dropping the identical object is
+   * consume-once; a genuinely new run settles a fresh object and is routed.
+   */
+  const routedReports = new Map<string, WorkerResult>();
   let timer: ReturnType<typeof setInterval> | null = null;
 
   // --- durable-state readers -------------------------------------------------
@@ -307,6 +323,10 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     const attemptId = worker.lease.attemptId;
     const result = item.result;
 
+    // Consume-once: a report already routed for this worker must not be routed
+    // again off a later poll (the answer loop would re-ask the same question).
+    if (result && routedReports.get(item.workerId) === result) return;
+
     // A question is not a completion: worker stays BUSY, lease/assignment stay
     // open, and the durable §12 interaction(s) are written alongside the Task
     // state transition so E2's answer loop has a question to resume from.
@@ -316,10 +336,12 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         recordInteractions(worker.id, task.id, attemptId, result.interactions, t);
         transitionTask(deps, task.id, { to: 'WAITING_INPUT' });
       })();
+      routedReports.set(worker.id, result);
       return;
     }
 
     const t = now();
+    routedReports.delete(worker.id);
     if (result && result.status === 'completed' && hasEvidence(result)) {
       const artifactIds = storeArtifacts(attemptId, result);
       deps.store.db.transaction(() => {
@@ -383,6 +405,56 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     }
   }
 
+  /**
+   * Compensate an `assign` that committed but whose `startTask` then threw:
+   * close the open Assignment, release the Worker, revert the Task to READY and
+   * record a diagnostic event. Without this the Task stays ASSIGNED/RUNNING, the
+   * Worker stays BUSY and the Assignment stays open with a null lease — a state
+   * `pollWorker` and the reclaim pass both skip, consuming a concurrency slot
+   * forever and silently.
+   *
+   * The revert is a rollback, not a forward §5.2 edge: `READY→ASSIGNED→READY`
+   * is not in `TASK_EDGES`, so the prior state is written directly and recorded
+   * with the reverted Task on the diagnostic event (replay folds it).
+   */
+  function compensateFailedStart(assignment: AssignmentRecord, error: unknown): void {
+    const at = now();
+    const message = error instanceof Error ? error.message : String(error);
+    const task = deps.store.get<Task>('tasks', assignment.taskId);
+    const worker = deps.store.get<WorkerRecord>('workers', assignment.workerId);
+    const open = openAssignmentFor(deps.store, assignment.workerId);
+    deps.store.db.transaction(() => {
+      if (task && (task.state === 'ASSIGNED' || task.state === 'RUNNING')) {
+        const reverted: Task = { ...task, state: 'READY', updatedAt: at };
+        deps.store.set('tasks', reverted.id, reverted);
+      }
+      if (worker) {
+        deps.store.set('workers', worker.id, {
+          ...worker,
+          runtimeState: 'IDLE',
+          lease: null,
+          lastActiveAt: at,
+        });
+      }
+      if (open) {
+        deps.store.set('assignments', open.id, { ...open, closedAt: at, updatedAt: at });
+      }
+      deps.events.appendEvent({
+        type: ASSIGNMENT_START_FAILED,
+        aggregateType: 'assignment',
+        aggregateId: assignment.id,
+        payload: {
+          assignmentId: assignment.id,
+          taskId: assignment.taskId,
+          workerId: assignment.workerId,
+          task: task ? { ...task, state: 'READY', updatedAt: at } : null,
+          error: message,
+          at,
+        },
+      });
+    })();
+  }
+
   function assignPass(): void {
     let slots = cfg.maxConcurrentTasks - countOccupied();
     const skipped = new Set<string>();
@@ -398,16 +470,21 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         continue;
       }
 
+      let assignment: AssignmentRecord | null = null;
       try {
         const worktree = deps.worktrees.createTaskWorktree(candidate.task.id, deps.repoPath);
-        const assignment = assign(
+        assignment = assign(
           { store: deps.store, events: deps.events, now },
           { taskId: candidate.task.id, workerId: idleWorker.id, worktree },
         );
         startTask({ ...deps, leaseTtlMs }, assignment);
         pollWorker(idleWorker.id);
         slots -= 1;
-      } catch {
+      } catch (error) {
+        // A committed assign whose start failed is compensated so the worker and
+        // the concurrency slot are not wedged; a pre-assign error (worktree
+        // creation) has nothing to compensate.
+        if (assignment) compensateFailedStart(assignment, error);
         // Per-task error (e.g. worktree creation failure): skip this task; retry next tick.
         skipped.add(candidate.task.id);
       }

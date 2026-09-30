@@ -157,11 +157,29 @@ function explainSelection(input: RouteInput, model: ModelId, budget: BudgetState
 }
 
 /**
+ * Thrown when every pool member is blocked by availability or budget. A caller
+ * maps this to `WAITING_RESOURCE` (or equivalent) — never a silent substitution
+ * of a blocked model.
+ */
+export class RoutingBlockedError extends Error {
+  readonly code = 'ROUTING_BLOCKED';
+  constructor(
+    readonly candidates: ModelId[],
+    readonly unavailable: ModelId[],
+    readonly budget: BudgetState,
+  ) {
+    super('routing blocked: every candidate model is unavailable or budget-exhausted');
+    this.name = 'RoutingBlockedError';
+  }
+}
+
+/**
  * Capability-first, budget-filtered selection: walk the ordered candidate list
  * and return the first model that is neither unavailable nor budget-blocked.
  * Last resort: the cheapest pool model that is not blocked either — never a
- * jump straight to the most expensive model. If the entire pool is blocked,
- * the first cheap model stands so the decision still records one.
+ * jump straight to the most expensive model. If the entire pool is blocked the
+ * decision is refused with a distinguishable {@link RoutingBlockedError} so the
+ * caller can park on `WAITING_RESOURCE` rather than run an unavailable model.
  */
 export function selectModel(
   input: RouteInput,
@@ -184,11 +202,11 @@ export function selectModel(
   const fallback = CAPABILITY_POOL.find(
     (model) => !blocked.has(model) && budgetAllows(model, budget),
   );
-  const selected = fallback ?? CAPABILITY_POOL[0];
+  if (!fallback) throw new RoutingBlockedError(candidates, [...unavailable], { ...budget });
   return {
-    selected,
+    selected: fallback,
     candidates,
-    reason: `All candidates blocked by availability/budget; last-resort ${selected}.`,
+    reason: `All candidates blocked by availability/budget; last-resort ${fallback}.`,
     source: 'rules',
     metadata: { ...input, unavailable: [...unavailable], budget: { ...budget } },
   };

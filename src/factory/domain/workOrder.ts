@@ -287,6 +287,14 @@ export interface TaskIntent {
  * validation/versioning is E3; this only commits Factory-owned Task state.
  */
 export function createTask(deps: WorkOrderDeps, intent: TaskIntent): Task {
+  // Pre-check the parent so a missing Work Order is a typed domain rejection
+  // (`WORK_ORDER_NOT_FOUND`), not a raw SQLite foreign-key error.
+  if (!deps.store.get<WorkOrder>('work_orders', intent.workOrderId)) {
+    throw new FactoryError(
+      'WORK_ORDER_NOT_FOUND',
+      `work order not found: ${intent.workOrderId}`,
+    );
+  }
   const now = new Date().toISOString();
   const task: Task = {
     id: `task_${crypto.randomUUID()}`,
@@ -366,6 +374,11 @@ export interface AttemptIntent {
  * execution history: each repeated execution gets a new Attempt.
  */
 export function createAttempt(deps: WorkOrderDeps, intent: AttemptIntent): Attempt {
+  // Pre-check the parent so a missing Task is a typed domain rejection
+  // (`TASK_NOT_FOUND`), not a raw SQLite foreign-key error.
+  if (!deps.store.get<Task>('tasks', intent.taskId)) {
+    throw new FactoryError('TASK_NOT_FOUND', `task not found: ${intent.taskId}`);
+  }
   const now = new Date().toISOString();
   const attempt: Attempt = {
     id: `attempt_${crypto.randomUUID()}`,

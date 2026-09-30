@@ -1,32 +1,39 @@
 import type { FactoryClient } from '../api/client';
 import type { WorkOrder } from '../domain/workOrder';
 import type { EvidenceBundle } from '../evidence/bundle';
-import type { PolicyResource, PolicyVerdict } from '../policy/policy';
+import type { PolicyDecisionOutcome, PolicyResource, PolicyVerdict } from '../policy/policy';
 
 /**
  * E6 GitHub adapter (spec §4.2 GitHub-only MVP; §28 ownership walkthrough).
  *
  * E6.1 (#20) built the import → Work Order → branch → PR-opening path. E6.2
  * (#21) adds the **merge gate** (`merge(gate)`): the Factory-authorized merge.
- * The merge is a production deployment, so it is a `deploy.execute
- * { env: production }` policy check (ADR 14 / policy §8-3) that can only ever
- * resolve to `ALLOW` by consuming an operator `APPROVAL` through E7's ledger.
- * All of the following must hold before any GitHub merge I/O:
+ * Every GitHub side effect is policy-gated at the Factory (E7 §8-1): branch
+ * creation is a `branch.create` check, PR opening is a `pr.create` check, and
+ * the merge is a `deploy.execute { env: production }` policy check (ADR 14 /
+ * policy §8-3) that can only ever resolve to `ALLOW` by consuming an operator
+ * `APPROVAL` through E7's ledger. While the Factory is emergency-stopped, E7's
+ * stage-1 gate returns `DENY` for every one of these consequential external
+ * actions, so a stopped Factory cannot mutate GitHub.
+ *
+ * The merge gate's additional gates, all checked before any GitHub merge I/O:
  *   - the Work Order is `APPROVED`,
  *   - the Evidence Bundle receipt is complete and linked by the live PR (hygiene),
  *   - the PR is still open, targets the configured base, and is the Work Order's
  *     own `factory/<id>` branch,
  *   - the actor is not the change's writer (no self-merge, spec §29 invariant 4),
- *   - the E7 policy check returns `ALLOW`.
+ *   - the E7 policy check returns `ALLOW` **and** the consumed `APPROVAL` was
+ *     authorized by the same actor performing the merge (the actor is bound to
+ *     the human approval, not taken on the caller's word).
  *
  * GitHub is the only external system in the MVP, and this module is the only
  * place in the Factory that talks to it. Everything GitHub-shaped arrives
  * through the injected {@link GitHubTransport} seam, so the provider is a
  * one-line swap and tests are hermetic (Ruling R6: mock the transport, no
  * network). The adapter never mutates Factory state directly: it reconciles and
- * creates Work Orders through the E2 API client, and the merge authorizes
- * through the caller-wired E7 `check`, because the server is the sole mutation
- * authority (spec §29 invariants 1/12/13).
+ * creates Work Orders through the E2 API client, and every external action
+ * authorizes through the caller-wired E7 `check`, because the server is the sole
+ * mutation authority (spec §29 invariants 1/12/13).
  */
 
 /** A GitHub repository + issue number: the durable identity of an import. */
@@ -389,17 +396,38 @@ export interface ImportIssueResult {
 // ---------------------------------------------------------------------------
 
 /**
- * The E7 policy port the merge path consumes (deps-first `check(subject, action)`
- * wired by the caller: `(subject, action) => check({ store, events }, subject,
- * action)`). The merge requires `ALLOW` for
+ * The E7 policy port the GitHub path consumes (deps-first `checkDetailed(subject,
+ * action)` wired by the caller: `(subject, action) => checkDetailed({ store,
+ * events }, subject, action)`). It returns the verdict **plus** how it was
+ * resolved (`resolvedBy`), the consumed approval instance (`spentApprovalId`)
+ * and the human who authorized it (`approvalActor`) — so the merge gate can bind
+ * the `ALLOW` to the operator whose `APPROVAL` produced it instead of trusting a
+ * caller-supplied actor. The merge requires `ALLOW` for
  * `deploy.execute { env: production }` — the only §13.2 capability that covers a
  * production merge (ADR 14 / policy §8-3) — which for every risk tier floors at
  * `REQUIRE_HUMAN` and so is reachable only by consuming an operator `APPROVAL`.
+ * Branch/PR creation consume it too: `branch.create` / `pr.create` (§8-1). The
+ * port fails closed when absent.
  */
 export type PolicyCheck = (
   subject: { taskId: string | null; workOrderId: string },
   action: { capability: string; resource?: PolicyResource },
-) => PolicyVerdict;
+) => PolicyDecisionOutcome;
+
+/** Thrown when a non-merge GitHub side effect is refused by policy (§8-1/§10). */
+export class PolicyBlockedError extends Error {
+  constructor(
+    readonly capability: string,
+    readonly verdict: PolicyVerdict | 'NO_POLICY',
+  ) {
+    super(
+      verdict === 'NO_POLICY'
+        ? `github action blocked: no policy check is configured for ${capability}`
+        : `github action blocked: policy verdict ${verdict} for ${capability}`,
+    );
+    this.name = 'PolicyBlockedError';
+  }
+}
 
 /** The Evidence Bundle receipt + model provenance the merge gate consumes. */
 export type MergeEvidence = Pick<
@@ -440,7 +468,8 @@ export type MergeBlockReason =
   | 'SELF_MERGE'
   | 'HYGIENE_FAILED'
   | 'EVIDENCE_LINK_MISSING'
-  | 'POLICY_NOT_ALLOWED';
+  | 'POLICY_NOT_ALLOWED'
+  | 'APPROVAL_ACTOR_MISMATCH';
 
 /** A refused merge. `reason` is a closed code; the message is human-facing. */
 export class MergeBlockedError extends Error {
@@ -465,8 +494,9 @@ export interface GitHubAdapterOptions {
   /** Branch naming policy. Defaults to `factory/<workOrderId>`. */
   branchName?: (workOrder: WorkOrder) => string;
   /**
-   * The E7 policy gate the merge path authorizes through. Required by `merge`
-   * (fails closed when absent); import/branch/PR-opening do not need it.
+   * The E7 policy gate every GitHub side-effect authorizes through
+   * (`branch.create`, `pr.create`, `deploy.execute { env: production }`).
+   * Required by the adapter; every path fails closed when it is absent.
    */
   checkPolicy?: PolicyCheck;
 }
@@ -479,11 +509,15 @@ export interface GitHubAdapter {
    * captured on first import.
    */
   importIssue(ref: IssueRef): Promise<ImportIssueResult>;
-  /** Create the change-set branch for a Work Order. */
+  /**
+   * Create the change-set branch for a Work Order after a `branch.create` policy
+   * check (fails closed via {@link PolicyBlockedError} on no port / non-ALLOW).
+   */
   createBranch(workOrder: WorkOrder, baseBranch?: string): Promise<GitHubBranch>;
   /**
    * Open a PR for the Work Order behind `evidence`, with the Work Order and
-   * Evidence Bundle linked in the body.
+   * Evidence Bundle linked in the body, after a `pr.create` policy check (fails
+   * closed via {@link PolicyBlockedError} on no port / non-ALLOW).
    */
   openPR(
     evidence: EvidenceReceipt,
@@ -493,8 +527,10 @@ export interface GitHubAdapter {
    * Merge the PR behind `gate` — the Factory-authorized production deployment.
    * Fails closed (throws {@link MergeBlockedError}) unless the Work Order is
    * APPROVED, the evidence is complete and linked, hygiene passes, the actor is
-   * not the writer, and E7's `deploy.execute { env: production }` check returns
-   * ALLOW. On success, records the Factory-owned `APPROVED → MERGED` transition.
+   * not the writer, E7's `deploy.execute { env: production }` check returns
+   * ALLOW resolved by an operator APPROVAL, and `gate.actor` is the human that
+   * authorized that APPROVAL. On success, records the Factory-owned
+   * `APPROVED → MERGED` transition.
    */
   merge(gate: MergeGate): Promise<MergeOutcome>;
 }
@@ -530,14 +566,34 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
     return { workOrder, created: true };
   }
 
+  /** Authorize a non-merge GitHub side effect; fail closed on no port / non-ALLOW. */
+  function requirePolicy(
+    capability: 'branch.create' | 'pr.create',
+    workOrderId: string,
+    resource?: PolicyResource,
+  ): PolicyDecisionOutcome {
+    if (!checkPolicy) throw new PolicyBlockedError(capability, 'NO_POLICY');
+    const result = checkPolicy({ taskId: null, workOrderId }, { capability, resource });
+    if (result.verdict !== 'ALLOW') throw new PolicyBlockedError(capability, result.verdict);
+    return result;
+  }
+
   async function createBranch(
     workOrder: WorkOrder,
     base = baseBranch,
   ): Promise<GitHubBranch> {
     const repository = requireRepository(workOrder);
+    const branch = branchName(workOrder);
+    // E7 §8-1: branch creation is a consequential external side effect; the
+    // Factory authorizes it (and blocks it under e-stop) before any GitHub I/O.
+    // The default `branch.create` scope binds `branchPattern: wo-*/**` and E6's
+    // branch is `factory/<wo>`; a deployment narrows/grant that pattern when it
+    // wants E6 branches authorized (v0.1 default policy denies an unbound or
+    // out-of-pattern ref, per §4 "resolves DENY via the scope").
+    requirePolicy('branch.create', workOrder.id, { branch });
     return transport.createBranch({
       repository,
-      branch: branchName(workOrder),
+      branch,
       baseBranch: base,
     });
   }
@@ -548,6 +604,8 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
   ): Promise<GitHubPullRequest> {
     const { workOrder } = await client.getWorkOrder(evidence.workOrderId);
     const repository = requireRepository(workOrder);
+    // E7 §8-1: opening a PR is a `pr.create` check before any GitHub I/O.
+    requirePolicy('pr.create', workOrder.id, { branch: branchName(workOrder) });
 
     return transport.createPullRequest({
       repository,
@@ -652,21 +710,36 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
 
     // 5. Policy ALLOW for the production merge (ADR 14 / policy §8-3). This is
     // the only gate with a side effect (consuming the operator APPROVAL), so it
-    // runs after every static gate. Absent port ⇒ fail closed.
+    // runs after every static gate. Absent port ⇒ fail closed. The ALLOW must be
+    // resolved by a human approval, and that approval must have been authorized
+    // by the very actor performing the merge — `gate.actor` is a claim, not
+    // evidence, so it is bound here to the consumed `APPROVAL`'s response actor.
     if (!checkPolicy) {
       throw new MergeBlockedError(
         'POLICY_NOT_ALLOWED',
         'merge blocked: no policy check is configured for the production merge',
       );
     }
-    const verdict = checkPolicy(
+    const policy = checkPolicy(
       { taskId: null, workOrderId: workOrder.id },
       { capability: 'deploy.execute', resource: { env: 'production' } },
     );
-    if (verdict !== 'ALLOW') {
+    if (policy.verdict !== 'ALLOW') {
       throw new MergeBlockedError(
         'POLICY_NOT_ALLOWED',
-        `merge blocked: policy verdict ${verdict} for deploy.execute { env: production }`,
+        `merge blocked: policy verdict ${policy.verdict} for deploy.execute { env: production }`,
+      );
+    }
+    if (policy.resolvedBy !== 'human-approval' || !policy.spentApprovalId) {
+      throw new MergeBlockedError(
+        'POLICY_NOT_ALLOWED',
+        `merge blocked: policy ALLOW for deploy.execute { env: production } was not authorized by an operator APPROVAL (resolvedBy ${policy.resolvedBy})`,
+      );
+    }
+    if (policy.approvalActor !== gate.actor) {
+      throw new MergeBlockedError(
+        'APPROVAL_ACTOR_MISMATCH',
+        `merge blocked: actor "${gate.actor}" did not authorize the consumed APPROVAL (authorized by "${policy.approvalActor}")`,
       );
     }
 

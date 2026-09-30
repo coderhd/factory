@@ -441,6 +441,8 @@ interface SchedulerHarness {
   store: StateStore;
   events: ReturnType<typeof openEventLog>;
   adapters: FakeHerdr[];
+  /** Adapters keyed by the worker id they were provisioned for. */
+  adapterByWorker: Map<string, FakeHerdr>;
   scheduler: ReturnType<typeof createScheduler>;
   server: ReturnType<typeof startFactoryServer>;
   client: ReturnType<typeof createFactoryClient>;
@@ -451,7 +453,8 @@ function schedulerHarness(config: { tickIntervalMs?: number } = {}): SchedulerHa
   const store = openStateStore(join(workDir, 'factory.db'));
   const events = openEventLog(store.db);
   const adapters: FakeHerdr[] = [];
-  const workers = createWorkerManager({
+  const adapterByWorker = new Map<string, FakeHerdr>();
+  const baseWorkers = createWorkerManager({
     store,
     events,
     spawn: () => {
@@ -460,6 +463,14 @@ function schedulerHarness(config: { tickIntervalMs?: number } = {}): SchedulerHa
       return adapter;
     },
   });
+  const workers: ReturnType<typeof createWorkerManager> = {
+    ...baseWorkers,
+    provisionWorker: (profile) => {
+      const worker = baseWorkers.provisionWorker(profile);
+      adapterByWorker.set(worker.id, adapters[adapters.length - 1]!);
+      return worker;
+    },
+  };
   const repoPath = initRepo(workDir);
   const worktrees = createWorktreeManager({
     rootDir: join(workDir, 'worktrees'),
@@ -475,6 +486,7 @@ function schedulerHarness(config: { tickIntervalMs?: number } = {}): SchedulerHa
     store,
     events,
     adapters,
+    adapterByWorker,
     scheduler,
     server,
     client,
@@ -484,6 +496,18 @@ function schedulerHarness(config: { tickIntervalMs?: number } = {}): SchedulerHa
       store.close();
     },
   };
+}
+
+/** The adapter provisioned for the worker currently holding `taskId`. */
+function adapterForTask(h: SchedulerHarness, taskId: string): FakeHerdr {
+  const open = h.store
+    .list<{ taskId: string; workerId: string; closedAt: string | null }>('assignments')
+    .find((assignment) => assignment.taskId === taskId && assignment.closedAt === null);
+  if (open) {
+    const adapter = h.adapterByWorker.get(open.workerId);
+    if (adapter) return adapter;
+  }
+  return h.adapters.find((adapter) => adapter.envelope?.taskId === taskId)!;
 }
 
 describe('E2 WAITING_INPUT answer/resume', () => {
@@ -501,7 +525,7 @@ describe('E2 WAITING_INPUT answer/resume', () => {
 
       const taskId = dag.nodes[0].taskId;
       h.scheduler.tick();
-      const adapter = h.adapters.find((a) => a.envelope?.taskId === taskId)!;
+      const adapter = adapterForTask(h, taskId);
       adapter.result = waitingResult('which base branch?');
       await settle();
       h.scheduler.tick();
@@ -1074,7 +1098,7 @@ describe('E2 CLI', () => {
       transitionWorkOrder({ store: h.store, events: h.events }, wo.id, { to: 'EXECUTING' });
       const taskId = dag.nodes[0].taskId;
       h.scheduler.tick();
-      const adapter = h.adapters.find((a) => a.envelope?.taskId === taskId)!;
+      const adapter = adapterForTask(h, taskId);
       adapter.result = waitingResult('which base branch?');
       await settle();
       h.scheduler.tick();

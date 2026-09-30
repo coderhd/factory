@@ -353,7 +353,7 @@ function newAttemptFor(deps: RecoveryDeps, failure: FailureContext, action: Reco
   const model = failure.substituteModel ?? failure.requiredModel ?? prior?.model ?? null;
   const condition = action.kind === 'RETRY_NEW_ATTEMPT' ? action.changedCondition : 'clean-worktree';
   return createAttempt(
-    { store: deps.store, events: deps.events, now: deps.now },
+    { store: deps.store, events: deps.events },
     {
       taskId: failure.taskId,
       workerId: null,

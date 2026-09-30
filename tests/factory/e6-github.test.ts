@@ -15,7 +15,11 @@ import { openStateStore, type StateStore } from '../../src/factory/state/store';
 import { createVerificationEngine } from '../../src/factory/verification/engine';
 import { createSemanticVerifier } from '../../src/factory/verification/semantic';
 import type { WorkOrder } from '../../src/factory/domain/workOrder';
-import { check as policyCheck, answerApproval, type ApprovalRecord } from '../../src/factory/policy/policy';
+import { checkDetailed as policyCheck, answerApproval, emergencyStop, type ApprovalRecord } from '../../src/factory/policy/policy';
+import {
+  createDefaultPolicy,
+  type PolicyDocument,
+} from '../../src/factory/policy/policy';
 import {
   acceptanceCriteriaFromIssue,
   buildPullRequestBody,
@@ -151,12 +155,36 @@ interface Harness {
   transport: MockGitHubTransport;
   client: ReturnType<typeof createFactoryClient>;
   adapter: ReturnType<typeof createGitHubAdapter>;
+  /** Optional policy override; defaults to the embedded policy. */
+  policy?: PolicyDocument;
   /** Every URL the adapter drove through the Factory client (loopback only). */
   factoryRequests: string[];
   stop(): void;
 }
 
 const FACTORY_BASE_URL = 'http://factory.local:8787';
+
+/**
+ * The E6 branch is `factory/<workOrderId>`; the embedded policy's `branch.create`
+ * scope binds `wo-*`; a real deployment grants the Factory's own branch prefix
+ * (`factory/wo_<id>`) so the E6 branch is authorized.
+ */
+const FACTORY_BRANCH_PATTERN = 'factory/wo_*';
+
+/** Grant `branch.create` for the Factory's own branch prefix (E7 §8-1). */
+function grantFactoryBranches(h: Harness): void {
+  h.policy = {
+    ...createDefaultPolicy(),
+    organization: {
+      capabilities: {
+        ...createDefaultPolicy().organization.capabilities,
+        'branch.create': [
+          { decision: 'ALLOW', scope: { branchPattern: FACTORY_BRANCH_PATTERN } },
+        ],
+      },
+    },
+  };
+}
 
 function harness(): Harness {
   const store = openStateStore(join(workDir, 'factory.db'));
@@ -178,27 +206,31 @@ function harness(): Harness {
 
   const client = createFactoryClient({ baseUrl: server.url, fetch: recordingFetch });
   const transport = new MockGitHubTransport();
-  const adapter = createGitHubAdapter({
-    transport,
-    client,
-    factoryBaseUrl: FACTORY_BASE_URL,
-    // E7 policy (deps-first `check`) wired as the merge gate's authorization
-    // port; the store/events are the same ones the loopback server owns.
-    checkPolicy: (subject, action) => policyCheck({ store, events }, subject, action),
-  });
-
-  return {
+  const h: Harness = {
     store,
     events,
     transport,
     client,
-    adapter,
+    adapter: null as unknown as ReturnType<typeof createGitHubAdapter>,
     factoryRequests,
     stop(): void {
       server.stop();
       store.close();
     },
   };
+  h.adapter = createGitHubAdapter({
+    transport,
+    client,
+    factoryBaseUrl: FACTORY_BASE_URL,
+    // E7 policy (deps-first `checkDetailed`) wired as the adapter's
+    // authorization port; the store/events are the same ones the loopback
+    // server owns. The outcome carries resolvedBy/spentApprovalId/approvalActor
+    // so the merge gate can bind the ALLOW to the approving human. Tests may
+    // override `h.policy` before exercising a gated path.
+    checkPolicy: (subject, action) => policyCheck({ store, events, policy: h.policy }, subject, action),
+  });
+
+  return h;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,11 +329,11 @@ describe('E6.1 GitHub issue import → Work Order (spec §4.2, §28)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// T2 — branch creation
+// T2 — branch creation (policy-gated: `branch.create`, E7 §8-1)
 // ---------------------------------------------------------------------------
 
 describe('E6.1 GitHub branch creation', () => {
-  it('creates a deterministic Work-Order branch from the default base', async () => {
+  it('creates a deterministic Work-Order branch from the default base after a branch.create ALLOW', async () => {
     const h = harness();
     try {
       const issue = issueFixture();
@@ -310,6 +342,9 @@ describe('E6.1 GitHub branch creation', () => {
         repository: issue.repository,
         number: issue.number,
       });
+      // The E6 branch is `factory/<wo>`; the embedded `branch.create` scope binds
+      // `wo-*/**`. A deployment grants the Factory prefix it actually uses.
+      grantFactoryBranches(h);
 
       const branch = await h.adapter.createBranch(workOrder);
 
@@ -318,6 +353,11 @@ describe('E6.1 GitHub branch creation', () => {
       expect(h.transport.branchCalls).toEqual([
         { repository: 'acme/widgets', branch: `factory/${workOrder.id}`, baseBranch: 'main' },
       ]);
+      // The side effect was authorized by an ALLOW decision for `branch.create`.
+      const decision = h.store
+        .list<{ action: { capability: string }; decision: string }>('policy_decisions')
+        .find((row) => row.action.capability === 'branch.create');
+      expect(decision?.decision).toBe('ALLOW');
     } finally {
       h.stop();
     }
@@ -332,10 +372,58 @@ describe('E6.1 GitHub branch creation', () => {
         repository: issue.repository,
         number: issue.number,
       });
+      grantFactoryBranches(h);
 
       const branch = await h.adapter.createBranch(workOrder, 'develop');
       expect(branch.name).toBe(`factory/${workOrder.id}`);
       expect(h.transport.branchCalls[0]?.baseBranch).toBe('develop');
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('fails closed when e-stop is active: no GitHub branch is created', async () => {
+    const h = harness();
+    try {
+      const issue = issueFixture();
+      h.transport.issues.set(issueKey(issue), issue);
+      const { workOrder } = await h.adapter.importIssue({
+        repository: issue.repository,
+        number: issue.number,
+      });
+      grantFactoryBranches(h);
+      emergencyStop({ store: h.store, events: h.events }, { actor: 'operator-1' });
+
+      await expect(h.adapter.createBranch(workOrder)).rejects.toMatchObject({
+        name: 'PolicyBlockedError',
+        capability: 'branch.create',
+        verdict: 'DENY',
+      });
+      expect(h.transport.branchCalls).toHaveLength(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('fails closed when no policy check is wired (no ungoverned branch)', async () => {
+    const h = harness();
+    try {
+      const issue = issueFixture();
+      h.transport.issues.set(issueKey(issue), issue);
+      const { workOrder } = await h.adapter.importIssue({
+        repository: issue.repository,
+        number: issue.number,
+      });
+      const unpolicied = createGitHubAdapter({
+        transport: h.transport,
+        client: h.client,
+        factoryBaseUrl: FACTORY_BASE_URL,
+      });
+
+      await expect(unpolicied.createBranch(workOrder)).rejects.toMatchObject({        name: 'PolicyBlockedError',
+        verdict: 'NO_POLICY',
+      });
+      expect(h.transport.branchCalls).toHaveLength(0);
     } finally {
       h.stop();
     }
@@ -355,6 +443,12 @@ async function realBundle(workOrder: WorkOrder): Promise<EvidenceBundle> {
     category: 'deterministic',
     kind: 'unit',
     run: () => ({ passed: true, evidence: { summary: 'unit: ok' } }),
+  });
+  engine.registerCheck({
+    id: 'security',
+    category: 'deterministic',
+    kind: 'security',
+    run: () => ({ passed: true, evidence: { summary: 'security: ok' } }),
   });
   engine.registerCheck({
     id: 'contract',
@@ -429,6 +523,61 @@ describe('E6.1 openPR(evidence): PR body links the WO and Evidence Bundle', () =
 
       expect(pr.url).toBe('https://github.com/acme/widgets/pull/101');
       expect(pr.head).toBe(`factory/${workOrder.id}`);
+
+      // The side effect was authorized by an ALLOW decision for `pr.create`.
+      const decision = h.store
+        .list<{ action: { capability: string }; decision: string }>('policy_decisions')
+        .find((row) => row.action.capability === 'pr.create');
+      expect(decision?.decision).toBe('ALLOW');
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('fails closed on openPR when e-stop is active: no GitHub PR is opened', async () => {
+    const h = harness();
+    try {
+      const issue = issueFixture();
+      h.transport.issues.set(issueKey(issue), issue);
+      const { workOrder } = await h.adapter.importIssue({
+        repository: issue.repository,
+        number: issue.number,
+      });
+      const bundle = await realBundle(workOrder);
+      emergencyStop({ store: h.store, events: h.events }, { actor: 'operator-1' });
+
+      await expect(h.adapter.openPR(bundle)).rejects.toMatchObject({
+        name: 'PolicyBlockedError',
+        capability: 'pr.create',
+        verdict: 'DENY',
+      });
+      expect(h.transport.prCalls).toHaveLength(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('fails closed on openPR when no policy check is wired (no ungoverned PR)', async () => {
+    const h = harness();
+    try {
+      const issue = issueFixture();
+      h.transport.issues.set(issueKey(issue), issue);
+      const { workOrder } = await h.adapter.importIssue({
+        repository: issue.repository,
+        number: issue.number,
+      });
+      const bundle = await realBundle(workOrder);
+      const unpolicied = createGitHubAdapter({
+        transport: h.transport,
+        client: h.client,
+        factoryBaseUrl: FACTORY_BASE_URL,
+      });
+
+      await expect(unpolicied.openPR(bundle)).rejects.toMatchObject({
+        name: 'PolicyBlockedError',
+        verdict: 'NO_POLICY',
+      });
+      expect(h.transport.prCalls).toHaveLength(0);
     } finally {
       h.stop();
     }
@@ -548,6 +697,7 @@ describe('E6.1 adapter is the sole GitHub integration (spec §4.2)', () => {
         repository: issue.repository,
         number: issue.number,
       });
+      grantFactoryBranches(h);
       await h.adapter.createBranch(workOrder);
       await h.adapter.openPR(await realBundle(workOrder));
 
@@ -768,14 +918,22 @@ async function approvedWorkOrderWithPr(
   return { workOrder, bundle, pr };
 }
 
-/** Park the E7 approval for the production merge and have an operator answer it. */
-function parkMergeApproval(h: Harness, workOrderId: string, actor: string): ApprovalRecord {
+/**
+ * Park the E7 approval for the production merge and have an operator answer it.
+ * `answeredBy` defaults to the actor who will perform the merge; pass a
+ * different value to prove the merge gate binds the actor to the approval.
+ */
+function parkMergeApproval(
+  h: Harness,
+  workOrderId: string,
+  answeredBy: string,
+): ApprovalRecord {
   const deps = { store: h.store, events: h.events };
-  expect(policyCheck(deps, { taskId: null, workOrderId }, MERGE_ACTION)).toBe('REQUIRE_HUMAN');
+  expect(policyCheck(deps, { taskId: null, workOrderId }, MERGE_ACTION).verdict).toBe('REQUIRE_HUMAN');
   const parked = h.store
     .list<ApprovalRecord>('interactions')
     .find((interaction) => interaction.type === 'APPROVAL')!;
-  answerApproval(deps, parked.id, { decision: 'APPROVAL', actor });
+  answerApproval(deps, parked.id, { decision: 'APPROVAL', actor: answeredBy });
   return h.store.get<ApprovalRecord>('interactions', parked.id)!;
 }
 
@@ -829,6 +987,31 @@ describe('E6.2 merge(gate): blocked until APPROVED + ALLOW + hygiene + no self-m
         .filter((interaction) => interaction.type === 'APPROVAL');
       expect(approvals).toHaveLength(1);
       expect(approvals[0]!.status).toBe('PENDING');
+      expect((await h.client.getWorkOrder(workOrder.id)).workOrder.state).toBe('APPROVED');
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('blocks a merge when the approving human differs from the merging actor (actor not bound)', async () => {
+    const h = harness();
+    try {
+      const { workOrder, bundle, pr } = await approvedWorkOrderWithPr(h);
+      // The approval was authorized by operator-2, but operator-1 tries to merge.
+      const approval = parkMergeApproval(h, workOrder.id, 'operator-2');
+
+      await expect(
+        h.adapter.merge(mergeGate(workOrder.id, bundle, pr, { actor: 'operator-1' })),
+      ).rejects.toMatchObject({
+        name: 'MergeBlockedError',
+        reason: 'APPROVAL_ACTOR_MISMATCH',
+      });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+      // The verdict resolves to ALLOW by consuming the approval; the merge is
+      // then refused because the actor is not the approver. The approval is
+      // already spent (the E7 check is the last pre-I/O gate and has a side
+      // effect) — the mismatch blocks the merge, not the spend.
+      expect(h.store.get<ApprovalRecord>('interactions', approval.id)!.status).toBe('SPENT');
       expect((await h.client.getWorkOrder(workOrder.id)).workOrder.state).toBe('APPROVED');
     } finally {
       h.stop();
@@ -906,6 +1089,23 @@ describe('E6.2 merge(gate): blocked until APPROVED + ALLOW + hygiene + no self-m
       await expect(h.adapter.merge(mergeGate(workOrder.id, bundle, pr))).rejects.toMatchObject({
         name: 'MergeBlockedError',
         reason: 'HYGIENE_FAILED',
+      });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('blocks a merge when e-stop is active before any GitHub I/O', async () => {
+    const h = harness();
+    try {
+      const { workOrder, bundle, pr } = await approvedWorkOrderWithPr(h);
+      parkMergeApproval(h, workOrder.id, 'operator-1');
+      emergencyStop({ store: h.store, events: h.events }, { actor: 'operator-1' });
+
+      await expect(h.adapter.merge(mergeGate(workOrder.id, bundle, pr))).rejects.toMatchObject({
+        name: 'MergeBlockedError',
+        reason: 'POLICY_NOT_ALLOWED',
       });
       expect(h.transport.mergeCalls).toHaveLength(0);
     } finally {

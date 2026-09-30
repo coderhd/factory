@@ -24,6 +24,7 @@ import {
   POLICY_DECISION_RECORDED,
   answerApproval,
   check,
+  checkDetailed,
   createDefaultPolicy,
   emergencyStop,
   evaluate,
@@ -421,6 +422,27 @@ describe('E7 policy: monotonic narrowing Org → Project → WO → Task', () =>
     expect(result.resolvedBy).toBe('tier-gate');
   });
 
+  it('a branch-scoped DENY does not poison sibling ALLOWs for other branches (per-rule scope fold)', () => {
+    const chain: PolicyChain = {
+      version: 'test',
+      organization: org(),
+      project: level({
+        'repo.write': [
+          { decision: 'ALLOW', scope: { branchPattern: 'wo-*/**', excludePaths: ['infra/**'] } },
+          { decision: 'DENY', scope: { branchPattern: 'main' } },
+        ],
+      }),
+    };
+
+    // The `wo-1/impl` write is covered by the ALLOW and out of the DENY's scope.
+    const feature = resolveChain('repo.write', { path: 'src/x.ts', branch: 'wo-1/impl' }, chain);
+    expect(feature.decision).toBe('ALLOW');
+
+    // The DENY-speak for the default branch still applies to it.
+    const mainWrite = resolveChain('repo.write', { path: 'src/x.ts', branch: 'main' }, chain);
+    expect(mainWrite.decision).toBe('DENY');
+  });
+
   it('unknown capabilities are DENY with an unknown-capability marker', () => {
     const result = evaluate({
       chain: { version: 'test', organization: org() },
@@ -517,8 +539,40 @@ describe('E7 policy: durable policy_decisions + idempotent write rule', () => {
     }
   });
 
-  it('a REQUIRE_HUMAN verdict creates an ApprovalRecord; a matching approval consumes it exactly once', () => {
+  it('checkDetailed reports the verdict plus resolvedBy/spentApprovalId/approvalActor for a consumed APPROVAL', () => {
     const h = harness();
+    try {
+      const wo = seedWorkOrder(h, { riskTier: 'RED' });
+      const subject = { taskId: null, workOrderId: wo.id };
+      const action: PolicyAction = { capability: 'pr.create', attemptId: 'attempt_1' };
+
+      // First evaluation parks: resolved by the tier gate, no approval spent yet.
+      const parked = checkDetailed(policyDeps(h), subject, action);
+      expect(parked.verdict).toBe('REQUIRE_HUMAN');
+      expect(parked.resolvedBy).toBe('tier-gate');
+      expect(parked.spentApprovalId).toBeNull();
+      expect(parked.approvalActor).toBeNull();
+
+      const appr = approvals(h)[0]!;
+      answerApproval(policyDeps(h), appr.id, { decision: 'APPROVAL', actor: 'operator-9' });
+
+      const allowed = checkDetailed(policyDeps(h), subject, action);
+      expect(allowed.verdict).toBe('ALLOW');
+      expect(allowed.resolvedBy).toBe('human-approval');
+      expect(allowed.spentApprovalId).toBe(appr.id);
+      // The actor is read from the durable approval record, not the caller.
+      expect(allowed.approvalActor).toBe('operator-9');
+
+      // Replay keeps the same binding (idempotent write rule).
+      const replay = checkDetailed(policyDeps(h), subject, action);
+      expect(replay.verdict).toBe('ALLOW');
+      expect(replay.approvalActor).toBe('operator-9');
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('a REQUIRE_HUMAN verdict creates an ApprovalRecord; a matching approval consumes it exactly once', () => {    const h = harness();
     try {
       const wo = seedWorkOrder(h, { riskTier: 'RED' });
       const action: PolicyAction = { capability: 'pr.create', attemptId: 'attempt_1' };

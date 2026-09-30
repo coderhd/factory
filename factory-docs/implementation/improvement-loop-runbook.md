@@ -38,7 +38,7 @@ All improvement events use `aggregateType: 'improvement_proposal'`, `aggregateId
 
 ## Telemetry inputs (what "Observe" reads)
 
-Per Attempt, `recordAttemptTelemetry` derives the six spec §24 layers — `outcome, human_leverage, execution, quality, economics, decision` (`TELEMETRY_LAYERS`) — from durable Factory state plus supplied runtime observables, and persists them as one append-only `telemetry.attempt_recorded` receipt on the `attempt` aggregate. Recording never mutates execution state; missing data is an honest `null`/`stub`, never fabricated (the `allowDenyStatus: 'stub'` field is E7's not-yet-recorded policy layer).
+Per Attempt, `recordAttemptTelemetry` derives the six spec §24 layers — `outcome, human_leverage, execution, quality, economics, decision` (`TELEMETRY_LAYERS`) — from durable Factory state plus supplied runtime observables, and persists them as one append-only `telemetry.attempt_recorded` receipt on the `attempt` aggregate. Recording never mutates execution state; missing data is an honest `null`/`stub`, never fabricated (the decision layer's `allowDenyStatus` reads E7's `policy_decisions` and reports `'stub'` only when no decision exists for the Attempt).
 
 Two read models feed the loop:
 
@@ -218,7 +218,7 @@ const promoted = promoteImprovement(deps, proposal.id); // WO DRAFT→READY, aut
 - **No built-in benchmark runner.** `benchmarkImprovement` records operator-supplied `BenchmarkMetrics` behind a structural, corpus-gated, append-only interface; producing the numbers (replaying the frozen corpus under both configurations) is manual/operator tooling for now. The trail-binding guards ensure qualification can never outrun what was actually *recorded*, but the harness remains external.
 - **The automatic gate reads 5 of the 8 metrics.** `isImprovement` gates on verified-outcome hold, rework non-growth, and effort/cost/first-pass improvement; `wallTimeMinutes`, `quality`, `interventions` are recorded for human review but do not fail the candidate automatically. A candidate with flat quality metrics can still auto-qualify — a human reviewing the `improvement.qualified` event before promoting is the backstop (and promotion is where the real gate is).
 - **`human_gate` is stamped, not authenticated.** The event records `authority: 'human_gate'` as a durable marker of the decision; the calling surface must keep it human-only by convention and process.
-- **The allow/deny decision layer is a stub.** Until E7 records `policy_decisions`, telemetry's `allowDenyStatus` honestly reports `'stub'` — a gap for the decision layer, not for improvement qualification.
+- **The allow/deny decision layer reads E7's durable records.** `policyDecisionsFor` reads the real `PolicyDecisionRecord` fields (`task`, `attemptId`, `action.capability`, `rules`); `allowDenyStatus` reports `'stub'` only when the Attempt has no recorded policy decision.
 - **Proposals are event-sourced only.** There is no `improvements` state table; `readImprovement`/`readRecordedBenchmark` reconstruct from the trail. Tooling that lists open proposals reads the event log.
 
 ## Sources

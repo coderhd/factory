@@ -107,6 +107,15 @@ export function createWorkerManager(deps: WorkerManagerDeps): WorkerManager {
   const adapters = new Map<string, WorkerAdapter>();
   const runs = new Map<string, Promise<void>>();
   const dispatchFailures = new Map<string, string>();
+  /**
+   * The per-worker provision→start boot promise (spec §15/§6.4). `provisionWorker`
+   * returns synchronously, but the adapter's runtime is only usable once
+   * `provision().then(start())` settles. `execute` awaits this before writing the
+   * envelope; without it a same-tick provision→assign→execute dispatch finds the
+   * real Herdr `child` null, the envelope is never written, and the run wedges
+   * with no loud failure.
+   */
+  const boots = new Map<string, Promise<void>>();
 
   const listWorkers = (): WorkerRecord[] => deps.store.list<WorkerRecord>('workers');
 
@@ -134,11 +143,15 @@ export function createWorkerManager(deps: WorkerManagerDeps): WorkerManager {
         });
       })();
 
-      // Provision + start the runtime in one call; the provision fact is the event.
-      void adapter
-        .provision()
-        .then(() => adapter.start())
-        .catch(() => undefined);
+      // Provision + start the runtime in one call; the provision fact is the
+      // event. The boot promise is retained so `execute` can await it (below).
+      boots.set(
+        worker.id,
+        adapter
+          .provision()
+          .then(() => adapter.start())
+          .catch(() => undefined),
+      );
 
       return worker;
     },
@@ -198,12 +211,19 @@ export function createWorkerManager(deps: WorkerManagerDeps): WorkerManager {
     async status(workerId): Promise<WorkerStatus> {
       const adapter = adapters.get(workerId);
       if (!adapter) throw new FactoryError('WORKER_NOT_FOUND', `worker not found: ${workerId}`);
+      const boot = boots.get(workerId);
+      if (boot) await boot;
       return adapter.status();
     },
 
     async execute(workerId, envelope): Promise<void> {
       const adapter = adapters.get(workerId);
       if (!adapter) throw new FactoryError('WORKER_NOT_FOUND', `worker not found: ${workerId}`);
+      // Await the provision→start boot before dispatching: a same-tick
+      // assign→execute must not race the detached boot (the real adapter's
+      // `child` is null until `start()` settles and would drop the envelope).
+      const boot = boots.get(workerId);
+      if (boot) await boot;
       dispatchFailures.delete(workerId);
       // Invoke the adapter synchronously so the dispatch is observable in-tick.
       const run = adapter.execute(envelope).catch((error: unknown) => {
@@ -216,6 +236,8 @@ export function createWorkerManager(deps: WorkerManagerDeps): WorkerManager {
     async collectArtifacts(workerId): Promise<WorkerResult> {
       const adapter = adapters.get(workerId);
       if (!adapter) throw new FactoryError('WORKER_NOT_FOUND', `worker not found: ${workerId}`);
+      const boot = boots.get(workerId);
+      if (boot) await boot;
       const run = runs.get(workerId);
       if (run) await run;
       const failure = dispatchFailures.get(workerId);

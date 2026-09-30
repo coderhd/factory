@@ -27,7 +27,7 @@ import {
   type DAGProposalPayload,
   type ProposalNode,
 } from '../../src/factory/planning/dag';
-import { createScheduler, INTERACTION_CREATED, type InteractionRecord } from '../../src/factory/scheduler/scheduler';
+import { createScheduler, INTERACTION_CREATED, ASSIGNMENT_START_FAILED, type InteractionRecord } from '../../src/factory/scheduler/scheduler';
 import { createArtifactStore, openStateStore } from '../../src/factory/state/store';
 import {
   createHerdrWorker,
@@ -179,6 +179,8 @@ interface Harness {
   worktrees: ReturnType<typeof createWorktreeManager>;
   scheduler: ReturnType<typeof createScheduler>;
   adapters: FakeHerdr[];
+  /** Adapters keyed by the worker id they were provisioned for. */
+  adapterByWorker: Map<string, FakeHerdr>;
   clock: ReturnType<typeof makeClock>;
 }
 
@@ -191,7 +193,8 @@ function harness(opts: {
   const events = openEventLog(store.db);
   const clock = makeClock();
   const adapters: FakeHerdr[] = [];
-  const workers = createWorkerManager({
+  const adapterByWorker = new Map<string, FakeHerdr>();
+  const baseWorkers = createWorkerManager({
     store,
     events,
     spawn: () => {
@@ -201,6 +204,16 @@ function harness(opts: {
     },
     now: clock.now,
   });
+  // The manager's adapter map is internal; track worker→adapter at provision so
+  // tests can reach a task's adapter before its (now boot-gated) envelope lands.
+  const workers: ReturnType<typeof createWorkerManager> = {
+    ...baseWorkers,
+    provisionWorker: (profile) => {
+      const worker = baseWorkers.provisionWorker(profile);
+      adapterByWorker.set(worker.id, adapters[adapters.length - 1]!);
+      return worker;
+    },
+  };
   const worktrees = createWorktreeManager({ rootDir: worktreeRoot, baseBranch: 'main' });
   const scheduler = createScheduler(
     {
@@ -217,7 +230,7 @@ function harness(opts: {
       tickIntervalMs: opts.tickIntervalMs ?? 1000,
     },
   );
-  return { store, events, workers, worktrees, scheduler, adapters, clock };
+  return { store, events, workers, worktrees, scheduler, adapters, adapterByWorker, clock };
 }
 
 function deps(h: Harness) {
@@ -254,8 +267,16 @@ const tasksInState = (h: Harness, state: string): Task[] =>
 const workerOf = (h: Harness, workerId: string): WorkerRecord =>
   h.store.get<WorkerRecord>('workers', workerId)!;
 
-const adapterForTask = (h: Harness, taskId: string): FakeHerdr =>
-  h.adapters.find((adapter) => adapter.envelope?.taskId === taskId)!;
+const adapterForTask = (h: Harness, taskId: string): FakeHerdr => {
+  const open = h.store
+    .list<AssignmentRecord>('assignments')
+    .find((assignment) => assignment.taskId === taskId && assignment.closedAt === null);
+  if (open) {
+    const adapter = h.adapterByWorker.get(open.workerId);
+    if (adapter) return adapter;
+  }
+  return h.adapters.find((adapter) => adapter.envelope?.taskId === taskId)!;
+};
 
 const openAssignments = (h: Harness): AssignmentRecord[] =>
   h.store
@@ -1022,6 +1043,67 @@ describe('E3 assignment + completion rules', () => {
     }
   });
 
+  it('does not re-ask a question after the Task is resumed (stale report is consumed once)', async () => {
+    const h = harness();
+    try {
+      const { dag } = plan(h, [{ nodeId: 'a', title: 'A' }]);
+      const a = nodeTask(dag, 'a');
+      h.scheduler.tick();
+
+      // The runtime settles a waiting_input report; the Task parks.
+      adapterForTask(h, a).result = waitingResult();
+      await settle();
+      h.scheduler.tick();
+      await settle();
+      expect(stateOf(h, a)).toBe('WAITING_INPUT');
+      expect(h.store.list<InteractionRecord>('interactions')).toHaveLength(1);
+
+      // A human answers; E2 resumes the Task WAITING_INPUT → RUNNING.
+      transitionTask(deps(h), a, { to: 'RUNNING' });
+
+      // The adapter still holds the SAME settled report (no new execute).
+      // A poll must not re-collect it: no duplicate interaction, no flip back.
+      for (let i = 0; i < 3; i += 1) {
+        h.scheduler.tick();
+        await settle();
+      }
+      expect(stateOf(h, a)).toBe('RUNNING');
+      expect(h.store.list<InteractionRecord>('interactions')).toHaveLength(1);
+      expect(
+        h.events.readEvents().filter((e) => e.type === INTERACTION_CREATED),
+      ).toHaveLength(1);
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('routes a genuinely new report after a resumed Task (consume-once is not consume-forever)', async () => {
+    const h = harness();
+    try {
+      const { dag } = plan(h, [{ nodeId: 'a', title: 'A' }]);
+      const a = nodeTask(dag, 'a');
+      h.scheduler.tick();
+      const adapter = adapterForTask(h, a);
+
+      adapter.result = waitingResult();
+      await settle();
+      h.scheduler.tick();
+      await settle();
+      expect(stateOf(h, a)).toBe('WAITING_INPUT');
+
+      transitionTask(deps(h), a, { to: 'RUNNING' });
+      // A fresh run settles a NEW report object; it must be routed normally.
+      adapter.result = completedResult();
+      h.scheduler.tick();
+      await settle();
+      h.scheduler.tick();
+      await settle();
+      expect(stateOf(h, a)).toBe('SUCCESS');
+    } finally {
+      h.store.close();
+    }
+  });
+
   it('does not renew the lease when status() reports a non-live (failed) runtime', async () => {
     const h = harness();
     try {
@@ -1109,6 +1191,51 @@ describe('E3 assignment + completion rules', () => {
     }
   });
 
+  it('compensates a post-assign startTask failure: task reverted, worker released, slot freed, diagnostic logged', async () => {
+    const h = harness();
+    try {
+      const { woId, dag } = plan(h, [{ nodeId: 'a', title: 'A' }]);
+      const a = nodeTask(dag, 'a');
+
+      // Force startTask to throw AFTER assign has committed: the lease grant is
+      // the first thing it does post-createAttempt.
+      const renewLease = h.workers.renewLease.bind(h.workers);
+      let thrownOnce = false;
+      h.workers.renewLease = (workerId, binding, ttl) => {
+        if (!thrownOnce) {
+          thrownOnce = true;
+          throw new Error('lease grant unavailable');
+        }
+        return renewLease(workerId, binding, ttl);
+      };
+
+      h.scheduler.tick();
+      await settle();
+
+      // Nothing is wedged: the Task is READY again, the Worker IDLE with no lease,
+      // and no Assignment is left open.
+      expect(stateOf(h, a)).toBe('READY');
+      expect(workerOf(h, h.workers.listWorkers()[0].id).runtimeState).toBe('IDLE');
+      expect(h.workers.listWorkers()[0].lease).toBeNull();
+      expect(openAssignments(h)).toHaveLength(0);
+
+      // A diagnostic event records the compensation.
+      const diagnostic = h.events
+        .readEvents({ aggregateType: 'assignment' })
+        .filter((event) => event.type === ASSIGNMENT_START_FAILED);
+      expect(diagnostic).toHaveLength(1);
+      expect((diagnostic[0].payload as { error: string }).error).toContain('lease grant unavailable');
+
+      // The freed slot lets a later tick retry and assign again.
+      h.scheduler.tick();
+      await settle();
+      expect(stateOf(h, a)).toBe('RUNNING');
+      expect(woId).toBeString();
+    } finally {
+      h.store.close();
+    }
+  });
+
   it('startTask returns a §17 execution envelope and dispatches to the adapter', async () => {
     const h = harness();
     try {
@@ -1153,16 +1280,87 @@ describe('E3 assignment + completion rules', () => {
 });
 
 // ---------------------------------------------------------------------------
+// T9b — real-adapter boot race + scheduler compensation (final-review fixes)
+// ---------------------------------------------------------------------------
+
+/** Write a tiny executable stub runtime and return its path. */
+function stubScript(name: string, body: string): string {
+  const scriptPath = join(workDir, name);
+  writeFileSync(scriptPath, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  return scriptPath;
+}
+
+describe('E3 real Herdr same-tick provision→assign→execute', () => {
+  it('delivers the envelope (and does not hang collectArtifacts) when provision→assign run in one tick', async () => {
+    const store = openStateStore(dbPath);
+    const events = openEventLog(store.db);
+    const d = { store, events };
+    const report: WorkerResult = {
+      status: 'completed',
+      commits: [{ sha: 'boot', message: 'delivered' }],
+      artifacts: [],
+      interactions: [],
+      observations: [],
+      verificationRequests: [],
+      diff: 'diff:boot',
+      failure: null,
+    };
+    // The stub reads one envelope line, then emits a report.
+    const script = stubScript('herdr-boot.sh', `read -r line\necho '${JSON.stringify(report)}'`);
+    const workers = createWorkerManager({
+      store,
+      events,
+      spawn: () => createHerdrWorker({ command: script }),
+    });
+    try {
+      const wo = createWorkOrder(d, { intent: 'boot race', acceptanceCriteria: ['ok'] });
+      transitionWorkOrder(d, wo.id, { to: 'READY' });
+      transitionWorkOrder(d, wo.id, { to: 'PLANNING' });
+      const dag = commitDAG(d, wo.id, { nodes: [{ nodeId: 'a', title: 'A' }] });
+      transitionWorkOrder(d, wo.id, { to: 'EXECUTING' });
+      const taskId = dag.nodes[0].taskId;
+      transitionTask(d, taskId, { to: 'READY' });
+
+      // Provision and assign + start in the SAME synchronous block — the exact
+      // same-tick race the real adapter hit.
+      const worker = workers.provisionWorker('herdr');
+      const assignment = assign(d, {
+        taskId,
+        workerId: worker.id,
+        worktree: {
+          taskId,
+          branch: `factory/task-${taskId}`,
+          worktreePath: join(worktreeRoot, taskId),
+          baseCommit,
+        },
+      });
+      startTask(
+        {
+          store,
+          events,
+          workers,
+          worktrees: createWorktreeManager({ rootDir: worktreeRoot, baseBranch: 'main' }),
+          now: () => new Date().toISOString(),
+        },
+        assignment,
+      );
+
+      // The envelope must reach the runtime and its report must come back.
+      const result = await workers.collectArtifacts(worker.id);
+      expect(result.status).toBe('completed');
+      expect(result.commits).toEqual([{ sha: 'boot', message: 'delivered' }]);
+      expect(result.failure).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // T10 — Herdr adapter wire protocol (NDJSON read-back)
 // ---------------------------------------------------------------------------
 
 describe('E3 Herdr adapter wire protocol', () => {
-  function stubScript(name: string, body: string): string {
-    const scriptPath = join(workDir, name);
-    writeFileSync(scriptPath, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
-    return scriptPath;
-  }
-
   const envelope: ExecutionEnvelope = {
     workOrderId: 'wo',
     taskId: 'task',

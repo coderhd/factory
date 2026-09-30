@@ -20,6 +20,7 @@ import {
 import type { EvidenceBundle } from '../../src/factory/evidence/bundle';
 import { openEventLog, type EventLog } from '../../src/factory/events/log';
 import type { EvidenceReadPort, VerifiedChange } from '../../src/factory/observatory/observatory';
+import type { PolicyDecisionRecord } from '../../src/factory/policy/policy';
 import type { RouteInput, RoutingDecisionRecord } from '../../src/factory/routing/decisionModel';
 import { persistRoutingDecision } from '../../src/factory/routing/persist';
 import { selectModel, toRoutingDecisionRecord } from '../../src/factory/routing/rules';
@@ -189,13 +190,22 @@ function seedInteraction(task: Task, id: string, status: 'PENDING' | 'ANSWERED')
 }
 
 function seedPolicyDecision(task: Task, decision: 'ALLOW' | 'DENY' | 'REQUIRE_HUMAN'): void {
-  store.set('policy_decisions', `pd_${decision}`, {
+  // Typed as the real E7 `PolicyDecisionRecord` so a reader/fixture drift is a
+  // compile error, not a silently empty decision layer.
+  const record: PolicyDecisionRecord = {
     id: `pd_${decision}`,
-    taskId: task.id,
-    action: 'repo.write',
+    task: task.id,
+    workOrderId: task.workOrderId,
+    attemptId: null,
+    action: { capability: 'repo.write' },
+    risk: 'YELLOW',
     decision,
-    reason: `${decision} by policy`,
-  });
+    rules: [`org:repo.write:${decision}`],
+    policyVersion: '<embedded>',
+    resolvedBy: 'policy',
+    createdAt: '2026-09-30T08:00:00.000Z',
+  };
+  store.set('policy_decisions', record.id, record);
 }
 
 /** Drive a Work Order all the way to a HUMAN_GATE decision so gate telemetry has real data. */
@@ -316,7 +326,7 @@ describe('E8.1 telemetry layers (spec §24)', () => {
     // allow/deny.
     expect(decision.allowDenyStatus).toBe('available');
     expect(decision.allowDeny).toEqual([
-      { ref: 'pd_DENY', action: 'repo.write', decision: 'DENY', reason: 'DENY by policy' },
+      { ref: 'pd_DENY', action: 'repo.write', decision: 'DENY', rules: ['org:repo.write:DENY'] },
     ]);
     // replanning.
     expect(decision.replan).toEqual([
@@ -328,7 +338,7 @@ describe('E8.1 telemetry layers (spec §24)', () => {
     expect(decision.gate[0]!.reason).toBe('APPROVED by human');
   });
 
-  it('marks allow-deny as an honest stub when no policy decision exists (E7 not recording yet)', () => {
+  it('marks allow-deny as an honest stub when no policy decision exists', () => {
     const wo = seedWorkOrder();
     const task = createTask({ store, events }, { workOrderId: wo.id, title: 'T' });
     const attempt = seedAttempt(task);
