@@ -21,3 +21,7 @@ Final architecture capture for the Root / Factory ecosystem. The existing `2026-
 
 - `architecture/decision-model-routing-core.md` — E4.1: generic DecisionModel seam, capability matrix, budget gates
 - `architecture/routing-decision-log.md` — E4.2: decision persistence, `routing.log` format + example line, override/appeal paths, ticket routing fields
+
+## Telemetry & self-improvement (Factory Server v0.1, E8)
+
+- `implementation/improvement-loop-runbook.md` — E8.2: operating the Improvement-as-Work loop (`Observe → Propose → Benchmark → Qualify → Promote`): per-stage entry/exit criteria and events, six telemetry layers + Observatory inputs (E8.1), benchmark corpus kept distinct from Lekhan dogfooding, Levels 1–2 only, human-gated promotion — never silent behavior change
