@@ -172,6 +172,8 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
    */
   const routedReports = new Map<string, WorkerResult>();
   let timer: ReturnType<typeof setInterval> | null = null;
+  /** One-time guard so a missing `repoPath` warns loudly but only once. */
+  let warnedMissingRepoPath = false;
 
   // --- durable-state readers -------------------------------------------------
 
@@ -482,6 +484,16 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       if (!idleWorker) break;
 
       if (!deps.repoPath) {
+        // Without a repo the scheduler cannot create a worktree, so it would
+        // skip every candidate forever and silently. Warn once (not per tick)
+        // so a misconfigured server is visible, mirroring the fail-closed
+        // policy default's loudness.
+        if (!warnedMissingRepoPath) {
+          warnedMissingRepoPath = true;
+          console.error(
+            'scheduler: no repoPath wired (SchedulerDeps.repoPath is undefined); skipping all assignments — set repository.path in factory.yaml',
+          );
+        }
         skipped.add(candidate.task.id);
         continue;
       }

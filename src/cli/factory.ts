@@ -149,11 +149,14 @@ function ensureStorageDirs(runtime: FactoryRuntimeConfig): void {
 /**
  * The E3 `SchedulerPolicy` adapter (E9.1 ruling RE5): assignment is an E7
  * `repo.write` decision on the Task's real worktree branch
- * (`wo-<workOrderId>/task-<short>`) with `path: '**'` — the whole-worktree
- * binding at assignment time (the per-path `infra&#47;**` exclusion is enforced
- * later, at write/verification time). `ALLOW` assigns; a `REQUIRE_HUMAN`/`DENY`
- * verdict leaves the Task `READY` and is surfaced by the scheduler's
- * `blockedPolicy`.
+ * (`wo-<workOrderId>/task-<short>`), binding `path: '**'` — the whole-worktree
+ * binding at assignment time. Path-level `repo.write` enforcement (the embedded
+ * default's `infra&#47;**` exclusion applied to an actual change path) is **not
+ * yet wired anywhere**: the assignment gate is today's only `repo.write` check,
+ * and E6 gates only `branch.create`/`pr.create`. That write-time path-scoped
+ * enforcer is pending and owned by E9.8 (#34). `ALLOW` assigns; a
+ * `REQUIRE_HUMAN`/`DENY` verdict leaves the Task `READY` and is surfaced by the
+ * scheduler's `blockedPolicy`.
  */
 export function createSchedulerPolicy(deps: {
   store: StateStore;

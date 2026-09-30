@@ -272,6 +272,37 @@ describe('E9.1 server orchestration spine — policy', () => {
       store.close();
     }
   });
+
+  it('warns once (not per tick) when no repoPath is wired and skips assignment', () => {
+    const store = openStateStore(join(workDir, 'norepo.db'));
+    const events = openEventLog(store.db);
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
+    try {
+      const workers = createWorkerManager({ store, events, spawn: () => new FakeHerdr() });
+      const worktrees = createWorktreeManager({ rootDir: join(workDir, 'wt'), baseBranch: 'main' });
+      const scheduler = createScheduler({
+        store,
+        events,
+        workers,
+        worktrees,
+        policy: { canAssign: () => 'ALLOW' },
+      });
+      const { task } = seedExecutingWorkOrder(store, events);
+
+      scheduler.tick();
+      scheduler.tick();
+
+      expect(store.get<Task>('tasks', task.id)!.state).not.toBe('RUNNING');
+      expect(store.list<{ taskId: string }>('assignments')).toHaveLength(0);
+      const repoWarnings = errors.filter((line) => /repoPath/.test(line));
+      expect(repoWarnings).toHaveLength(1);
+    } finally {
+      console.error = originalError;
+      store.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -359,7 +390,12 @@ describe('E9.1 evidence read seam', () => {
         workerId: 'worker_1',
       });
       // An empty store yields no verified change (not a fabricated one).
-      expect(projectObservatory(createEvidenceReadPort(openStateStore(join(workDir, 'empty.db')))).verifiedPerDay).toEqual([]);
+      const empty = openStateStore(join(workDir, 'empty.db'));
+      try {
+        expect(projectObservatory(createEvidenceReadPort(empty)).verifiedPerDay).toEqual([]);
+      } finally {
+        empty.close();
+      }
     } finally {
       store.close();
     }
