@@ -10,7 +10,7 @@ import type { WorkVerifier, VerificationOutcome } from '../verification/orchestr
 import type { EventLog } from '../events/log';
 import { getActiveDAG, type DAGVersion } from '../planning/dag';
 import { createEvidenceReadPort, type EvidenceReadPort } from '../observatory/observatory';
-import { isEmergencyStopped, isFactoryPaused } from '../policy/policy';
+import { changedPathsFromDiff, isEmergencyStopped, isFactoryPaused } from '../policy/policy';
 import { RESOURCE_UNAVAILABLE } from '../recovery/recovery';
 import { routeAssignment } from '../routing/assignment';
 import type { BudgetState, ModelId } from '../routing/decisionModel';
@@ -29,6 +29,7 @@ import {
   type WorkerRecord,
 } from '../workers/manager';
 import type { WorktreeManager } from '../worktrees/worktree';
+import { taskWorktreeBranch } from '../worktrees/worktree';
 
 /**
  * E3.2 capacity- and policy-aware scheduler (spec §7.2). In-process and
@@ -41,6 +42,19 @@ export type PolicyVerdict = 'ALLOW' | 'DENY' | 'REQUIRE_HUMAN';
 
 export interface SchedulerPolicy {
   canAssign(task: Task, workOrder: WorkOrder): PolicyVerdict;
+  /**
+   * E9.8 write-time path gate (RE6): given the changed paths a SUCCESS change
+   * set touches, authorize each as a `repo.write` on the Task's worktree branch.
+   * The assignment gate binds `path:'**'` for the whole worktree; this is the
+   * enforcement against the *actual* paths — the embedded `infra/**` exclusion.
+   * Absent, the write-time gate is not enforced (production wires it).
+   */
+  canWriteChangeSet?(
+    task: Task,
+    workOrder: WorkOrder,
+    branch: string,
+    paths: string[],
+  ): { allowed: boolean; denied: string[] };
 }
 
 export interface SchedulerConfig {
@@ -797,6 +811,32 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     }
     for (const subject of subjects) {
       if (verifyPending.has(subject.task.id)) continue;
+
+      // E9.8 write-time path gate (RE6): the assignment gate authorized the whole
+      // worktree (`path:'**'`); here the change set's *actual* paths are known
+      // from the diff, so a path outside the `repo.write` grant (the embedded
+      // `infra/**` exclusion) is refused before verification — never verified,
+      // never promoted. A denial settles as a structured rejection.
+      const gate = deps.policy?.canWriteChangeSet;
+      if (gate) {
+        const branch = taskWorktreeBranch(subject.task.id, subject.workOrder.id);
+        const paths = changedPathsFromDiff(subject.attempt.diff ?? '');
+        const check = gate(subject.task, subject.workOrder, branch, paths);
+        if (!check.allowed) {
+          verifyPending.add(subject.task.id);
+          verificationCompletions.push({
+            subject: keyOf(subject),
+            outcome: {
+              bundle: null,
+              passed: false,
+              failures: [],
+              rejection: `repo.write denied for ${check.denied.join(', ')} on ${branch}`,
+            },
+          });
+          continue;
+        }
+      }
+
       verifyPending.add(subject.task.id);
       const reject = (error: unknown): void => {
         verificationCompletions.push({

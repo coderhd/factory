@@ -18,13 +18,17 @@ import type { PolicyDecisionOutcome, PolicyResource, PolicyVerdict } from '../po
  *
  * The merge gate's additional gates, all checked before any GitHub merge I/O:
  *   - the Work Order is `APPROVED`,
- *   - the Evidence Bundle receipt is complete and linked by the live PR (hygiene),
+ *   - the Evidence Bundle is read back from the **durable** `evidence_bundles`
+ *     receipt by id (a fabricated in-memory bundle with no receipt is refused),
+ *     and the PR links it (hygiene),
  *   - the PR is still open, targets the configured base, and is the Work Order's
- *     own `factory/<id>` branch,
+ *     own change-set branch,
  *   - the actor is not the change's writer (no self-merge, spec §29 invariant 4),
  *   - the E7 policy check returns `ALLOW` **and** the consumed `APPROVAL` was
  *     authorized by the same actor performing the merge (the actor is bound to
- *     the human approval, not taken on the caller's word).
+ *     the human approval, not taken on the caller's word),
+ *   - the merge is pinned to the PR head SHA read back here, so the commit that
+ *     was verified is exactly the commit that is merged (no TOCTOU).
  *
  * GitHub is the only external system in the MVP, and this module is the only
  * place in the Factory that talks to it. Everything GitHub-shaped arrives
@@ -77,6 +81,8 @@ export interface PullRequestRef {
 export interface GitHubPullRequestDetail extends GitHubPullRequest {
   /** The rendered PR body; must carry the Work Order + Evidence Bundle links. */
   body: string;
+  /** The commit the PR head currently points at (the head-SHA pin input). */
+  headSha: string;
   state: 'open' | 'closed';
   merged: boolean;
 }
@@ -98,6 +104,11 @@ export interface CreatePullRequestInput {
 export interface MergePullRequestInput {
   repository: string;
   number: number;
+  /**
+   * The PR head SHA the gate verified. GitHub rejects the merge if the head has
+   * moved since, so verified-code ≠ merged-code is impossible (no TOCTOU).
+   */
+  sha?: string;
 }
 
 /** The result of a Factory-authorized merge. */
@@ -162,7 +173,7 @@ interface GitHubIssueDto {
 interface GitHubPrDto {
   number?: unknown;
   html_url?: unknown;
-  head?: { ref?: unknown };
+  head?: { ref?: unknown; sha?: unknown };
   base?: { ref?: unknown };
 }
 
@@ -287,6 +298,7 @@ export function createGitHubRestTransport(options: GitHubRestTransportOptions): 
         number: typeof pr.number === 'number' ? pr.number : ref.number,
         url: typeof pr.html_url === 'string' ? pr.html_url : '',
         head: typeof pr.head?.ref === 'string' ? pr.head.ref : '',
+        headSha: typeof pr.head?.sha === 'string' ? pr.head.sha : '',
         base: typeof pr.base?.ref === 'string' ? pr.base.ref : '',
         body: typeof pr.body === 'string' ? pr.body : '',
         state: pr.state === 'closed' ? 'closed' : 'open',
@@ -298,6 +310,8 @@ export function createGitHubRestTransport(options: GitHubRestTransportOptions): 
       const result = await request<GitHubMergeDto>(
         'PUT',
         `/repos/${input.repository}/pulls/${input.number}/merge`,
+        // The head-SHA pin: GitHub refuses the merge if the head moved.
+        input.sha === undefined ? undefined : { sha: input.sha },
       );
       return {
         repository: input.repository,
@@ -435,6 +449,15 @@ export type MergeEvidence = Pick<
   'id' | 'workOrderId' | 'complete' | 'gates' | 'provenance'
 >;
 
+/**
+ * The durable Evidence Bundle read-back port. The merge gate **looks the bundle
+ * up by id** here (production: the store's `evidence_bundles` rows) and refuses
+ * a caller-supplied bundle that has no durable receipt — the persisted receipt
+ * is the source of truth (spec §28; E9.4 persists it). Absent the port, the
+ * merge fails closed: an in-memory claim can never authorize a merge.
+ */
+export type EvidenceReader = (bundleId: string) => EvidenceBundle | null;
+
 /** The inputs to `merge(gate)`: the promotion authorization. */
 export interface MergeGate {
   /** The Work Order being promoted; must be `APPROVED` (spec §5.1). */
@@ -442,8 +465,10 @@ export interface MergeGate {
   /** The PR to merge. */
   pullRequest: PullRequestRef;
   /**
-   * The promotion-grade Evidence Bundle receipt the PR links. `complete` must
-   * be `true`, and `provenance` supplies the writer identity for no-self-merge.
+   * The promotion-grade Evidence Bundle receipt the PR links. Only its `id` is
+   * trusted as a pointer: the merge re-reads the bundle from the durable
+   * `evidence_bundles` receipt (`readEvidence`) — an in-memory bundle with no
+   * persisted receipt cannot authorize a merge.
    */
   evidence: MergeEvidence;
   /**
@@ -463,6 +488,7 @@ export interface MergeOutcome {
 /** Why the merge gate refused to merge. */
 export type MergeBlockReason =
   | 'WORK_ORDER_NOT_APPROVED'
+  | 'EVIDENCE_NOT_PERSISTED'
   | 'EVIDENCE_INCOMPLETE'
   | 'EVIDENCE_MISMATCH'
   | 'SELF_MERGE'
@@ -491,7 +517,12 @@ export interface GitHubAdapterOptions {
   factoryBaseUrl: string;
   /** Default PR base branch. Defaults to `main`. */
   baseBranch?: string;
-  /** Branch naming policy. Defaults to `factory/<workOrderId>`. */
+  /**
+   * Branch naming policy. Defaults to the E3 namespace
+   * `wo-<workOrderId>/task-<workOrderIdShort>` — the same `wo-<id>/task-<short>`
+   * shape the E3 worktree manager mints and the E7 embedded scope authorizes
+   * (`wo-*&#47;**`), so the worktree, PR and policy namespaces agree.
+   */
   branchName?: (workOrder: WorkOrder) => string;
   /**
    * The E7 policy gate every GitHub side-effect authorizes through
@@ -499,6 +530,12 @@ export interface GitHubAdapterOptions {
    * Required by the adapter; every path fails closed when it is absent.
    */
   checkPolicy?: PolicyCheck;
+  /**
+   * The durable Evidence Bundle read-back (the merge gate's source of truth).
+   * Required for a merge; absent, the merge fails closed — an in-memory bundle
+   * can never authorize a production merge.
+   */
+  readEvidence?: EvidenceReader;
 }
 
 export interface GitHubAdapter {
@@ -526,19 +563,22 @@ export interface GitHubAdapter {
   /**
    * Merge the PR behind `gate` — the Factory-authorized production deployment.
    * Fails closed (throws {@link MergeBlockedError}) unless the Work Order is
-   * APPROVED, the evidence is complete and linked, hygiene passes, the actor is
-   * not the writer, E7's `deploy.execute { env: production }` check returns
-   * ALLOW resolved by an operator APPROVAL, and `gate.actor` is the human that
-   * authorized that APPROVAL. On success, records the Factory-owned
-   * `APPROVED → MERGED` transition.
+   * APPROVED, the Evidence Bundle **has a durable receipt** that is complete and
+   * linked, hygiene passes, the actor is not the writer, E7's
+   * `deploy.execute { env: production }` check returns ALLOW resolved by an
+   * operator APPROVAL, and `gate.actor` is the human that authorized that
+   * APPROVAL. The merge is pinned to the PR head SHA read back here. On success,
+   * records the Factory-owned `APPROVED → MERGED` transition.
    */
   merge(gate: MergeGate): Promise<MergeOutcome>;
 }
 
 export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapter {
-  const { transport, client, factoryBaseUrl, checkPolicy } = options;
+  const { transport, client, factoryBaseUrl, checkPolicy, readEvidence } = options;
   const baseBranch = options.baseBranch ?? 'main';
-  const branchName = options.branchName ?? ((workOrder: WorkOrder) => `factory/${workOrder.id}`);
+  const branchName =
+    options.branchName ??
+    ((workOrder: WorkOrder) => `wo-${workOrder.id}/task-${workOrder.id.slice(0, 8)}`);
 
   function requireRepository(workOrder: WorkOrder): string {
     if (!workOrder.repository) {
@@ -636,9 +676,25 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
       );
     }
 
-    // 2. The change must be promotion-grade: a complete Evidence Bundle for this
-    // very Work Order.
-    const { evidence } = gate;
+    // 2. The change must be promotion-grade, and the receipt must be durable:
+    // the bundle is looked up by id from the persisted `evidence_bundles` — an
+    // in-memory bundle the caller fabricated has no receipt and cannot authorize
+    // a merge. The caller's claim is only a *pointer* (its id); the durable row
+    // is the source of truth (spec §28; E9.4 persists it).
+    const claim = gate.evidence;
+    if (!readEvidence) {
+      throw new MergeBlockedError(
+        'EVIDENCE_NOT_PERSISTED',
+        'merge blocked: no durable Evidence Bundle reader is configured; an in-memory bundle cannot authorize a merge',
+      );
+    }
+    const evidence = readEvidence(claim.id);
+    if (!evidence) {
+      throw new MergeBlockedError(
+        'EVIDENCE_NOT_PERSISTED',
+        `merge blocked: Evidence Bundle ${claim.id} has no durable receipt in evidence_bundles`,
+      );
+    }
     if (evidence.workOrderId !== workOrder.id) {
       throw new MergeBlockedError(
         'EVIDENCE_MISMATCH',
@@ -693,6 +749,15 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
         `merge blocked: pull request base "${pullRequest.base}" is not "${baseBranch}"`,
       );
     }
+    // The head-SHA pin: the gate merges exactly the commit it verified. Without a
+    // head SHA there is nothing to pin, so the merge fails closed rather than
+    // merging whatever the branch happens to point at.
+    if (!pullRequest.headSha) {
+      throw new MergeBlockedError(
+        'HYGIENE_FAILED',
+        `merge blocked: pull request ${repository}#${pullRequest.number} has no head SHA to pin`,
+      );
+    }
     const expectedEvidenceLink = `[${evidence.id}](${evidenceLinkUrl(factoryBaseUrl, workOrder.id)})`;
     const expectedWorkOrderLink = `[${workOrder.id}](${workOrderLinkUrl(factoryBaseUrl, workOrder.id)})`;
     if (!pullRequest.body.includes(expectedEvidenceLink)) {
@@ -743,10 +808,12 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
       );
     }
 
-    // 6. Merged on GitHub, then the Factory-owned APPROVED → MERGED transition.
+    // 6. Merged on GitHub (pinned to the verified head SHA), then the
+    // Factory-owned APPROVED → MERGED transition.
     const merged = await transport.mergePullRequest({
       repository,
       number: pullRequest.number,
+      sha: pullRequest.headSha,
     });
     const transitioned = await client.transitionWorkOrder(workOrder.id, {
       to: 'MERGED',

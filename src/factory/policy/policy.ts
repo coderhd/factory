@@ -749,6 +749,62 @@ export function check(deps: PolicyCheckDeps, subject: TaskRef, action: PolicyAct
   return checkDetailed(deps, subject, action).verdict;
 }
 
+// ---------------------------------------------------------------------------
+// Write-time `repo.write` path gating (RE6: the `infra/**` exclusion)
+// ---------------------------------------------------------------------------
+
+/** One changed path from a unified diff: the `b/<path>` side of a `diff --git`. */
+const DIFF_HEADER = /^diff --git a\/.+ b\/(.+)$/gm;
+
+/**
+ * The changed paths a git diff touches (the write-time input for path-scoped
+ * `repo.write`). Reads only the `diff --git a/… b/<path>` headers, which git
+ * emits for every touched file — no hunk parsing, no heuristic content
+ * sniffing. Deterministic and deduplicated, in first-seen order.
+ */
+export function changedPathsFromDiff(diff: string): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  DIFF_HEADER.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = DIFF_HEADER.exec(diff)) !== null) {
+    const path = match[1];
+    if (path && !seen.has(path)) {
+      seen.add(path);
+      paths.push(path);
+    }
+  }
+  return paths;
+}
+
+export interface RepoWriteGateResult {
+  allowed: boolean;
+  /** The changed paths whose `repo.write` verdict was not `ALLOW`. */
+  denied: string[];
+}
+
+/**
+ * The write-time path-scoped `repo.write` gate (design §4; RE5(b)/RE6): the
+ * assignment gate binds `path:'**'` for the whole worktree, but the actual
+ * change's paths are only known once the diff exists. This folds E7's `check`
+ * over every changed path on the Task's real worktree branch, so the embedded
+ * `infra/**` exclusion (or any deployment narrowing) is enforced against the
+ * change set — not merely the branch. Fail-closed: a path whose verdict is not
+ * `ALLOW` denies the whole change set.
+ */
+export function repoWriteGate(
+  deps: PolicyCheckDeps,
+  subject: TaskRef,
+  branch: string,
+  paths: readonly string[],
+): RepoWriteGateResult {
+  const denied = paths.filter(
+    (path) =>
+      check(deps, subject, { capability: 'repo.write', resource: { branch, path } }) !== 'ALLOW',
+  );
+  return { allowed: denied.length === 0, denied };
+}
+
 /** Build the resolved chain for a Work Order from deployment + durable state. */
 export function createPolicyChain(
   deps: { store: StateStore; policy?: PolicyDocument },

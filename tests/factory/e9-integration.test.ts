@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildServerDeps, runCli, type CliIO, type ServerDepsOptions } from '../../src/cli/factory';
+import { buildGitHubAdapter, buildServerDeps, runCli, type CliIO, type ServerDepsOptions } from '../../src/cli/factory';
 import { createFactoryClient, FactoryApiError } from '../../src/factory/api/client';
 import { startFactoryServer } from '../../src/factory/api/server';
 import {
@@ -36,9 +36,23 @@ import {
   type SemanticJudge,
   type WorkVerifier,
 } from '../../src/factory/verification/orchestrator';
+import { buildEvidenceBundle } from '../../src/factory/evidence/bundle';
+import { createSemanticVerifier } from '../../src/factory/verification/semantic';
+import {
+  createGitHubAdapter,
+  type CreateBranchInput,
+  type CreatePullRequestInput,
+  type GitHubIssue,
+  type GitHubPullRequest,
+  type GitHubPullRequestDetail,
+  type GitHubTransport,
+  type IssueRef,
+  type MergePullRequestInput,
+  type PullRequestRef,
+} from '../../src/factory/github/adapter';
 import { commitDAG, listDAGVersions } from '../../src/factory/planning/dag';
-import { createEvidenceReadPort, projectObservatory } from '../../src/factory/observatory/observatory';
-import { check, emergencyStop } from '../../src/factory/policy/policy';
+import { createEvidenceReadPort, createEmptyEvidenceReadPort, projectObservatory } from '../../src/factory/observatory/observatory';
+import { answerApproval, changedPathsFromDiff, check, checkDetailed, emergencyStop, repoWriteGate } from '../../src/factory/policy/policy';
 import { CAPABILITY_POOL } from '../../src/factory/routing/rules';
 import type { BudgetState, RoutingDecisionRecord } from '../../src/factory/routing/decisionModel';
 import {
@@ -1022,12 +1036,13 @@ function driveTaskToSuccess(
   events: ReturnType<typeof openEventLog>,
   taskId: string,
   model: string,
+  diff = 'diff --git a/x b/x\n+export const x = 1;',
 ): Attempt {
   const deps = { store, events };
   const attempt = createAttempt(deps, { taskId, model });
   completeAttempt(deps, attempt.id, {
     outcome: 'success',
-    diff: 'diff --git a/x b/x\n+export const x = 1;',
+    diff,
     artifactIds: ['art_1'],
   });
   for (const to of ['READY', 'ASSIGNED', 'RUNNING', 'SUCCESS'] as const) {
@@ -2178,23 +2193,22 @@ describe('E9.6 dependency circuit breaker (spec §18.9)', () => {
         .filter((event) => (event.payload as { kind?: string }).kind === 'RETRY_NEW_ATTEMPT');
       expect(automatic).toHaveLength(1);
 
-      // After the reset window the next recovery half-opens the circuit and that
-      // retry is the single probe.
+      // After the reset window the next recovery admits the single HALF_OPEN
+      // probe. E9.8: because `recover()` delivers a *failure*, that delivery is a
+      // failed probe — it is settled (the circuit re-opens with a fresh window)
+      // and shed, rather than retried blindly. No probe is left dangling.
       h.clock.advance(30_000);
       const probe = recover(h.deps, failure({ failureIndex: 4, sameClassCount: 0 }));
-      expect(probe).toMatchObject({ kind: 'RETRY_NEW_ATTEMPT' });
-      expect(circuitSnapshot(h.deps, 'dependency')).toMatchObject({
-        state: 'HALF_OPEN',
-        probeInFlight: true,
-      });
+      expect(probe).toMatchObject({ kind: 'WAITING_RESOURCE', resource: 'dependency' });
+      const afterProbe = circuitSnapshot(h.deps, 'dependency');
+      expect(afterProbe.state).toBe('OPEN');
+      expect(afterProbe.probeInFlight).toBe(false);
+      expect(afterProbe.openedAt).toBe(h.clock.now());
 
-      // A failing probe re-opens the circuit with a fresh window and sheds again.
+      // The re-opened window sheds further deliveries until it elapses again.
       const reopenedAction = recover(h.deps, failure({ failureIndex: 5, sameClassCount: 0 }));
       expect(reopenedAction).toMatchObject({ kind: 'WAITING_RESOURCE' });
-      const reopened = circuitSnapshot(h.deps, 'dependency');
-      expect(reopened.state).toBe('OPEN');
-      expect(reopened.probeInFlight).toBe(false);
-      expect(reopened.openedAt).toBe(h.clock.now());
+      expect(circuitSnapshot(h.deps, 'dependency').state).toBe('OPEN');
 
       // A dependency success closes the circuit and resets the failure count.
       recordDependencySuccess(h.deps, 'dependency');
@@ -2454,6 +2468,652 @@ describe('E9.7 telemetry recorded on the live path', () => {
     } finally {
       server.stop();
       deps.store.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E9.8 (#34) — E6 composition + provenance: durable receipt, head-SHA pin,
+// branch-naming reconciliation, and the carried circuit/path-gate items.
+// ---------------------------------------------------------------------------
+
+/**
+ * The mocked GitHub transport for the E9.8 path (Ruling R6): records every call
+ * and hits no network. `headSha` is mutable so a test can simulate the branch
+ * moving between the gate's read-back and the merge PUT (a TOCTOU attempt).
+ */
+class E9GitHubTransport implements GitHubTransport {
+  issues = new Map<string, GitHubIssue>();
+  branchCalls: CreateBranchInput[] = [];
+  prCalls: CreatePullRequestInput[] = [];
+  prDetails = new Map<number, GitHubPullRequestDetail>();
+  /**
+   * The branch's live head, independent of the last read-back. A test moves this
+   * between the gate's `getPullRequest` and the merge PUT to simulate TOCTOU;
+   * the merge rejects when the pinned SHA no longer matches.
+   */
+  currentHeadSha = new Map<number, string>();
+  mergeCalls: MergePullRequestInput[] = [];
+  private prNumber = 500;
+
+  issueKey = (ref: IssueRef): string => `${ref.repository}#${ref.number}`;
+
+  async getIssue(ref: IssueRef): Promise<GitHubIssue> {
+    const issue = this.issues.get(this.issueKey(ref));
+    if (!issue) throw new Error(`no such issue: ${this.issueKey(ref)}`);
+    return issue;
+  }
+
+  async createBranch(input: CreateBranchInput): Promise<{ repository: string; name: string; sha: string }> {
+    this.branchCalls.push({ ...input });
+    return { repository: input.repository, name: input.branch, sha: 'sha_base' };
+  }
+
+  async createPullRequest(input: CreatePullRequestInput): Promise<GitHubPullRequest> {
+    this.prCalls.push({ ...input });
+    this.prNumber += 1;
+    const pr: GitHubPullRequest = {
+      repository: input.repository,
+      number: this.prNumber,
+      url: `https://github.com/${input.repository}/pull/${this.prNumber}`,
+      head: input.head,
+      base: input.base,
+    };
+    this.prDetails.set(pr.number, {
+      ...pr,
+      headSha: 'sha_head_1',
+      body: input.body,
+      state: 'open',
+      merged: false,
+    });
+    this.currentHeadSha.set(pr.number, 'sha_head_1');
+    return pr;
+  }
+
+  async getPullRequest(ref: PullRequestRef): Promise<GitHubPullRequestDetail> {
+    const pr = this.prDetails.get(ref.number);
+    if (!pr || pr.repository !== ref.repository) {
+      throw new Error(`no such pull request: ${ref.repository}#${ref.number}`);
+    }
+    return { ...pr };
+  }
+
+  async mergePullRequest(input: MergePullRequestInput) {
+    this.mergeCalls.push({ ...input });
+    const pr = this.prDetails.get(input.number);
+    const current = this.currentHeadSha.get(input.number) ?? pr?.headSha;
+    // GitHub's `sha` parameter: reject the merge if the head moved since the
+    // caller pinned it (the TOCTOU the head-SHA pin exists to close).
+    if (input.sha !== undefined && input.sha !== current) {
+      throw new Error(`head sha mismatch: expected ${current}, got ${input.sha}`);
+    }
+    if (pr) {
+      this.prDetails.set(input.number, { ...pr, merged: true, state: 'closed' });
+    }
+    return {
+      repository: input.repository,
+      number: input.number,
+      merged: true,
+      sha: 'merge_sha',
+      message: 'Pull request merged',
+    };
+  }
+}
+
+/** Build a genuine, complete E5 Evidence Bundle for `workOrder` on the live path. */
+async function e9Bundle(workOrder: WorkOrder): Promise<EvidenceBundle> {
+  const criteria = workOrder.acceptanceCriteria;
+  const engine = createVerificationEngine();
+  engine.registerCheck({
+    id: 'unit',
+    category: 'deterministic',
+    kind: 'unit',
+    run: () => ({ passed: true, evidence: { summary: 'unit: ok' } }),
+  });
+  engine.registerCheck({
+    id: 'contract',
+    category: 'behavioral',
+    kind: 'contract',
+    run: () => ({ passed: true, evidence: { summary: 'contract: ok' } }),
+  });
+  const changeSet = {
+    id: 'cs_e9',
+    attemptId: 'attempt_e9',
+    taskId: 'task_e9',
+    diff: 'diff --git a/counter b/counter',
+    artifactIds: [],
+  };
+  const run = await engine.verify(changeSet, {
+    criteria,
+    criterionChecks: {
+      [criteria[0]!]: ['unit'],
+      ...(criteria[1] ? { [criteria[1]]: ['contract'] } : {}),
+    },
+  });
+  const semantic = await createSemanticVerifier({
+    judge: {
+      identity: { provider: 'judge-co', model: 'judge-model' },
+      falsify: (context) =>
+        context.criteria.map((criterion) => ({
+          criterion,
+          falsified: false,
+          evidence: { summary: `${criterion}: survived` },
+        })),
+    },
+    generator: { provider: 'writer', model: 'writer-model' },
+    prompt: { id: 'verify', version: '1' },
+    rubric: ['seek counterexamples'],
+  }).verify({
+    workOrder,
+    changeSet,
+    deterministic: run.deterministic,
+    behavioral: run.behavioral,
+    criteria,
+  });
+  return buildEvidenceBundle({ workOrder, changeSet, run, semantic, attempts: [] });
+}
+
+interface E9Harness {
+  store: ReturnType<typeof openStateStore>;
+  events: ReturnType<typeof openEventLog>;
+  transport: E9GitHubTransport;
+  client: ReturnType<typeof createFactoryClient>;
+  adapter: ReturnType<typeof createGitHubAdapter>;
+  stop(): void;
+}
+
+/**
+ * The real composition seam E9.8 wires: the adapter is built by the production
+ * {@link buildGitHubAdapter} (the E6 composition root), which composes the real
+ * E7 `checkDetailed` policy and the **store-backed durable Evidence Bundle
+ * read-back**, over a loopback server (sole mutation authority).
+ */
+function e9Harness(): E9Harness {
+  const store = openStateStore(join(workDir, `e9-github-${crypto.randomUUID()}.db`));
+  const events = openEventLog(store.db);
+  const server = startFactoryServer(
+    { store, events, evidence: createEmptyEvidenceReadPort() },
+    { port: 0, hostname: '127.0.0.1' },
+  );
+  const client = createFactoryClient({ baseUrl: server.url });
+  const transport = new E9GitHubTransport();
+  const h: E9Harness = {
+    store,
+    events,
+    transport,
+    client,
+    adapter: null as unknown as ReturnType<typeof createGitHubAdapter>,
+    stop(): void {
+      server.stop();
+      store.close();
+    },
+  };
+  h.adapter = buildGitHubAdapter({
+    transport,
+    client,
+    factoryBaseUrl: 'http://factory.local:8787',
+    store,
+    events,
+  });
+  return h;
+}
+
+const E9_ISSUE: GitHubIssue = {
+  repository: 'acme/widgets',
+  number: 42,
+  title: 'Add the widget counter',
+  body: ['Acceptance criteria:', '- [ ] counter increments', '- [x] counter persists'].join('\n'),
+  labels: ['enhancement'],
+  url: 'https://github.com/acme/widgets/issues/42',
+};
+
+const E9_ON_THE_WAY_TO_GATE = [
+  'READY',
+  'PLANNING',
+  'EXECUTING',
+  'VERIFYING',
+  'EVIDENCE_READY',
+  'HUMAN_GATE',
+] as const;
+
+/** Import → … → HUMAN_GATE → APPROVED, with a genuine real bundle. */
+async function e9Approved(h: E9Harness): Promise<{ workOrder: WorkOrder; bundle: EvidenceBundle }> {
+  h.transport.issues.set(h.transport.issueKey(E9_ISSUE), E9_ISSUE);
+  const { workOrder: imported } = await h.adapter.importIssue({
+    repository: E9_ISSUE.repository,
+    number: E9_ISSUE.number,
+  });
+  let workOrder = imported;
+  for (const to of E9_ON_THE_WAY_TO_GATE) {
+    workOrder = await h.client.transitionWorkOrder(workOrder.id, { to });
+  }
+  workOrder = await h.client.applyGate(workOrder.id, 'APPROVE');
+  const bundle = await e9Bundle(workOrder);
+  return { workOrder, bundle };
+}
+
+describe('E9.8 merge receipt — durable bundle read-back by id (source of truth)', () => {
+  it('refuses a fabricated in-memory bundle that has no durable receipt', async () => {
+    const h = e9Harness();
+    try {
+      const { workOrder, bundle } = await e9Approved(h);
+      const pr = await h.adapter.openPR(bundle);
+
+      // The fabricated bundle is structurally valid but was never persisted.
+      await expect(
+        h.adapter.merge({
+          workOrderId: workOrder.id,
+          pullRequest: { repository: pr.repository, number: pr.number },
+          evidence: bundle,
+          actor: 'operator-1',
+        }),
+      ).rejects.toMatchObject({ name: 'MergeBlockedError', reason: 'EVIDENCE_NOT_PERSISTED' });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+      expect(h.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      expect(h.store.get<WorkOrder>('work_orders', workOrder.id)!.state).toBe('APPROVED');
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('refuses a claim that upgrades an incomplete durable receipt (durable value governs)', async () => {
+    const h = e9Harness();
+    try {
+      const { workOrder, bundle } = await e9Approved(h);
+      // Persist an INCOMPLETE receipt under this id; the caller claims complete.
+      h.store.set('evidence_bundles', bundle.id, { ...bundle, complete: false });
+      const pr = await h.adapter.openPR(bundle);
+
+      await expect(
+        h.adapter.merge({
+          workOrderId: workOrder.id,
+          pullRequest: { repository: pr.repository, number: pr.number },
+          evidence: { ...bundle, complete: true },
+          actor: 'operator-1',
+        }),
+      ).rejects.toMatchObject({ name: 'MergeBlockedError', reason: 'EVIDENCE_INCOMPLETE' });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+      expect(h.store.get<WorkOrder>('work_orders', workOrder.id)!.state).toBe('APPROVED');
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('merges only when the durable receipt is APPROVED + complete + policy ALLOW', async () => {
+    const h = e9Harness();
+    try {
+      const { workOrder, bundle } = await e9Approved(h);
+      h.store.set('evidence_bundles', bundle.id, bundle);
+      const pr = await h.adapter.openPR(bundle);
+      // Park + answer the production merge approval (the only §13.2 path to ALLOW).
+      checkDetailed(
+        { store: h.store, events: h.events },
+        { taskId: null, workOrderId: workOrder.id },
+        { capability: 'deploy.execute', resource: { env: 'production' } },
+      );
+      const parked = h.store
+        .list<{ id: string; type: string }>('interactions')
+        .find((row) => row.type === 'APPROVAL')!;
+      answerApproval(
+        { store: h.store, events: h.events },
+        parked.id,
+        { decision: 'APPROVAL', actor: 'operator-1' },
+      );
+
+      const outcome = await h.adapter.merge({
+        workOrderId: workOrder.id,
+        pullRequest: { repository: pr.repository, number: pr.number },
+        evidence: bundle,
+        actor: 'operator-1',
+      });
+
+      expect(outcome.merge.merged).toBe(true);
+      expect(h.store.get<WorkOrder>('work_orders', workOrder.id)!.state).toBe('MERGED');
+    } finally {
+      h.stop();
+    }
+  });
+});
+
+describe('E9.8 head-SHA pin — verified code is the merged code (no TOCTOU)', () => {
+  it('sends the verified PR head SHA on the merge PUT', async () => {
+    const h = e9Harness();
+    try {
+      const { workOrder, bundle } = await e9Approved(h);
+      h.store.set('evidence_bundles', bundle.id, bundle);
+      const pr = await h.adapter.openPR(bundle);
+      checkDetailed(
+        { store: h.store, events: h.events },
+        { taskId: null, workOrderId: workOrder.id },
+        { capability: 'deploy.execute', resource: { env: 'production' } },
+      );
+      const parked = h.store
+        .list<{ id: string; type: string }>('interactions')
+        .find((row) => row.type === 'APPROVAL')!;
+      answerApproval(
+        { store: h.store, events: h.events },
+        parked.id,
+        { decision: 'APPROVAL', actor: 'operator-1' },
+      );
+
+      await h.adapter.merge({
+        workOrderId: workOrder.id,
+        pullRequest: { repository: pr.repository, number: pr.number },
+        evidence: bundle,
+        actor: 'operator-1',
+      });
+
+      // The pinned SHA is the head the gate read back — never an unpinned merge.
+      expect(h.transport.mergeCalls).toEqual([
+        { repository: 'acme/widgets', number: pr.number, sha: 'sha_head_1' },
+      ]);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('refuses to merge when the head moved after the read-back (TOCTOU blocked)', async () => {
+    const h = e9Harness();
+    try {
+      const { workOrder, bundle } = await e9Approved(h);
+      h.store.set('evidence_bundles', bundle.id, bundle);
+      const pr = await h.adapter.openPR(bundle);
+      checkDetailed(
+        { store: h.store, events: h.events },
+        { taskId: null, workOrderId: workOrder.id },
+        { capability: 'deploy.execute', resource: { env: 'production' } },
+      );
+      const parked = h.store
+        .list<{ id: string; type: string }>('interactions')
+        .find((row) => row.type === 'APPROVAL')!;
+      answerApproval(
+        { store: h.store, events: h.events },
+        parked.id,
+        { decision: 'APPROVAL', actor: 'operator-1' },
+      );
+
+      // The head branch moves between the gate's read-back and the merge PUT:
+      // the read-back still reports sha_head_1, but the branch now points at
+      // sha_head_2, so a pinned merge must be refused by GitHub.
+      h.transport.currentHeadSha.set(pr.number, 'sha_head_2');
+
+      await expect(
+        h.adapter.merge({
+          workOrderId: workOrder.id,
+          pullRequest: { repository: pr.repository, number: pr.number },
+          evidence: bundle,
+          actor: 'operator-1',
+        }),
+      ).rejects.toThrow(/head sha mismatch/);
+      // The pin was actually sent, and the merge did not land.
+      expect(h.transport.mergeCalls[0]!.sha).toBe('sha_head_1');
+      expect(h.store.get<WorkOrder>('work_orders', workOrder.id)!.state).toBe('APPROVED');
+    } finally {
+      h.stop();
+    }
+  });
+});
+
+describe('E9.8 branch naming reconciled with E3 worktrees + the policy scope', () => {
+  it('names the E6 change-set branch in the E3 `wo-<woId>/task-<short>` namespace', async () => {
+    const h = e9Harness();
+    try {
+      h.transport.issues.set(h.transport.issueKey(E9_ISSUE), E9_ISSUE);
+      const { workOrder } = await h.adapter.importIssue({
+        repository: E9_ISSUE.repository,
+        number: E9_ISSUE.number,
+      });
+
+      const branch = await h.adapter.createBranch(workOrder);
+
+      // The branch is authorizable by the embedded `branch.create` scope
+      // (`wo-*/**`) without a bespoke deployment grant.
+      expect(branch.name).toBe(`wo-${workOrder.id}/task-${workOrder.id.slice(0, 8)}`);
+      expect(branch.name.startsWith('wo-')).toBe(true);
+      expect(branch.name).toMatch(/^wo-[^/]+\/task-.+/);
+      const decision = h.store
+        .list<{ action: { capability: string }; decision: string }>('policy_decisions')
+        .find((row) => row.action.capability === 'branch.create');
+      expect(decision?.decision).toBe('ALLOW');
+    } finally {
+      h.stop();
+    }
+  });
+});
+
+describe('E9.8 path-level repo.write gating (the infra/** exclusion) at write time', () => {
+  it('refuses a change set that writes infra/** even on a wo-* branch', () => {
+    const store = openStateStore(join(workDir, `e9-write-${crypto.randomUUID()}.db`));
+    const events = openEventLog(store.db);
+    try {
+      const { wo, task } = seedExecutingWorkOrder(store, events);
+      const branch = expectedBranch(wo.id, task.id);
+      const ref = { taskId: task.id, workOrderId: wo.id };
+
+      // A source write on the Factory branch is allowed...
+      expect(
+        check({ store, events }, ref, {
+          capability: 'repo.write',
+          resource: { branch, path: 'src/counter.ts' },
+        }),
+      ).toBe('ALLOW');
+      // ...but an infra write is outside the grant (the embedded exclusion).
+      expect(
+        check({ store, events }, ref, {
+          capability: 'repo.write',
+          resource: { branch, path: 'infra/main.tf' },
+        }),
+      ).toBe('DENY');
+      // A write with no path binding is not provably outside the excluded set.
+      expect(
+        check({ store, events }, ref, {
+          capability: 'repo.write',
+          resource: { branch },
+        }),
+      ).toBe('DENY');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('extracts changed paths from a git diff (the write-time input)', () => {
+    const diff = [
+      'diff --git a/src/counter.ts b/src/counter.ts',
+      'index 111..222 100644',
+      '--- a/src/counter.ts',
+      '+++ b/src/counter.ts',
+      '@@ -1 +1 @@',
+      '-const x = 1;',
+      '+const x = 2;',
+      'diff --git a/infra/main.tf b/infra/main.tf',
+      'index 333..444 100644',
+      '--- a/infra/main.tf',
+      '+++ b/infra/main.tf',
+      '+resource "x" "y" {}',
+    ].join('\n');
+    expect(changedPathsFromDiff(diff).sort()).toEqual(['infra/main.tf', 'src/counter.ts']);
+  });
+
+  it('rejects a SUCCESS change set that writes infra/** at verification time (never verified)', async () => {
+    const store = openStateStore(join(workDir, `e9-writepath-${crypto.randomUUID()}.db`));
+    const events = openEventLog(store.db);
+    try {
+      const workers = createWorkerManager({ store, events, spawn: () => new FakeHerdr() });
+      const worktrees = createWorktreeManager({ rootDir: join(workDir, 'wt'), baseBranch: 'main' });
+      const scheduler = createScheduler({
+        store,
+        events,
+        workers,
+        worktrees,
+        repoPath,
+        policy: {
+          canAssign: () => 'ALLOW',
+          // The live write-time gate: per-path `repo.write` over the change set.
+          canWriteChangeSet: (task, workOrder, branch, paths) =>
+            repoWriteGate({ store, events }, { taskId: task.id, workOrderId: workOrder.id }, branch, paths),
+        },
+        verifier: {
+          verify: async () => {
+            throw new Error('verifier must not be reached for a denied change set');
+          },
+        },
+      });
+      const { wo, task } = seedExecutingWorkOrder(store, events);
+      driveTaskToSuccess(store, events, task.id, 'writer-xl', 'diff --git a/infra/main.tf b/infra/main.tf\n+bad');
+
+      // The write gate settles as a completion on tick 1, routed at the start of
+      // tick 2 (mirroring the async verifier path).
+      scheduler.tick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      scheduler.tick();
+
+      // The write-time gate refused the out-of-scope path: no bundle, REWORK.
+      expect(store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      expect(store.get<Task>('tasks', task.id)!.state).toBe('REWORK');
+      expect(store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      const rejection = events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .find((event) => event.type === 'verification.rejected');
+      expect((rejection!.payload as { diagnosis: string }).diagnosis).toMatch(/infra\/main\.tf/);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe('E9.8 circuit wiring — live dependency load + HALF_OPEN probe settlement', () => {
+  const circuitFailure = (failureClass: FailureContext['failureClass'], overrides: Partial<FailureContext> = {}): FailureContext => ({
+    attemptId: `attempt_${crypto.randomUUID()}`,
+    taskId: `task_${crypto.randomUUID()}`,
+    workOrderId: `wo_${crypto.randomUUID()}`,
+    failureClass,
+    error: `${failureClass} observed`,
+    attemptCount: 0,
+    sameClassCount: 0,
+    changedCondition: 'backoff',
+    ...overrides,
+  });
+
+  function circuitHarnessConfig() {
+    const store = openStateStore(join(workDir, `e98-circuit-${crypto.randomUUID()}.db`));
+    const events = openEventLog(store.db);
+    let t = Date.parse('2026-09-30T00:00:00.000Z');
+    const clock = {
+      now: () => new Date(t).toISOString(),
+      advance: (ms: number) => {
+        t += ms;
+      },
+    };
+    const circuit = { failureThreshold: 2, resetTimeoutMs: 30_000, probeTimeoutMs: 5_000 };
+    return {
+      store,
+      events,
+      clock,
+      circuit,
+      deps: {
+        store,
+        events,
+        now: clock.now,
+        budgets: { perClassRetries: 2, backoffBaseMs: 1, backoffMaxMs: 1 },
+        circuit,
+      } as RecoveryDeps,
+      close: () => store.close(),
+    };
+  }
+
+  it('feeds DEPENDENCY_UNAVAILABLE / PROVIDER_OUTAGE / MODEL_UNAVAILABLE into the circuit', () => {
+    const h = circuitHarnessConfig();
+    try {
+      for (const failureClass of ['DEPENDENCY_UNAVAILABLE', 'PROVIDER_OUTAGE', 'MODEL_UNAVAILABLE'] as const) {
+        recover(h.deps, circuitFailure(failureClass, { failureIndex: 1, requiredModel: 'model-x' }));
+      }
+      // Each class is observed as live load: three named buckets exist, not one
+      // silently-ignored class. The provider/model classes key by the pinned model.
+      expect(circuitSnapshot(h.deps, 'dependency').consecutiveFailures).toBe(1);
+      expect(circuitSnapshot(h.deps, 'model-x').consecutiveFailures).toBe(2);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('always settles a HALF_OPEN probe it admits (a failed probe re-opens and sheds)', () => {
+    const h = circuitHarnessConfig();
+    try {
+      recover(h.deps, circuitFailure('DEPENDENCY_UNAVAILABLE', { failureIndex: 1 }));
+      // Second failure trips OPEN and sheds.
+      expect(recover(h.deps, circuitFailure('DEPENDENCY_UNAVAILABLE', { failureIndex: 2 }))).toMatchObject({
+        kind: 'WAITING_RESOURCE',
+      });
+      expect(circuitSnapshot(h.deps, 'dependency').state).toBe('OPEN');
+
+      // After the window the next failure admits a HALF_OPEN probe and — because
+      // `recover()` is a failure delivery — settles it (re-opens, no dangling
+      // probe) and sheds rather than retrying blindly.
+      h.clock.advance(30_000);
+      const probe = recover(h.deps, circuitFailure('DEPENDENCY_UNAVAILABLE', { failureIndex: 3 }));
+      expect(probe).toMatchObject({ kind: 'WAITING_RESOURCE' });
+      const settled = circuitSnapshot(h.deps, 'dependency');
+      expect(settled.state).toBe('OPEN');
+      expect(settled.probeInFlight).toBe(false);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('a settled success closes the circuit and shedding stops (recordDependencySuccess)', () => {
+    const h = circuitHarnessConfig();
+    try {
+      recover(h.deps, circuitFailure('DEPENDENCY_UNAVAILABLE', { failureIndex: 1 }));
+      recover(h.deps, circuitFailure('DEPENDENCY_UNAVAILABLE', { failureIndex: 2 }));
+      expect(circuitSnapshot(h.deps, 'dependency').state).toBe('OPEN');
+
+      recordDependencySuccess(h.deps, 'dependency');
+      expect(circuitSnapshot(h.deps, 'dependency')).toMatchObject({
+        state: 'CLOSED',
+        consecutiveFailures: 0,
+        probeInFlight: false,
+      });
+      // Load flows again: the next failure is not shed (it is retried within
+      // the bounded wheel, and only then counts toward a fresh window).
+      expect(recover(h.deps, circuitFailure('DEPENDENCY_UNAVAILABLE', { failureIndex: 3 }))).toMatchObject({
+        kind: 'RETRY_NEW_ATTEMPT',
+      });
+    } finally {
+      h.close();
+    }
+  });
+
+  it('a directly-admitted probe that is never settled times out (no permanent half-open)', () => {
+    const h = circuitHarnessConfig();
+    try {
+      recordDependencyFailure(h.deps, 'dependency', h.circuit);
+      recordDependencyFailure(h.deps, 'dependency', h.circuit);
+      expect(circuitSnapshot(h.deps, 'dependency').state).toBe('OPEN');
+
+      h.clock.advance(30_000);
+      // The gate admits the probe; nothing settles it.
+      expect(beforeDependencyRequest(h.deps, 'dependency', h.circuit)).toMatchObject({
+        allowed: true,
+        state: 'HALF_OPEN',
+      });
+      expect(circuitSnapshot(h.deps, 'dependency').probeInFlight).toBe(true);
+
+      // While in flight (within the probe window) further calls are shed.
+      h.clock.advance(1_000);
+      expect(beforeDependencyRequest(h.deps, 'dependency', h.circuit)).toMatchObject({
+        allowed: false,
+        state: 'HALF_OPEN',
+      });
+
+      // Past the probe timeout the dangling probe is reaped: the gate re-opens
+      // (fresh window) instead of shedding forever.
+      h.clock.advance(5_000);
+      const reaped = beforeDependencyRequest(h.deps, 'dependency', h.circuit);
+      expect(reaped.allowed).toBe(false);
+      expect(reaped.state).toBe('OPEN');
+      expect(circuitSnapshot(h.deps, 'dependency').probeInFlight).toBe(false);
+    } finally {
+      h.close();
     }
   });
 });

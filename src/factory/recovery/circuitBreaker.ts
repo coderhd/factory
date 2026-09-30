@@ -45,11 +45,20 @@ export interface CircuitConfig {
   failureThreshold: number;
   /** How long an OPEN circuit sheds before it half-opens for a probe. */
   resetTimeoutMs: number;
+  /**
+   * How long a HALF_OPEN probe may stay in flight before it is reaped. A probe
+   * that is admitted but never settled (the caller neither reports success nor
+   * failure) would otherwise shed every dependent call forever — this bounds it:
+   * past the timeout the probe is treated as failed and the circuit re-opens
+   * with a fresh window.
+   */
+  probeTimeoutMs: number;
 }
 
 export const DEFAULT_CIRCUIT_CONFIG: CircuitConfig = {
   failureThreshold: 3,
   resetTimeoutMs: 30_000,
+  probeTimeoutMs: 30_000,
 };
 
 export interface CircuitDeps {
@@ -129,8 +138,24 @@ export function beforeDependencyRequest(
   if (snapshot.state === 'CLOSED') return { allowed: true, state: 'CLOSED' };
 
   if (snapshot.state === 'HALF_OPEN') {
-    // A half-open window admits a single probe. While one is in flight, shed.
-    if (snapshot.probeInFlight) return { allowed: false, state: 'HALF_OPEN' };
+    // A half-open window admits a single probe. While one is in flight, shed —
+    // unless the probe has outlived `probeTimeoutMs`, in which case it is reaped
+    // as failed (the caller never settled it) and the circuit re-opens with a
+    // fresh window. This guarantees no permanently-stuck HALF_OPEN.
+    if (snapshot.probeInFlight) {
+      const admittedMs = snapshot.updatedAt ? Date.parse(snapshot.updatedAt) : Date.parse(at);
+      if (Date.parse(at) - admittedMs < cfg.probeTimeoutMs) {
+        return { allowed: false, state: 'HALF_OPEN' };
+      }
+      appendState(deps, {
+        ...snapshot,
+        state: 'OPEN',
+        openedAt: at,
+        probeInFlight: false,
+        updatedAt: at,
+      });
+      return { allowed: false, state: 'OPEN', retryAfterMs: cfg.resetTimeoutMs };
+    }
     appendState(deps, { ...snapshot, probeInFlight: true, updatedAt: at });
     return { allowed: true, state: 'HALF_OPEN' };
   }

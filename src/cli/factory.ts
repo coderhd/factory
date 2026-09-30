@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createFactoryClient } from '../factory/api/client';
+import { createFactoryClient, type FactoryClient } from '../factory/api/client';
 import { startFactoryServer, type FactoryServerDeps } from '../factory/api/server';
 import { createBackup, restoreBackup } from '../factory/backup/archive';
 import {
@@ -12,9 +12,15 @@ import {
   serializeFactoryConfig,
   type FactoryRuntimeConfig,
 } from '../factory/config/factoryConfig';
+import type { EvidenceBundle } from '../factory/evidence/bundle';
+import {
+  createGitHubAdapter,
+  type GitHubAdapter,
+  type GitHubTransport,
+} from '../factory/github/adapter';
 import { openEventLog, type EventLog } from '../factory/events/log';
 import { createEvidenceReadPort } from '../factory/observatory/observatory';
-import { check } from '../factory/policy/policy';
+import { check, checkDetailed, repoWriteGate } from '../factory/policy/policy';
 import type { DAGProposalPayload } from '../factory/planning/dag';
 import { reconcileAfterRestart } from '../factory/recovery/recovery';
 import { createScheduler, type SchedulerPolicy } from '../factory/scheduler/scheduler';
@@ -153,13 +159,11 @@ function ensureStorageDirs(runtime: FactoryRuntimeConfig): void {
  * The E3 `SchedulerPolicy` adapter (E9.1 ruling RE5): assignment is an E7
  * `repo.write` decision on the Task's real worktree branch
  * (`wo-<workOrderId>/task-<short>`), binding `path: '**'` — the whole-worktree
- * binding at assignment time. Path-level `repo.write` enforcement (the embedded
- * default's `infra&#47;**` exclusion applied to an actual change path) is **not
- * yet wired anywhere**: the assignment gate is today's only `repo.write` check,
- * and E6 gates only `branch.create`/`pr.create`. That write-time path-scoped
- * enforcer is pending and owned by E9.8 (#34). `ALLOW` assigns; a
- * `REQUIRE_HUMAN`/`DENY` verdict leaves the Task `READY` and is surfaced by the
- * scheduler's `blockedPolicy`.
+ * binding at assignment time. The **write-time** path gate (E9.8, RE6) folds
+ * `repo.write` over the change set's actual changed paths, so the embedded
+ * `infra/**` exclusion is enforced against the diff and not merely the branch.
+ * `ALLOW` assigns; a `REQUIRE_HUMAN`/`DENY` verdict leaves the Task `READY` and
+ * is surfaced by the scheduler's `blockedPolicy`.
  */
 export function createSchedulerPolicy(deps: {
   store: StateStore;
@@ -171,6 +175,8 @@ export function createSchedulerPolicy(deps: {
         capability: 'repo.write',
         resource: { branch: taskWorktreeBranch(task.id, workOrder.id), path: '**' },
       }),
+    canWriteChangeSet: (task, workOrder, branch, paths) =>
+      repoWriteGate(deps, { taskId: task.id, workOrderId: workOrder.id }, branch, paths),
   };
 }
 
@@ -267,6 +273,36 @@ export function buildServerDeps(
     version: runtime.factoryVersion,
     schemaVersion: runtime.schemaVersion,
   };
+}
+
+/**
+ * The E6 composition root (E9.8, #34): construct the GitHub adapter with the
+ * **real** deps — the E2 client (sole mutation authority), the E7
+ * `checkDetailed` policy (so `branch.create`/`pr.create`/merge gates run against
+ * live policy), and the durable `evidence_bundles` read-back (so the merge gate
+ * trusts the persisted receipt, never a caller-supplied bundle). Production
+ * supplies the concrete transport (a GitHub REST client); tests mock it (R6).
+ *
+ * The Factory never constructs a second GitHub path: this is the only place the
+ * E6 adapter is wired, mirroring `buildServerDeps`.
+ */
+export function buildGitHubAdapter(input: {
+  transport: GitHubTransport;
+  client: FactoryClient;
+  factoryBaseUrl: string;
+  store: StateStore;
+  events: EventLog;
+  baseBranch?: string;
+}): GitHubAdapter {
+  return createGitHubAdapter({
+    transport: input.transport,
+    client: input.client,
+    factoryBaseUrl: input.factoryBaseUrl,
+    ...(input.baseBranch ? { baseBranch: input.baseBranch } : {}),
+    checkPolicy: (subject, action) =>
+      checkDetailed({ store: input.store, events: input.events }, subject, action),
+    readEvidence: (id) => input.store.get<EvidenceBundle>('evidence_bundles', id),
+  });
 }
 
 async function cmdInit(args: ParsedArgs, io: CliIO): Promise<number> {

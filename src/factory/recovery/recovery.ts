@@ -10,6 +10,8 @@ import {
 import { isEmergencyStopped, isFactoryPaused } from '../policy/policy';
 import {
   beforeDependencyRequest,
+  circuitSnapshot,
+  DEFAULT_CIRCUIT_CONFIG,
   recordDependencyFailure,
   type CircuitConfig,
 } from './circuitBreaker';
@@ -454,13 +456,34 @@ export function recover(deps: RecoveryDeps, failure: FailureContext): RecoveryAc
 
   if (CIRCUIT_FAILURE_CLASSES.has(failure.failureClass)) {
     const dependency = dependencyKeyFor(failure);
-    recordDependencyFailure(deps, dependency, deps.circuit);
+    // Gate first: an OPEN circuit sheds (and, past the probe window, admits the
+    // single HALF_OPEN probe). A shed is not evidence about the dependency, so it
+    // is not recorded as a failure — an OPEN circuit keeps its existing window.
     const gate = beforeDependencyRequest(deps, dependency, deps.circuit);
     if (!gate.allowed) {
       const shed: RecoveryAction = {
         kind: 'WAITING_RESOURCE',
         resource: dependency,
         ...(gate.retryAfterMs !== undefined ? { retryAfterMs: gate.retryAfterMs } : {}),
+      };
+      applyAction(deps, failure, shed, key);
+      return shed;
+    }
+    // The operation was admitted: this delivery is live evidence about the
+    // dependency. Count the failure — which trips OPEN at the threshold, or
+    // re-opens a HALF_OPEN probe. This settles every probe `recover()` admits
+    // (a failure delivery is, by construction, a failed probe), so no probe is
+    // left dangling.
+    recordDependencyFailure(deps, dependency, deps.circuit);
+    const settled = circuitSnapshot(deps, dependency);
+    if (settled.state === 'OPEN') {
+      // The failure tripped the circuit (threshold) or failed a HALF_OPEN probe.
+      // Shed this delivery; a freshly-opened window leaves the full reset time.
+      const config = { ...DEFAULT_CIRCUIT_CONFIG, ...(deps.circuit ?? {}) };
+      const shed: RecoveryAction = {
+        kind: 'WAITING_RESOURCE',
+        resource: dependency,
+        retryAfterMs: gate.retryAfterMs ?? config.resetTimeoutMs,
       };
       applyAction(deps, failure, shed, key);
       return shed;
