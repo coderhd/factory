@@ -15,7 +15,7 @@ import type { BudgetState, ModelId } from '../routing/decisionModel';
 import { persistRoutingDecision } from '../routing/persist';
 import { RoutingBlockedError, toRoutingDecisionRecord } from '../routing/rules';
 import type { ArtifactStore, StateStore } from '../state/store';
-import type { WorkerInteraction, WorkerResult } from '../workers/herdr';
+import type { WorkerAnswer, WorkerInteraction, WorkerResult } from '../workers/herdr';
 import {
   assign,
   openAssignmentFor,
@@ -109,6 +109,12 @@ export interface Scheduler {
   start(): void;
   stop(): void;
   status(): SchedulerStatus;
+  /**
+   * Deliver a human answer into the runtime holding `workerId` (E9.5). The
+   * durable interaction is already persisted by the server; this is the live
+   * channel that unparks a `waiting_input` runtime.
+   */
+  deliverAnswer(workerId: string, answer: WorkerAnswer): Promise<void>;
 }
 
 /** Event vocabulary for persisted §12 interactions (E1 `<aggregate>.<verb>` style). */
@@ -216,14 +222,15 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
   const completions: Completion[] = [];
   const pending = new Set<string>();
   /**
-   * Route-time settle guard: the exact `WorkerResult` object already routed for
-   * a worker. A resumed Task (WAITING_INPUT → RUNNING) would otherwise re-collect
-   * the adapter's still-settled report and re-ask the same question forever. The
-   * object identity is stable across polls (the adapter returns the same settled
-   * report until the next `execute`), so dropping the identical object is
-   * consume-once; a genuinely new run settles a fresh object and is routed.
+   * Route-time settle guard: the signature of the exact `WorkerResult` content
+   * already routed for a worker's live Attempt. A resumed Task
+   * (WAITING_INPUT → RUNNING) would otherwise re-collect the adapter's still-
+   * settled report and re-ask the same question forever. The guard is
+   * content-based (not object identity) so it holds even when an adapter returns
+   * a fresh copy of the same report on every poll; `attemptId` scopes it so a
+   * genuinely new Attempt (or a new question on the same Attempt) is routed.
    */
-  const routedReports = new Map<string, WorkerResult>();
+  const routedReports = new Map<string, { attemptId: string; signature: string }>();
   /**
    * E9.3: READY tasks a blocked route refused this tick, rendered by `status()`.
    * Recomputed each assign pass; a blocked Task stays READY and is retried next
@@ -349,6 +356,21 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     );
   }
 
+  /**
+   * The content signature of a routed report (E9.5). Keyed per Attempt so the
+   * same report polled twice is consumed once, while a new question, a new
+   * completion or a new Attempt routes afresh.
+   */
+  function reportSignature(result: WorkerResult): string {
+    return JSON.stringify({
+      status: result.status,
+      interactions: result.interactions,
+      commits: result.commits,
+      diff: result.diff,
+      failure: result.failure,
+    });
+  }
+
   function storeArtifacts(attemptId: string, result: WorkerResult): string[] {
     return result.artifacts.map((artifact) => {
       if (!deps.artifacts) return artifact.name;
@@ -418,9 +440,15 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     const attemptId = worker.lease.attemptId;
     const result = item.result;
 
-    // Consume-once: a report already routed for this worker must not be routed
-    // again off a later poll (the answer loop would re-ask the same question).
-    if (result && routedReports.get(item.workerId) === result) return;
+    // Consume-once: a report whose content was already routed for this Attempt
+    // must not be routed again off a later poll (the answer loop would re-ask
+    // the same question).
+    if (result) {
+      const routed = routedReports.get(item.workerId);
+      if (routed && routed.attemptId === attemptId && routed.signature === reportSignature(result)) {
+        return;
+      }
+    }
 
     // A question is not a completion: worker stays BUSY, lease/assignment stay
     // open, and the durable §12 interaction(s) are written alongside the Task
@@ -431,7 +459,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         recordInteractions(worker.id, task.id, attemptId, result.interactions, t);
         transitionTask(deps, task.id, { to: 'WAITING_INPUT' });
       })();
-      routedReports.set(worker.id, result);
+      routedReports.set(worker.id, { attemptId, signature: reportSignature(result) });
       return;
     }
 
@@ -911,5 +939,8 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       timer = null;
     },
     status,
+    async deliverAnswer(workerId, answer): Promise<void> {
+      await deps.workers.deliverAnswer(workerId, answer);
+    },
   };
 }

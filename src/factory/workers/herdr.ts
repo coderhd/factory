@@ -48,6 +48,17 @@ export interface WorkerInteraction {
   question: string;
 }
 
+/**
+ * A human answer delivered back into a running runtime (spec §12). The Factory
+ * persists the durable interaction; this is the live channel that lets a
+ * `waiting_input` runtime continue instead of sitting parked.
+ */
+export interface WorkerAnswer {
+  interactionId: string;
+  question: string;
+  response: string;
+}
+
 export type WorkerReportStatus = 'completed' | 'failed' | 'waiting_input';
 
 /** Worker → Factory report collected by the scheduler's collect step (spec §17). */
@@ -81,6 +92,12 @@ export interface WorkerAdapter {
   resume(): Promise<void>;
   status(): Promise<WorkerStatus>;
   execute(envelope: ExecutionEnvelope): Promise<void>;
+  /**
+   * Push a human answer into the running runtime (spec §12). The durable
+   * interaction is already persisted by the Factory; this is the live channel
+   * that unparks a `waiting_input` runtime so it can continue.
+   */
+  deliverAnswer(answer: WorkerAnswer): Promise<void>;
   collectArtifacts(): Promise<WorkerResult>;
   destroy(): Promise<void>;
 }
@@ -251,6 +268,16 @@ export function createHerdrWorker(options: HerdrOptions = {}): WorkerAdapter {
         return;
       }
       child.stdin.write(`${JSON.stringify(envelope)}\n`);
+      heartbeat();
+    },
+    async deliverAnswer(answer: WorkerAnswer): Promise<void> {
+      // Same NDJSON protocol as the envelope: one JSON answer line on stdin,
+      // tagged so the runtime can tell an answer from an envelope.
+      if (!child?.stdin) {
+        result = emptyResult('herdr runtime is not running; answer not delivered');
+        return;
+      }
+      child.stdin.write(`${JSON.stringify({ type: 'answer', ...answer })}\n`);
       heartbeat();
     },
     async collectArtifacts(): Promise<WorkerResult> {

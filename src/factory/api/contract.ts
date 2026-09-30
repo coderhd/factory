@@ -1,5 +1,6 @@
 import type { Attempt, Task, WorkOrder } from '../domain/workOrder';
 import type { DailyThroughput, HumanHourThroughput, DrillDownStage } from '../observatory/observatory';
+import type { ApprovalRecord } from '../policy/policy';
 import type { DAGVersion, RecordedProposal } from '../planning/dag';
 import type { SchedulerStatus } from '../scheduler/scheduler';
 
@@ -69,6 +70,21 @@ export interface AnswerResultDto {
   interaction: InteractionDto;
   task: Task;
   workOrder: WorkOrder | null;
+}
+
+/**
+ * The E9.5 approval answer (spec §13). A human answers a §5.2 approval park:
+ * `APPROVAL` authorizes the consuming decision (E7 spends it), `DENY` settles
+ * it as refused. The `actor` is the durable operator receipt.
+ */
+export interface ApprovalAnswerRequest {
+  decision: 'APPROVAL' | 'DENY';
+  actor: string;
+  comment?: string;
+}
+
+export interface ApprovalsDto {
+  approvals: ApprovalRecord[];
 }
 
 export interface SchedulerStatusDto {

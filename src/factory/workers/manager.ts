@@ -9,7 +9,7 @@ import {
 import type { EventLog } from '../events/log';
 import type { SchedulerDeps } from '../scheduler/scheduler';
 import type { StateStore } from '../state/store';
-import type { ExecutionEnvelope, WorkerAdapter, WorkerResult, WorkerStatus } from './herdr';
+import type { ExecutionEnvelope, WorkerAdapter, WorkerAnswer, WorkerResult, WorkerStatus } from './herdr';
 
 /**
  * E3.2 WorkerManager façade (spec §15/§16). Workers are durable JSON documents
@@ -68,6 +68,7 @@ export interface WorkerManager {
   listWorkers(): WorkerRecord[];
   status(workerId: string): Promise<WorkerStatus>;
   execute(workerId: string, envelope: ExecutionEnvelope): Promise<void>;
+  deliverAnswer(workerId: string, answer: WorkerAnswer): Promise<void>;
   collectArtifacts(workerId: string): Promise<WorkerResult>;
 }
 
@@ -243,6 +244,18 @@ export function createWorkerManager(deps: WorkerManagerDeps): WorkerManager {
       const failure = dispatchFailures.get(workerId);
       if (failure) return failedResult(failure);
       return adapter.collectArtifacts();
+    },
+
+    async deliverAnswer(workerId, answer): Promise<void> {
+      const adapter = adapters.get(workerId);
+      if (!adapter) throw new FactoryError('WORKER_NOT_FOUND', `worker not found: ${workerId}`);
+      // The dispatch run must not still be in flight; an answer belongs to a
+      // runtime that has already reported `waiting_input`.
+      const run = runs.get(workerId);
+      if (run) await run;
+      const boot = boots.get(workerId);
+      if (boot) await boot;
+      await adapter.deliverAnswer(answer);
     },
   };
 }

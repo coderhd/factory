@@ -544,6 +544,43 @@ async function cmdObservatory(args: ParsedArgs, io: CliIO): Promise<number> {
   return 0;
 }
 
+async function cmdApprovals(args: ParsedArgs, io: CliIO): Promise<number> {
+  const sub = args.positionals[1];
+  const url = resolveUrl(args, io);
+  if (!url) {
+    io.err('no server URL; pass --url or start the server first');
+    return 1;
+  }
+  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+
+  if (sub === 'list') {
+    const status = flag(args, 'status') as 'PENDING' | 'ANSWERED' | 'SPENT' | undefined;
+    io.out(JSON.stringify(await client.listApprovals(status)));
+    return 0;
+  }
+
+  if (sub === 'answer') {
+    const id = args.positionals[2];
+    const decision = flag(args, 'decision');
+    const actor = flag(args, 'actor');
+    if (!id || (decision !== 'APPROVAL' && decision !== 'DENY') || !actor) {
+      io.err('usage: factory approvals answer <approvalId> --decision APPROVAL|DENY --actor <id> [--comment <text>] [--url <url>]');
+      return 1;
+    }
+    const comment = flag(args, 'comment');
+    const approval = await client.answerApproval(id, {
+      decision,
+      actor,
+      ...(comment ? { comment } : {}),
+    });
+    io.out(JSON.stringify(approval));
+    return 0;
+  }
+
+  io.err(`unknown approvals subcommand: ${sub ?? ''}`);
+  return 1;
+}
+
 const HELP = [
   'factory <command>',
   '',
@@ -558,6 +595,8 @@ const HELP = [
   '  wo status <workOrderId> [--url]        read Work Order status',
   '  wo plan <workOrderId> --dag <file>     commit a planner DAG proposal',
   '  wo answer <interactionId> <response>   answer a QUESTION',
+  '  approvals list [--status <state>]      list policy approvals',
+  '  approvals answer <approvalId> --decision APPROVAL|DENY --actor <id>  answer an approval',
   '  observatory [--url]                    read Observatory projections',
 ].join('\n');
 
@@ -584,6 +623,8 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         return await cmdRestore(args, io);
       case 'wo':
         return await cmdWo(args, io);
+      case 'approvals':
+        return await cmdApprovals(args, io);
       case 'observatory':
         return await cmdObservatory(args, io);
       case 'help':

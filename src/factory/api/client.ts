@@ -1,7 +1,9 @@
 import type { WorkOrder, WorkOrderIntent, WorkOrderTransition } from '../domain/workOrder';
 import type { DAGProposalPayload } from '../planning/dag';
+import type { ApprovalRecord } from '../policy/policy';
 import type {
   AnswerResultDto,
+  ApprovalAnswerRequest,
   CommitDagResultDto,
   DrillDownDto,
   GateDecision,
@@ -48,6 +50,8 @@ export interface FactoryClient {
   commitDag(id: string, payload: DAGProposalPayload): Promise<CommitDagResultDto>;
   listInteractions(status?: InteractionDto['status']): Promise<InteractionDto[]>;
   answerInteraction(id: string, response: string): Promise<AnswerResultDto>;
+  listApprovals(status?: ApprovalRecord['status']): Promise<ApprovalRecord[]>;
+  answerApproval(id: string, answer: ApprovalAnswerRequest): Promise<ApprovalRecord>;
   schedulerStatus(): Promise<SchedulerStatusDto>;
   observatory(): Promise<ObservatoryDto>;
   drillDown(workOrderId: string): Promise<DrillDownDto>;
@@ -122,6 +126,22 @@ export function createFactoryClient(options: FactoryClientOptions): FactoryClien
     },
     answerInteraction: (id, response) =>
       request<AnswerResultDto>('POST', `/interactions/${id}/answer`, { response }),
+    async listApprovals(status): Promise<ApprovalRecord[]> {
+      const query = status === undefined ? '' : `?status=${encodeURIComponent(status)}`;
+      const { approvals } = await request<{ approvals: ApprovalRecord[] }>(
+        'GET',
+        `/approvals${query}`,
+      );
+      return approvals;
+    },
+    async answerApproval(id, answer): Promise<ApprovalRecord> {
+      const { approval } = await request<{ approval: ApprovalRecord }>(
+        'POST',
+        `/approvals/${id}/answer`,
+        answer,
+      );
+      return approval;
+    },
     schedulerStatus: () => request<SchedulerStatusDto>('GET', '/scheduler'),
     observatory: () => request<ObservatoryDto>('GET', '/observatory'),
     drillDown: (workOrderId) =>

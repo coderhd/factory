@@ -44,9 +44,11 @@ import type { BudgetState, RoutingDecisionRecord } from '../../src/factory/routi
 import { RESOURCE_UNAVAILABLE } from '../../src/factory/recovery/recovery';
 import { createScheduler, type SchedulerRouting } from '../../src/factory/scheduler/scheduler';
 import { openStateStore } from '../../src/factory/state/store';
+import type { ApprovalRecord } from '../../src/factory/policy/policy';
 import {
   type ExecutionEnvelope,
   type WorkerAdapter,
+  type WorkerAnswer,
   type WorkerResult,
   type WorkerStatus,
 } from '../../src/factory/workers/herdr';
@@ -93,6 +95,7 @@ afterEach(() => {
 
 class FakeHerdr implements WorkerAdapter {
   envelope: ExecutionEnvelope | null = null;
+  delivered: WorkerAnswer[] = [];
   async provision(): Promise<void> {}
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
@@ -115,6 +118,9 @@ class FakeHerdr implements WorkerAdapter {
       diff: null,
       failure: 'not run',
     };
+  }
+  async deliverAnswer(answer: WorkerAnswer): Promise<void> {
+    this.delivered.push(answer);
   }
   async destroy(): Promise<void> {}
 }
@@ -1452,6 +1458,354 @@ describe('E9.4 verification + evidence orchestration', () => {
         .filter((event) => event.type === 'work_order.transitioned')
         .map((event) => (event.payload as { workOrder: WorkOrder }).workOrder.state);
       expect(states).not.toContain('HUMAN_GATE');
+    } finally {
+      h.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E9.5 (#31) — human loops: approval answering + worker answer delivery
+// ---------------------------------------------------------------------------
+
+/**
+ * A controllable Herdr adapter for the human loops. `result` is the runtime's
+ * next report; `collectArtifacts` returns a *fresh copy* each call so the
+ * scheduler's consume-once guard is exercised on content, not object identity —
+ * exactly the "stale report re-collected" hazard the answer loop must survive.
+ * `deliverAnswer` records what the runtime received (the answer channel).
+ */
+class ControllableHerdr implements WorkerAdapter {
+  result: WorkerResult | null = null;
+  envelope: ExecutionEnvelope | null = null;
+  delivered: WorkerAnswer[] = [];
+  async provision(): Promise<void> {}
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  async pause(): Promise<void> {}
+  async resume(): Promise<void> {}
+  async status(): Promise<WorkerStatus> {
+    const state: WorkerStatus['state'] = this.result
+      ? this.result.status === 'completed'
+        ? 'completed'
+        : this.result.status === 'waiting_input'
+          ? 'waiting_input'
+          : 'failed'
+      : 'running';
+    return { state, lastHeartbeatAt: new Date().toISOString() };
+  }
+  async execute(envelope: ExecutionEnvelope): Promise<void> {
+    this.envelope = envelope;
+  }
+  async collectArtifacts(): Promise<WorkerResult> {
+    return structuredClone(this.result ?? failedWorkerResult('no result produced'));
+  }
+  async deliverAnswer(answer: WorkerAnswer): Promise<void> {
+    this.delivered.push(answer);
+  }
+  async destroy(): Promise<void> {}
+}
+
+function failedWorkerResult(failure: string): WorkerResult {
+  return {
+    status: 'failed',
+    commits: [],
+    artifacts: [],
+    interactions: [],
+    observations: [],
+    verificationRequests: [],
+    diff: null,
+    failure,
+  };
+}
+
+function waitingWorkerResult(question: string): WorkerResult {
+  return {
+    status: 'waiting_input',
+    commits: [],
+    artifacts: [],
+    interactions: [{ question }],
+    observations: [],
+    verificationRequests: [],
+    diff: null,
+    failure: null,
+  };
+}
+
+function completedWorkerResult(): WorkerResult {
+  return {
+    status: 'completed',
+    commits: [{ sha: 'cafe', message: 'after the answer' }],
+    artifacts: [],
+    interactions: [],
+    observations: [],
+    verificationRequests: [],
+    diff: 'diff --git a/x b/x\n+done',
+    failure: null,
+  };
+}
+
+/** A real server (real `buildServerDeps` wiring) plus its spawned adapters. */
+function humanLoopHarness(initial?: WorkerResult) {
+  const runtime = runtimeFrom(configText());
+  const adapters: ControllableHerdr[] = [];
+  const deps = buildServerDeps(runtime, {
+    spawn: () => {
+      const adapter = new ControllableHerdr();
+      if (initial) adapter.result = structuredClone(initial);
+      adapters.push(adapter);
+      return adapter;
+    },
+    now: () => new Date().toISOString(),
+  });
+  const server = startFactoryServer(deps);
+  const client = createFactoryClient({ baseUrl: server.url });
+  return {
+    store: deps.store,
+    events: deps.events,
+    adapters,
+    scheduler: deps.scheduler!,
+    client,
+    url: server.url,
+    async poll(): Promise<void> {
+      // Let the async adapter dispatch/collect settle between ticks.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    },
+    close(): void {
+      server.stop();
+      deps.store.close();
+    },
+  };
+}
+
+const approvalsIn = (store: ReturnType<typeof openStateStore>): ApprovalRecord[] =>
+  store.list<ApprovalRecord>('interactions').filter((row) => row.type === 'APPROVAL');
+
+describe('E9.5 approval answering — REQUIRE_HUMAN park answerable end-to-end', () => {
+  it('answers a parked approval through the API and the decision proceeds on APPROVAL', async () => {
+    const h = humanLoopHarness();
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events, {
+        // The Work Order narrows repo.write to REQUIRE_HUMAN, so the assignment
+        // gate parks an approval instead of assigning.
+        constraints: ['policy:repo.write=require_human'],
+      });
+
+      h.scheduler.tick();
+      await h.poll();
+
+      const parked = approvalsIn(h.store);
+      expect(parked).toHaveLength(1);
+      expect(parked[0]!.status).toBe('PENDING');
+      expect(parked[0]!.workOrderId).toBe(wo.id);
+      expect(parked[0]!.binding.capability).toBe('repo.write');
+      expect(h.store.get<Task>('tasks', task.id)!.state).not.toBe('RUNNING');
+
+      // The approval is discoverable and answerable over the API contract.
+      const listed = await h.client.listApprovals('PENDING');
+      expect(listed.map((row) => row.id)).toContain(parked[0]!.id);
+
+      const answered = await h.client.answerApproval(parked[0]!.id, {
+        decision: 'APPROVAL',
+        actor: 'operator-1',
+        comment: 'proceed',
+      });
+      expect(answered.status).toBe('ANSWERED');
+      expect(answered.response?.actor).toBe('operator-1');
+      expect(answered.response?.decision).toBe('APPROVAL');
+
+      // The receipt is durable: an approval.answered event carries actor+decision.
+      const receipt = h.events
+        .readEvents({ aggregateType: 'interaction', aggregateId: parked[0]!.id })
+        .find((event) => event.type === 'interaction.approval_answered');
+      expect(receipt).toBeDefined();
+      expect((receipt!.payload as { approval: ApprovalRecord }).approval.response?.actor).toBe(
+        'operator-1',
+      );
+
+      // The consuming decision proceeds: the next gate check consumes the
+      // approval and the assignment goes through (ALLOW), spending it once.
+      h.scheduler.tick();
+      await h.poll();
+
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('RUNNING');
+      const spent = h.store.get<ApprovalRecord>('interactions', parked[0]!.id)!;
+      expect(spent.status).toBe('SPENT');
+      expect(spent.spentByDecisionId).toBeString();
+      expect(approvalsIn(h.store)).toHaveLength(1);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('keeps the gate standing on DENY and refuses to re-answer a spent approval', async () => {
+    const h = humanLoopHarness();
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events, {
+        constraints: ['policy:repo.write=require_human'],
+      });
+      h.scheduler.tick();
+      await h.poll();
+
+      const parked = approvalsIn(h.store)[0]!;
+      const denied = await h.client.answerApproval(parked.id, {
+        decision: 'DENY',
+        actor: 'operator-2',
+      });
+      expect(denied.status).toBe('ANSWERED');
+      expect(denied.response?.decision).toBe('DENY');
+
+      // A DENY is never consumed: the gate stands and the Task stays unassigned.
+      h.scheduler.tick();
+      await h.poll();
+      expect(h.store.get<Task>('tasks', task.id)!.state).not.toBe('RUNNING');
+      expect(h.store.get<ApprovalRecord>('interactions', parked.id)!.status).toBe('ANSWERED');
+      // No duplicate approval is parked while the answered one stands.
+      expect(approvalsIn(h.store)).toHaveLength(1);
+      expect(wo.id).toBe(parked.workOrderId);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('rejects an unknown approval (404), a missing actor (400) and a spent approval (409)', async () => {
+    const h = humanLoopHarness();
+    try {
+      await expect(
+        h.client.answerApproval('appr_missing', { decision: 'APPROVAL', actor: 'operator-1' }),
+      ).rejects.toMatchObject({ code: 'APPROVAL_NOT_FOUND', status: 404 });
+
+      const { task } = seedExecutingWorkOrder(h.store, h.events, {
+        constraints: ['policy:repo.write=require_human'],
+      });
+      h.scheduler.tick();
+      await h.poll();
+      const parked = approvalsIn(h.store)[0]!;
+
+      await expect(
+        h.client.answerApproval(parked.id, { decision: 'APPROVAL', actor: '' }),
+      ).rejects.toMatchObject({ code: 'APPROVAL_ACTOR_REQUIRED', status: 400 });
+
+      await h.client.answerApproval(parked.id, { decision: 'APPROVAL', actor: 'operator-1' });
+      h.scheduler.tick();
+      await h.poll();
+      expect(h.store.get<ApprovalRecord>('interactions', parked.id)!.status).toBe('SPENT');
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('RUNNING');
+
+      await expect(
+        h.client.answerApproval(parked.id, { decision: 'DENY', actor: 'operator-1' }),
+      ).rejects.toMatchObject({ code: 'APPROVAL_SPENT', status: 409 });
+    } finally {
+      h.close();
+    }
+  });
+
+  it('answers an approval from the CLI (`factory approvals answer`)', async () => {
+    const h = humanLoopHarness();
+    try {
+      seedExecutingWorkOrder(h.store, h.events, {
+        constraints: ['policy:repo.write=require_human'],
+      });
+      h.scheduler.tick();
+      await h.poll();
+      const parked = approvalsIn(h.store)[0]!;
+
+      const cap = capture(workDir);
+      const code = await runCli(
+        ['approvals', 'answer', parked.id, '--decision', 'APPROVAL', '--actor', 'operator-7', '--url', h.url],
+        cap.io,
+      );
+      expect(code).toBe(0);
+      const out = JSON.parse(cap.out()) as ApprovalRecord;
+      expect(out.status).toBe('ANSWERED');
+      expect(out.response?.actor).toBe('operator-7');
+      expect(h.store.get<ApprovalRecord>('interactions', parked.id)!.status).toBe('ANSWERED');
+    } finally {
+      h.close();
+    }
+  });
+});
+
+describe('E9.5 worker answer delivery — WAITING_INPUT resumes and converges', () => {
+  it('delivers the answer to the runtime, resumes the Task and converges with one interaction', async () => {
+    const h = humanLoopHarness(waitingWorkerResult('which base branch?'));
+    try {
+      const { task } = seedExecutingWorkOrder(h.store, h.events);
+
+      h.scheduler.tick();
+      await h.poll();
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('RUNNING');
+      const adapter = h.adapters[0]!;
+
+      // The runtime asked a question; the report is routed as WAITING_INPUT.
+      h.scheduler.tick();
+      await h.poll();
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('WAITING_INPUT');
+
+      const pending = h.store
+        .list<{ id: string; type: string; status: string; question: string }>('interactions')
+        .filter((row) => row.type === 'QUESTION');
+      expect(pending).toHaveLength(1);
+      expect(pending[0]!.status).toBe('PENDING');
+
+      // Answer through the API: the response is persisted, the Task resumes, and
+      // the answer is delivered into the running runtime.
+      const answered = await h.client.answerInteraction(pending[0]!.id, 'use main');
+      expect(answered.interaction.status).toBe('ANSWERED');
+      expect(answered.task.state).toBe('RUNNING');
+      expect(adapter.delivered).toHaveLength(1);
+      expect(adapter.delivered[0]!.response).toBe('use main');
+      expect(adapter.delivered[0]!.interactionId).toBe(pending[0]!.id);
+
+      // Convergence: the stale waiting report is re-collected across several
+      // ticks (fresh object each poll) but is consumed once — no duplicate
+      // interaction, no WAITING_INPUT flip-back, no re-ask.
+      for (let i = 0; i < 3; i += 1) {
+        h.scheduler.tick();
+        await h.poll();
+      }
+      const questions = h.store
+        .list<{ type: string }>('interactions')
+        .filter((row) => row.type === 'QUESTION');
+      expect(questions).toHaveLength(1);
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('RUNNING');
+      expect(adapter.delivered).toHaveLength(1);
+
+      // A genuinely new runtime report (the runtime continued after the answer)
+      // is routed: the Task settles to SUCCESS.
+      adapter.result = completedWorkerResult();
+      h.scheduler.tick();
+      await h.poll();
+      h.scheduler.tick();
+      await h.poll();
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('SUCCESS');
+      expect(questions).toHaveLength(1);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('does not duplicate interactions across ticks when the runtime repeats the same question', async () => {
+    const h = humanLoopHarness(waitingWorkerResult('same question'));
+    try {
+      const { task } = seedExecutingWorkOrder(h.store, h.events);
+      h.scheduler.tick();
+      await h.poll();
+      // The report is routed on the next tick, then the same waiting report is
+      // collected by several more ticks (the adapter returns a fresh copy each
+      // poll) — it must be consumed once.
+      h.scheduler.tick();
+      await h.poll();
+      h.scheduler.tick();
+      await h.poll();
+      h.scheduler.tick();
+      await h.poll();
+
+      const questions = h.store
+        .list<{ type: string }>('interactions')
+        .filter((row) => row.type === 'QUESTION');
+      expect(questions).toHaveLength(1);
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('WAITING_INPUT');
     } finally {
       h.close();
     }

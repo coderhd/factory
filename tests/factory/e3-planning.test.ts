@@ -123,6 +123,7 @@ class FakeHerdr implements WorkerAdapter {
   async collectArtifacts(): Promise<WorkerResult> {
     return this.result ?? failedResult('no result produced');
   }
+  async deliverAnswer(): Promise<void> {}
   async destroy(): Promise<void> {
     this.destroyed = true;
   }

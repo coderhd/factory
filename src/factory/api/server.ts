@@ -11,12 +11,15 @@ import {
 import type { EventLog } from '../events/log';
 import { projectDrillDown, projectObservatory, type EvidenceReadPort } from '../observatory/observatory';
 import { commitDAG, getActiveDAG, proposeDAG, type DAGProposalPayload } from '../planning/dag';
+import { answerApproval, type ApprovalRecord } from '../policy/policy';
 import type { Scheduler } from '../scheduler/scheduler';
 import type { StateStore } from '../state/store';
 import {
   API_VERSION,
   type AnswerResultDto,
   type ApiErrorDto,
+  type ApprovalAnswerRequest,
+  type ApprovalsDto,
   type CommitDagResultDto,
   type GateDecision,
   type HandshakeDto,
@@ -65,11 +68,14 @@ const STATUS_BY_CODE: Record<string, number> = {
   TASK_NOT_FOUND: 404,
   ATTEMPT_NOT_FOUND: 404,
   WORKER_NOT_FOUND: 404,
+  APPROVAL_NOT_FOUND: 404,
   INVALID_TRANSITION: 409,
   INTERACTION_ALREADY_ANSWERED: 409,
+  APPROVAL_SPENT: 409,
   TASK_NOT_WAITING_INPUT: 409,
   TASK_NOT_READY: 409,
   WORKER_NOT_IDLE: 409,
+  APPROVAL_ACTOR_REQUIRED: 400,
   DAG_INVALID: 422,
 };
 
@@ -116,16 +122,16 @@ const GATE_TRANSITIONS: Record<GateDecision, WorkOrderState> = {
  *
  * This is the durable, state-level resume. There is deliberately no WO-level
  * `WAITING_INPUT` here: a Work Order only asks through its Tasks, so the resume
- * unit is the Task (spec §5.2). The live-runtime channel is also absent — E3's
- * `WorkerAdapter` has no `deliverAnswer`, so the human's response is recorded
- * but not yet pushed into the running worker. That channel is an E3 follow-up
- * (documented finding); the durable answer + Task resume is what E2 owns.
+ * unit is the Task (spec §5.2). The answer is also pushed into the live runtime
+ * (`WorkerAdapter.deliverAnswer`) so the worker can continue rather than sit
+ * parked with its answered question; delivery is attempted only when a
+ * scheduler/runtime is wired.
  */
-function answerInteraction(
+async function answerInteraction(
   deps: FactoryServerDeps,
   interactionId: string,
   response: string,
-): AnswerResultDto {
+): Promise<AnswerResultDto> {
   const now = deps.now?.() ?? new Date().toISOString();
   const record = deps.store.get<InteractionDto>('interactions', interactionId);
   if (!record) {
@@ -173,7 +179,42 @@ function answerInteraction(
     });
   })();
 
+  // Deliver the answer into the live runtime (E9.5). The durable answer above is
+  // the source of truth; this is the channel that lets the worker continue. The
+  // worker holds an open assignment for a `waiting_input` Attempt, so it is
+  // present; a delivery failure is surfaced, never swallowed.
+  if (deps.scheduler) {
+    await deps.scheduler.deliverAnswer(record.workerId, {
+      interactionId,
+      question: record.question,
+      response,
+    });
+  }
+
   return { interaction: answered, task: updatedTask, workOrder };
+}
+
+/**
+ * Answer a PENDING E7 approval (spec §13). The approval ledger and the answer
+ * receipt are E7's (`answerApproval`); this route is only the server-side entry
+ * point that keeps the server the sole mutation authority. An `APPROVAL` is
+ * consumed (spent) by the *next* matching policy decision, not here.
+ */
+function answerApprovalRoute(
+  deps: FactoryServerDeps,
+  approvalId: string,
+  body: ApprovalAnswerRequest,
+): ApprovalRecord {
+  const now = deps.now ?? (() => new Date().toISOString());
+  return answerApproval(
+    { store: deps.store, events: deps.events, now },
+    approvalId,
+    {
+      decision: body.decision,
+      actor: body.actor,
+      ...(body.comment ? { comment: body.comment } : {}),
+    },
+  );
 }
 
 /** The pure request handler: the entire server surface, no socket required. */
@@ -189,7 +230,7 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
     version,
     apiVersion: API_VERSION,
     schemaVersion,
-    capabilities: ['work_orders', 'interactions', 'observatory', 'scheduler'],
+    capabilities: ['work_orders', 'interactions', 'approvals', 'observatory', 'scheduler'],
   });
 
   return async function handle(request: Request): Promise<Response> {
@@ -342,7 +383,35 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
         if (response === null || response.trim().length === 0) {
           return apiError('INVALID_REQUEST', 'response is required', 400);
         }
-        return json(answerInteraction(deps, id, response));
+        return json(await answerInteraction(deps, id, response));
+      }
+    }
+
+    if (resource === 'approvals') {
+      if (method === 'GET' && id === undefined) {
+        const status = url.searchParams.get('status');
+        const approvals = deps.store
+          .list<ApprovalRecord>('interactions')
+          .filter((row) => row.type === 'APPROVAL')
+          .filter((row) => status === null || row.status === status);
+        const dto: ApprovalsDto = { approvals };
+        return json(dto);
+      }
+      if (method === 'POST' && id !== undefined && action === 'answer') {
+        const body = await readJson<Partial<ApprovalAnswerRequest>>(request);
+        const decision = body?.decision;
+        if (decision !== 'APPROVAL' && decision !== 'DENY') {
+          return apiError('INVALID_REQUEST', 'decision must be APPROVAL or DENY', 400);
+        }
+        const actor = typeof body?.actor === 'string' ? body.actor.trim() : '';
+        if (actor.length === 0) return apiError('APPROVAL_ACTOR_REQUIRED', 'actor is required', 400);
+        const comment = typeof body?.comment === 'string' ? body.comment : undefined;
+        const approval = answerApprovalRoute(deps, id, {
+          decision,
+          actor,
+          ...(comment ? { comment } : {}),
+        });
+        return json({ approval });
       }
     }
 
