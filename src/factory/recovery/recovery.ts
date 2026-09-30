@@ -230,14 +230,35 @@ function decide(
   counts: { attemptCount: number; sameClassCount: number; woAutomatic: number },
 ): RecoveryAction {
   const budgets = budgetsOf(deps);
-  const automaticAllowed =
-    counts.attemptCount < budgets.perTaskAttempts && counts.woAutomatic < budgets.workOrderCeiling;
+  // The §9.4 global bound, tracked separately so a *substitute* (an automatic
+  // remedy) can tell WO-ceiling exhaustion — which escalates — from a per-Task
+  // / per-class bound, which parks on capacity.
+  const workOrderCeilingReached = counts.woAutomatic >= budgets.workOrderCeiling;
+  const automaticAllowed = counts.attemptCount < budgets.perTaskAttempts && !workOrderCeilingReached;
   const withinRetryBudget = counts.sameClassCount < budgets.perClassRetries;
   const hasChangedCondition = counts.sameClassCount === 0 || Boolean(failure.changedCondition);
 
   const canAutoRetry = automaticAllowed && withinRetryBudget && hasChangedCondition;
   const retry = (reason: string): RecoveryAction =>
     retryAction(failure.changedCondition ?? 'clean-worktree', reason);
+
+  /**
+   * A policy-satisfying model substitute mints a new Attempt, so it is an
+   * *automatic* remedy and obeys the §9.4 bounds exactly like every other
+   * automatic action — it may not bypass them by naming a substitute. When a
+   * bound refuses it, the branch falls through to the class's §9.2 "after
+   * bounds" remedy: capacity parking, or `ESCALATE_HUMAN` once the Work-Order
+   * ceiling (the global bound) is reached, since §9.4 maps every remaining
+   * automatic remedy to escalation there.
+   */
+  const substituteRetry = (satisfies: boolean): RecoveryAction | null => {
+    if (!satisfies) return null;
+    if (automaticAllowed && withinRetryBudget) return retry(`model:${failure.substituteModel}`);
+    if (workOrderCeilingReached) {
+      return { kind: 'ESCALATE_HUMAN', reason: 'work-order-recovery-ceiling-exhausted' };
+    }
+    return null;
+  };
 
   switch (failure.failureClass) {
     case 'IDEMPOTENCY_DUPLICATE':
@@ -251,7 +272,8 @@ function decide(
         Boolean(failure.substituteModel) &&
         failure.substituteModel === failure.requiredModel &&
         Boolean(failure.changedCondition);
-      if (satisfies) return retry(`model:${failure.substituteModel}`);
+      const substitute = substituteRetry(satisfies);
+      if (substitute) return substitute;
       // Never a silent cheaper-model downgrade (§9.5).
       return {
         kind: 'WAITING_RESOURCE',
@@ -263,7 +285,8 @@ function decide(
     case 'PROVIDER_OUTAGE':
     case 'MODEL_UNAVAILABLE': {
       const satisfies = Boolean(failure.substituteModel) && Boolean(failure.changedCondition);
-      if (satisfies) return retry(`model:${failure.substituteModel}`);
+      const substitute = substituteRetry(satisfies);
+      if (substitute) return substitute;
       return {
         kind: 'WAITING_RESOURCE',
         resource: failure.requiredModel ?? 'provider',
@@ -465,6 +488,11 @@ export interface ReconcileOptions {
   workerStatus?: WorkerStatusFn;
 }
 
+// `SUCCESS` is in-flight here on purpose: a Task that reached SUCCESS while an
+// Attempt on it is still open (no completion evidence, no `outcome`) is
+// anomalous — the crash left the state and the Attempt disagreeing. Interrupting
+// that open Attempt is evidence-preserving (it never claims success); reading
+// SUCCESS as "settled, skip" would leave a phantom open Attempt behind forever.
 const IN_FLIGHT_STATES: ReadonlySet<string> = new Set([
   'ASSIGNED',
   'RUNNING',
@@ -543,7 +571,14 @@ export function reconcileAfterRestart(
         outcome: 'interrupted',
         failureHistory: [
           ...attempt.failureHistory,
-          { at, failure: `CRASH_RECOVERY: factory restart (${reason})`, recovery: 'INTERRUPTED' },
+          // §9.1: `failureHistory[].recovery` carries a `RecoveryAction.kind`.
+          // The crash-recovery default (§9.3) is a new clean-baseline Attempt;
+          // the "interrupted" disposition stays in the failure detail.
+          {
+            at,
+            failure: `CRASH_RECOVERY: factory restart interrupted (${reason})`,
+            recovery: 'RETRY_NEW_ATTEMPT',
+          },
         ],
       });
       if (leaseEntry) {

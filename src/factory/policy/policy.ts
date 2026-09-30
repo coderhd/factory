@@ -210,6 +210,11 @@ export function ceilingFor(capability: Capability, resource?: PolicyResource): P
     case 'production.write':
     case 'secrets.read':
       return 'REQUIRE_HUMAN';
+    case 'production.read':
+      // Ceiling is scoped to `dataClass: customer-data` (§4); synthetic/staging
+      // reads keep the default's `ALLOW`. An over-ceiling expression on the
+      // customer-data facet is coerced and marked `ceiling-violation`.
+      return resource?.dataClass === 'customer-data' ? 'REQUIRE_HUMAN' : 'ALLOW';
     case 'deploy.execute':
       return resource?.env === 'production' ? 'REQUIRE_HUMAN' : 'ALLOW';
     default:
@@ -290,19 +295,31 @@ function selectorsMatch(scope: PolicyScope | undefined, resource?: PolicyResourc
   return true;
 }
 
-/** Set dimensions (paths/branch) must jointly cover the resource or it is out of scope. */
+/**
+ * Set dimensions (paths / excludePaths / branch) must jointly cover the
+ * resource, else the rule does not speak to it (§3.3-4/§3.3-5). Fail-closed on
+ * a missing binding: a scope that constrains a set dimension can only be
+ * satisfied by an action that actually supplies that dimension — an omitted
+ * `branch`/`path` cannot silently satisfy a root scope. This is what makes the
+ * §4 default `repo.write`/`branch.create` scope (the Factory branch prefix plus
+ * an `infra/**` exclusion) resolve `DENY` for a default-branch or
+ * otherwise unbound write instead of leaking an `ALLOW` (§5: a capability whose
+ * root scope requires a binding resolves restricted rather than guess).
+ */
 function coversSetDims(scope: PolicyScope | undefined, resource?: PolicyResource): boolean {
   if (!scope) return true;
   if (scope.paths && scope.paths.length > 0) {
     const path = resource?.path;
     if (!path || !matchesAnyGlob(scope.paths, path)) return false;
   }
-  if (scope.excludePaths && resource?.path) {
-    if (matchesAnyGlob(scope.excludePaths, resource.path)) return false;
+  if (scope.excludePaths && scope.excludePaths.length > 0) {
+    const path = resource?.path;
+    // A missing path cannot be proven outside the excluded set: not covered.
+    if (!path || matchesAnyGlob(scope.excludePaths, path)) return false;
   }
   if (scope.branchPattern) {
     const branch = resource?.branch;
-    if (branch && !matchesGlobSafe(scope.branchPattern, branch)) return false;
+    if (!branch || !matchesGlobSafe(scope.branchPattern, branch)) return false;
   }
   return true;
 }
@@ -665,7 +682,12 @@ export function check(deps: PolicyCheckDeps, subject: TaskRef, action: PolicyAct
       spendApproval(deps, evaluation.spentApprovalId, record.id, t);
     }
     if (evaluation.risk !== wo.riskTier) {
-      ratchetTier(deps, subject.workOrderId, evaluation.risk, record);
+      ratchetTier(
+        { store: deps.store, events: deps.events, now },
+        subject.workOrderId,
+        evaluation.risk,
+        record,
+      );
     }
 
     return evaluation.decision;

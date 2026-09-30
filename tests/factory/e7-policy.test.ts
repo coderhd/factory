@@ -315,6 +315,60 @@ describe('E7 policy: monotonic narrowing Org → Project → WO → Task', () =>
     expect(src.decision).toBe('ALLOW');
   });
 
+  it('a scope-bound dimension with no binding is not covered — an omitted branch DENIES repo.write/branch.create', () => {
+    const chain = { version: 'test', organization: org() };
+
+    // The root repo.write scope binds `branch: wo-*/**`; silence about the
+    // branch must not satisfy it (§4 "anything else … resolves DENY via the
+    // scope"; §5 "rather than guess").
+    const omittedBranch = evaluate({
+      chain,
+      wo: { riskTier: 'GREEN' },
+      action: action('repo.write', { path: 'src/orders.ts' }),
+    });
+    expect(omittedBranch.decision).toBe('DENY');
+    expect(omittedBranch.rules.some((r) => r.includes('outside-scope'))).toBe(true);
+
+    const branchCreate = evaluate({
+      chain,
+      wo: { riskTier: 'GREEN' },
+      action: action('branch.create'),
+    });
+    expect(branchCreate.decision).toBe('DENY');
+
+    // A missing path cannot be proven outside the root `excludePaths: ['infra/**']`.
+    const omittedPath = evaluate({
+      chain,
+      wo: { riskTier: 'GREEN' },
+      action: action('repo.write', { branch: 'wo-9/impl' }),
+    });
+    expect(omittedPath.decision).toBe('DENY');
+
+    // Supplying the bindings restores the grant (the change is fail-closed, not a veto).
+    const bound = evaluate({
+      chain,
+      wo: { riskTier: 'GREEN' },
+      action: action('repo.write', { path: 'src/orders.ts', branch: 'wo-9/impl' }),
+    });
+    expect(bound.decision).toBe('ALLOW');
+  });
+
+  it('a custom source cannot express an ALLOW above the scoped production.read customer-data ceiling (§3.3-5)', () => {
+    const chain: PolicyChain = {
+      version: 'test',
+      organization: level({ 'production.read': [{ decision: 'ALLOW' }] }),
+    };
+
+    const customer = resolveChain('production.read', { dataClass: 'customer-data' }, chain);
+    expect(customer.decision).toBe('REQUIRE_HUMAN');
+    expect(customer.rules.some((r) => r.includes('ceiling-violation'))).toBe(true);
+
+    // The ceiling binds per matched dimension: the synthetic facet is untouched.
+    const synthetic = resolveChain('production.read', { dataClass: 'synthetic' }, chain);
+    expect(synthetic.decision).toBe('ALLOW');
+    expect(synthetic.rules.some((r) => r.includes('ceiling-violation'))).toBe(false);
+  });
+
   it('a production deploy cannot be unlocked below a WO DENY even by a Task claim (§7.4)', () => {
     const chain: PolicyChain = {
       version: 'test',
@@ -928,6 +982,71 @@ describe('E7 @debug reproduction (c): quota exhaustion with a pinned escalation 
       h.store.close();
     }
   });
+
+  it('after the Work-Order ceiling, a satisfying substitute escalates instead of minting an Attempt (§9.4)', () => {
+    const h = harness();
+    try {
+      const { wo, taskId, attempt } = seedQuotaAttempt(h);
+      for (let i = 0; i < DEFAULT_RECOVERY_BUDGETS.workOrderCeiling; i += 1) {
+        h.events.appendEvent({
+          type: RECOVERY_ACTION_APPLIED,
+          aggregateType: 'work_order',
+          aggregateId: wo.id,
+          payload: { kind: 'RETRY_NEW_ATTEMPT' },
+        });
+      }
+
+      const action = recover(recoveryDeps(h), {
+        attemptId: attempt.id,
+        taskId,
+        workOrderId: wo.id,
+        failureClass: 'MODEL_QUOTA_EXHAUSTED',
+        error: 'quota exhausted',
+        requiredModel: 'reasoning-high',
+        substituteModel: 'reasoning-high',
+        changedCondition: 'model:reasoning-high',
+        attemptCount: 0,
+        sameClassCount: 0,
+        failureIndex: 0,
+      });
+
+      expect(action).toEqual({
+        kind: 'ESCALATE_HUMAN',
+        reason: 'work-order-recovery-ceiling-exhausted',
+      });
+      // No automatic recovery leaked past the global bound.
+      expect(h.store.list<Attempt>('attempts').filter((x) => x.taskId === taskId)).toHaveLength(1);
+      expect(eventsOfType(h, RESOURCE_UNAVAILABLE)).toHaveLength(0);
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('a substitute refused by the per-Task attempt bound parks on capacity (WAITING_RESOURCE)', () => {
+    const h = harness();
+    try {
+      const { wo, taskId, attempt } = seedQuotaAttempt(h);
+      const action = recover(recoveryDeps(h), {
+        attemptId: attempt.id,
+        taskId,
+        workOrderId: wo.id,
+        failureClass: 'MODEL_QUOTA_EXHAUSTED',
+        error: 'quota exhausted',
+        requiredModel: 'reasoning-high',
+        substituteModel: 'reasoning-high',
+        changedCondition: 'model:reasoning-high',
+        attemptCount: DEFAULT_RECOVERY_BUDGETS.perTaskAttempts,
+        sameClassCount: 0,
+        failureIndex: 0,
+      });
+
+      expect(action.kind).toBe('WAITING_RESOURCE');
+      // No third Attempt: the bound holds even with a satisfying substitute.
+      expect(h.store.list<Attempt>('attempts').filter((x) => x.taskId === taskId)).toHaveLength(1);
+    } finally {
+      h.store.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1021,11 +1140,9 @@ describe('E7 @debug reproduction (a): worker crash mid-Attempt', () => {
       expect(old.diff).toContain('partial work');
 
       // Old diff preserved as an immutable evidence artifact.
-      const evidencePath = join(workDir, 'artifacts', seeded.attemptId, 'diff.patch');
       expect(Buffer.from(h.artifacts.get(`${seeded.attemptId}/diff.patch`)).toString('utf8')).toContain(
         'partial work',
       );
-      void evidencePath;
 
       // The assignment is closed and the worker released.
       expect(h.store.get<{ closedAt: string | null }>('assignments', seeded.assignmentId)!.closedAt).not.toBeNull();

@@ -147,7 +147,7 @@ export function tierFloor(tier: 'GREEN' | 'YELLOW' | 'RED', sensitivity: Sensiti
  * observed the escalation, so state and log can never disagree.
  */
 export function ratchetTier(
-  deps: Pick<WorkerManagerDeps, 'store' | 'events'>,
+  deps: Pick<WorkerManagerDeps, 'store' | 'events'> & { now?: () => string },
   workOrderId: string,
   observed: 'GREEN' | 'YELLOW' | 'RED',
   evidence: PolicyDecisionRecord,
@@ -156,7 +156,9 @@ export function ratchetTier(
   if (!wo) return false;
   if (TIER_RANK[observed] <= TIER_RANK[wo.riskTier]) return false;
 
-  const now = new Date().toISOString();
+  // Use the caller's injected clock so the ratcheted Work Order row and the
+  // evidence decision row it pairs with agree (fake clocks in tests).
+  const now = (deps.now ?? (() => new Date().toISOString()))();
   const updated: WorkOrder = { ...wo, riskTier: observed, updatedAt: now };
   const record: PolicyDecisionRecord = {
     id: `pd_${crypto.randomUUID()}`,
