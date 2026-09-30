@@ -131,6 +131,22 @@ interface Completion {
   error?: string;
 }
 
+/**
+ * The fail-closed stand-in for an absent `SchedulerPolicy` (E9.1). A scheduler
+ * with no policy must never assign: defaulting to `ALLOW` would silently bypass
+ * the §5 policy gate. It DENIES every Task and logs once, loudly, at
+ * construction so a misconfigured server is visible in the logs rather than
+ * silently starved.
+ */
+function missingPolicy(): SchedulerPolicy {
+  console.error(
+    'scheduler: no policy wired (SchedulerDeps.policy is undefined); denying all assignments — wire the E7 policy check',
+  );
+  return {
+    canAssign: (_task, _workOrder) => 'DENY',
+  };
+}
+
 export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerConfig> = {}): Scheduler {
   const cfg: SchedulerConfig = {
     maxConcurrentTasks: config.maxConcurrentTasks ?? DEFAULT_CONFIG.maxConcurrentTasks,
@@ -141,7 +157,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     },
   };
   const now = deps.now ?? (() => new Date().toISOString());
-  const policy: SchedulerPolicy = deps.policy ?? { canAssign: () => 'ALLOW' };
+  const policy = deps.policy ?? missingPolicy();
   const leaseTtlMs = deps.leaseTtlMs ?? cfg.provisioning.idleTimeoutMs;
 
   const completions: Completion[] = [];
@@ -472,7 +488,11 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
 
       let assignment: AssignmentRecord | null = null;
       try {
-        const worktree = deps.worktrees.createTaskWorktree(candidate.task.id, deps.repoPath);
+        const worktree = deps.worktrees.createTaskWorktree(
+          candidate.task.id,
+          candidate.workOrder.id,
+          deps.repoPath,
+        );
         assignment = assign(
           { store: deps.store, events: deps.events, now },
           { taskId: candidate.task.id, workerId: idleWorker.id, worktree },

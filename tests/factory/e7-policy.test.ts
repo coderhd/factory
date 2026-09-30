@@ -1161,7 +1161,7 @@ function seedRunningAttempt(
     id: assignmentId,
     taskId,
     workerId,
-    branch: `factory/task-${taskId}`,
+    branch: `wo-${wo.id}/task-${taskId.slice(0, 8)}`,
     worktreePath: join(workDir, 'worktrees', taskId),
     baseCommit: 'base',
     closedAt: null,

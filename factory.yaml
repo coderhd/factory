@@ -7,9 +7,20 @@ storage:
   state: .factory/state
   artifacts: .factory/artifacts
   knowledge: .factory/knowledge
+repository:
+  path: .
 scheduler:
   maxConcurrentTasks: 3
   tickIntervalMs: 1000
+  provisioning:
+    enabled: true
+    min: 0
+    max: 5
+    idleTimeoutMs: 600000
+    defaultProfile: herdr
+worktrees:
+  rootDir: .factory/worktrees
+  baseBranch: main
 workers:
   profiles:
     - herdr

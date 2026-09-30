@@ -12,13 +12,14 @@ import {
   serializeFactoryConfig,
   type FactoryRuntimeConfig,
 } from '../factory/config/factoryConfig';
-import { openEventLog } from '../factory/events/log';
-import { createEmptyEvidenceReadPort } from '../factory/observatory/observatory';
-import { createScheduler } from '../factory/scheduler/scheduler';
-import { openStateStore } from '../factory/state/store';
+import { openEventLog, type EventLog } from '../factory/events/log';
+import { createEvidenceReadPort } from '../factory/observatory/observatory';
+import { check } from '../factory/policy/policy';
+import { createScheduler, type SchedulerPolicy } from '../factory/scheduler/scheduler';
+import { createArtifactStore, openStateStore, type StateStore } from '../factory/state/store';
 import { createHerdrWorker } from '../factory/workers/herdr';
-import { createWorkerManager } from '../factory/workers/manager';
-import { createWorktreeManager } from '../factory/worktrees/worktree';
+import { createWorkerManager, type SpawnWorker, type WorkerProfile } from '../factory/workers/manager';
+import { createWorktreeManager, taskWorktreeBranch } from '../factory/worktrees/worktree';
 
 /**
  * The E2 `factory` CLI (spec §20 operator interface): `init`, `start`, `stop`,
@@ -145,28 +146,81 @@ function ensureStorageDirs(runtime: FactoryRuntimeConfig): void {
 // Server lifecycle
 // ---------------------------------------------------------------------------
 
-function buildServerDeps(dir: string, runtime: FactoryRuntimeConfig): FactoryServerDeps {
+/**
+ * The E3 `SchedulerPolicy` adapter (E9.1 ruling RE5): assignment is an E7
+ * `repo.write` decision on the Task's real worktree branch
+ * (`wo-<workOrderId>/task-<short>`) with `path: '**'` — the whole-worktree
+ * binding at assignment time (the per-path `infra&#47;**` exclusion is enforced
+ * later, at write/verification time). `ALLOW` assigns; a `REQUIRE_HUMAN`/`DENY`
+ * verdict leaves the Task `READY` and is surfaced by the scheduler's
+ * `blockedPolicy`.
+ */
+export function createSchedulerPolicy(deps: {
+  store: StateStore;
+  events: EventLog;
+}): SchedulerPolicy {
+  return {
+    canAssign: (task, workOrder) =>
+      check(deps, { taskId: task.id, workOrderId: workOrder.id }, {
+        capability: 'repo.write',
+        resource: { branch: taskWorktreeBranch(task.id, workOrder.id), path: '**' },
+      }),
+  };
+}
+
+/**
+ * Overridable seams for {@link buildServerDeps}. Production uses the real Herdr
+ * adapter factory and wall-clock `now`; tests inject a fake adapter (Ruling R5:
+ * hermetic — never spawn a real runtime) and a deterministic clock.
+ */
+export interface ServerDepsOptions {
+  spawn?: SpawnWorker;
+  now?: () => string;
+}
+
+export function buildServerDeps(
+  runtime: FactoryRuntimeConfig,
+  options: ServerDepsOptions = {},
+): FactoryServerDeps {
+  ensureStorageDirs(runtime);
   const store = openStateStore(runtime.paths.db);
   const events = openEventLog(store.db);
-  const workers = createWorkerManager({ store, events, spawn: () => createHerdrWorker() });
+  const workers = createWorkerManager({
+    store,
+    events,
+    spawn: options.spawn ?? (() => createHerdrWorker()),
+    ...(options.now ? { now: options.now } : {}),
+  });
   const worktrees = createWorktreeManager({
-    rootDir: join(dir, '.factory', 'worktrees'),
-    baseBranch: 'main',
+    rootDir: runtime.worktrees.rootDir,
+    baseBranch: runtime.worktrees.baseBranch,
   });
   // The resolved `factory.yaml` scheduler config drives the real E3 scheduler,
   // so an edited desired config changes the running instance. The serve path
   // owns the loop lifecycle (start/stop around the listener).
   const scheduler = createScheduler(
-    { store, events, workers, worktrees },
+    {
+      store,
+      events,
+      workers,
+      worktrees,
+      repoPath: runtime.repository.path,
+      artifacts: createArtifactStore(runtime.paths.artifacts),
+      policy: createSchedulerPolicy({ store, events }),
+    },
     {
       maxConcurrentTasks: runtime.scheduler.maxConcurrentTasks,
       tickIntervalMs: runtime.scheduler.tickIntervalMs,
+      provisioning: {
+        ...runtime.scheduler.provisioning,
+        defaultProfile: runtime.scheduler.provisioning.defaultProfile as WorkerProfile,
+      },
     },
   );
   return {
     store,
     events,
-    evidence: createEmptyEvidenceReadPort(),
+    evidence: createEvidenceReadPort(store),
     scheduler,
     version: runtime.factoryVersion,
     schemaVersion: runtime.schemaVersion,
@@ -226,7 +280,7 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   if (!loaded) return 1;
   const port = flag(args, 'port') !== undefined ? Number(flag(args, 'port')) : loaded.runtime.server.port;
 
-  const deps = buildServerDeps(dir, loaded.runtime);
+  const deps = buildServerDeps(loaded.runtime);
   const handle = startFactoryServer(deps, { port });
   // Actually run the E3 scheduler loop for the life of the server (spec §7.2).
   deps.scheduler?.start();

@@ -21,7 +21,20 @@ export interface FactoryDesiredConfig {
   factoryVersion: string;
   server: { hostname: string; port: number };
   storage: { state: string; artifacts: string; knowledge: string };
-  scheduler: { maxConcurrentTasks: number; tickIntervalMs: number };
+  /** The local repository the Factory creates per-Task worktrees from (§15/§17). */
+  repository: { path: string };
+  scheduler: {
+    maxConcurrentTasks: number;
+    tickIntervalMs: number;
+    provisioning: {
+      enabled: boolean;
+      min: number;
+      max: number;
+      idleTimeoutMs: number;
+      defaultProfile: string;
+    };
+  };
+  worktrees: { rootDir: string; baseBranch: string };
   workers: { profiles: string[] };
   image: { repository: string; tag: string };
   compose: {
@@ -35,7 +48,13 @@ export interface FactoryRuntimeConfig {
   schemaVersion: string;
   server: { hostname: string; port: number; url: string };
   paths: { root: string; state: string; artifacts: string; knowledge: string; db: string };
-  scheduler: { maxConcurrentTasks: number; tickIntervalMs: number };
+  repository: { path: string };
+  scheduler: {
+    maxConcurrentTasks: number;
+    tickIntervalMs: number;
+    provisioning: FactoryDesiredConfig['scheduler']['provisioning'];
+  };
+  worktrees: { rootDir: string; baseBranch: string };
   workers: { profiles: string[] };
   image: { repository: string; tag: string; ref: string };
 }
@@ -58,7 +77,21 @@ export const DEFAULT_FACTORY_CONFIG: FactoryDesiredConfig = {
     artifacts: '.factory/artifacts',
     knowledge: '.factory/knowledge',
   },
-  scheduler: { maxConcurrentTasks: 3, tickIntervalMs: 1000 },
+  // The Factory's own checkout is the default worktree source; an operator
+  // points this at the repository Work Orders execute against.
+  repository: { path: '.' },
+  scheduler: {
+    maxConcurrentTasks: 3,
+    tickIntervalMs: 1000,
+    provisioning: {
+      enabled: true,
+      min: 0,
+      max: 5,
+      idleTimeoutMs: 600_000,
+      defaultProfile: 'herdr',
+    },
+  },
+  worktrees: { rootDir: '.factory/worktrees', baseBranch: 'main' },
   workers: { profiles: ['herdr'] },
   image: { repository: 'ghcr.io/coderhd/factory', tag: FACTORY_VERSION },
   compose: { healthcheck: { intervalSeconds: 10, timeoutSeconds: 5, retries: 3 } },
@@ -83,6 +116,10 @@ function isNonEmptyString(value: unknown): value is string {
 
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 1;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
 /** Validate a `factory.yaml` document; returns every issue with a dotted path. */
@@ -127,6 +164,14 @@ export function parseFactoryConfig(text: string): ConfigParse {
     }
   }
 
+  if (!isPlainObject(root.repository)) {
+    issue('repository', 'repository is required');
+  } else if (!isNonEmptyString(root.repository.path)) {
+    // The scheduler cannot create a worktree without a repo to create it from,
+    // so a missing path is a hard, loud failure at config load.
+    issue('repository.path', 'repository.path is required');
+  }
+
   if (!isPlainObject(root.scheduler)) {
     issue('scheduler', 'scheduler is required');
   } else {
@@ -135,6 +180,44 @@ export function parseFactoryConfig(text: string): ConfigParse {
     }
     if (!isPositiveInteger(root.scheduler.tickIntervalMs)) {
       issue('scheduler.tickIntervalMs', 'tickIntervalMs must be an integer >= 1');
+    }
+    if (!isPlainObject(root.scheduler.provisioning)) {
+      issue('scheduler.provisioning', 'scheduler.provisioning is required');
+    } else {
+      const provisioning = root.scheduler.provisioning;
+      if (typeof provisioning.enabled !== 'boolean') {
+        issue('scheduler.provisioning.enabled', 'enabled must be a boolean');
+      }
+      if (!isNonNegativeInteger(provisioning.min)) {
+        issue('scheduler.provisioning.min', 'min must be an integer >= 0');
+      }
+      if (!isPositiveInteger(provisioning.max)) {
+        issue('scheduler.provisioning.max', 'max must be an integer >= 1');
+      }
+      if (
+        isNonNegativeInteger(provisioning.min) &&
+        isPositiveInteger(provisioning.max) &&
+        provisioning.min > provisioning.max
+      ) {
+        issue('scheduler.provisioning.min', 'min must not exceed max');
+      }
+      if (!isPositiveInteger(provisioning.idleTimeoutMs)) {
+        issue('scheduler.provisioning.idleTimeoutMs', 'idleTimeoutMs must be an integer >= 1');
+      }
+      if (!isNonEmptyString(provisioning.defaultProfile)) {
+        issue('scheduler.provisioning.defaultProfile', 'defaultProfile is required');
+      }
+    }
+  }
+
+  if (!isPlainObject(root.worktrees)) {
+    issue('worktrees', 'worktrees is required');
+  } else {
+    if (!isNonEmptyString(root.worktrees.rootDir)) {
+      issue('worktrees.rootDir', 'worktrees.rootDir is required');
+    }
+    if (!isNonEmptyString(root.worktrees.baseBranch)) {
+      issue('worktrees.baseBranch', 'worktrees.baseBranch is required');
     }
   }
 
@@ -196,7 +279,16 @@ export function resolveFactoryConfig(
       knowledge: resolve(root, config.storage.knowledge),
       db: join(state, 'factory.db'),
     },
-    scheduler: { ...config.scheduler },
+    repository: { path: resolve(root, config.repository.path) },
+    scheduler: {
+      maxConcurrentTasks: config.scheduler.maxConcurrentTasks,
+      tickIntervalMs: config.scheduler.tickIntervalMs,
+      provisioning: { ...config.scheduler.provisioning },
+    },
+    worktrees: {
+      rootDir: resolve(root, config.worktrees.rootDir),
+      baseBranch: config.worktrees.baseBranch,
+    },
     workers: { profiles: [...config.workers.profiles] },
     image: {
       repository: config.image.repository,
@@ -218,9 +310,20 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
     `  state: ${config.storage.state}`,
     `  artifacts: ${config.storage.artifacts}`,
     `  knowledge: ${config.storage.knowledge}`,
+    'repository:',
+    `  path: ${config.repository.path}`,
     'scheduler:',
     `  maxConcurrentTasks: ${config.scheduler.maxConcurrentTasks}`,
     `  tickIntervalMs: ${config.scheduler.tickIntervalMs}`,
+    '  provisioning:',
+    `    enabled: ${config.scheduler.provisioning.enabled}`,
+    `    min: ${config.scheduler.provisioning.min}`,
+    `    max: ${config.scheduler.provisioning.max}`,
+    `    idleTimeoutMs: ${config.scheduler.provisioning.idleTimeoutMs}`,
+    `    defaultProfile: ${config.scheduler.provisioning.defaultProfile}`,
+    'worktrees:',
+    `  rootDir: ${config.worktrees.rootDir}`,
+    `  baseBranch: ${config.worktrees.baseBranch}`,
     'workers:',
     '  profiles:',
     ...config.workers.profiles.map((profile) => `    - ${profile}`),
