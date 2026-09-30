@@ -518,10 +518,15 @@ export interface GitHubAdapterOptions {
   /** Default PR base branch. Defaults to `main`. */
   baseBranch?: string;
   /**
-   * Branch naming policy. Defaults to the E3 namespace
-   * `wo-<workOrderId>/task-<workOrderIdShort>` — the same `wo-<id>/task-<short>`
-   * shape the E3 worktree manager mints and the E7 embedded scope authorizes
-   * (`wo-*&#47;**`), so the worktree, PR and policy namespaces agree.
+   * Branch naming policy. Defaults to `wo-<workOrderId>/task-<workOrderIdShort>`.
+   *
+   * This is **namespace-consistent** with the E3 worktree branch and the E7
+   * embedded `branch.create`/`repo.write` scope (`wo-*&#47;**`): all three share
+   * the `wo-<workOrderId>/task-<…>` prefix the Factory is authorized to write.
+   * The **leaf differs**, by design: this PR branch is keyed on the Work Order
+   * (one PR per Work Order, aggregating its Tasks), whereas
+   * `taskWorktreeBranch(taskId, workOrderId)` keys the E3 worktree leaf on the
+   * Task (`task-<taskId8>`). Per-task alignment is tracked in #37.
    */
   branchName?: (workOrder: WorkOrder) => string;
   /**
@@ -576,6 +581,9 @@ export interface GitHubAdapter {
 export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapter {
   const { transport, client, factoryBaseUrl, checkPolicy, readEvidence } = options;
   const baseBranch = options.baseBranch ?? 'main';
+  // The Work Order's change-set branch. Shares the E3 `wo-<workOrderId>/task-<…>`
+  // namespace (and so the embedded policy scope); the leaf is keyed on the Work
+  // Order because E6 opens one PR per Work Order, not per Task.
   const branchName =
     options.branchName ??
     ((workOrder: WorkOrder) => `wo-${workOrder.id}/task-${workOrder.id.slice(0, 8)}`);

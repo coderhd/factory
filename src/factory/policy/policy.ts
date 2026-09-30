@@ -761,6 +761,11 @@ const DIFF_HEADER = /^diff --git a\/.+ b\/(.+)$/gm;
  * `repo.write`). Reads only the `diff --git a/… b/<path>` headers, which git
  * emits for every touched file — no hunk parsing, no heuristic content
  * sniffing. Deterministic and deduplicated, in first-seen order.
+ *
+ * Only the **new** (`b/<path>`) side is read: for a rename the destination path
+ * is gated and the source path is not, and for a delete the removed path is not
+ * gated (a deletion changes no file the grant protects). This is deliberate for
+ * v0.1 — the `repo.write` concern is what is written, not what is removed.
  */
 export function changedPathsFromDiff(diff: string): string[] {
   const paths: string[] = [];
@@ -789,8 +794,17 @@ export interface RepoWriteGateResult {
  * change's paths are only known once the diff exists. This folds E7's `check`
  * over every changed path on the Task's real worktree branch, so the embedded
  * `infra/**` exclusion (or any deployment narrowing) is enforced against the
- * change set — not merely the branch. Fail-closed: a path whose verdict is not
- * `ALLOW` denies the whole change set.
+ * change set — not merely the branch.
+ *
+ * Fail-closed on paths that are not `ALLOW`: `REQUIRE_HUMAN` and `DENY` both deny
+ * the change set here (the caller routes it to REWORK), unlike the assignment
+ * gate which leaves a Task READY on `REQUIRE_HUMAN`. The asymmetry is deliberate
+ * — a change set that has already been written cannot park pending a human; it
+ * must be reworked or escalated rather than verified.
+ *
+ * No changed paths (an empty diff) is a vacuous allow: nothing was written, so
+ * there is nothing to gate. The caller treats a no-diff SUCCESS change set the
+ * same as any other; the short-circuit is explicit so the case is visible.
  */
 export function repoWriteGate(
   deps: PolicyCheckDeps,
@@ -798,6 +812,7 @@ export function repoWriteGate(
   branch: string,
   paths: readonly string[],
 ): RepoWriteGateResult {
+  if (paths.length === 0) return { allowed: true, denied: [] };
   const denied = paths.filter(
     (path) =>
       check(deps, subject, { capability: 'repo.write', resource: { branch, path } }) !== 'ALLOW',

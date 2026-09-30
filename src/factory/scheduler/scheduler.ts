@@ -816,7 +816,9 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       // worktree (`path:'**'`); here the change set's *actual* paths are known
       // from the diff, so a path outside the `repo.write` grant (the embedded
       // `infra/**` exclusion) is refused before verification — never verified,
-      // never promoted. A denial settles as a structured rejection.
+      // never promoted. A denial settles as a structured rejection. An empty
+      // diff yields no paths (a vacuous, explicitly-non-denying case inside the
+      // gate) — nothing was written, so there is nothing to gate.
       const gate = deps.policy?.canWriteChangeSet;
       if (gate) {
         const branch = taskWorktreeBranch(subject.task.id, subject.workOrder.id);

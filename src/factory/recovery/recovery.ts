@@ -478,12 +478,14 @@ export function recover(deps: RecoveryDeps, failure: FailureContext): RecoveryAc
     const settled = circuitSnapshot(deps, dependency);
     if (settled.state === 'OPEN') {
       // The failure tripped the circuit (threshold) or failed a HALF_OPEN probe.
-      // Shed this delivery; a freshly-opened window leaves the full reset time.
+      // The circuit was admitted (CLOSED or a probe), so this is a *freshly*
+      // opened window: the full reset time remains. (`gate.retryAfterMs` is only
+      // set on a shed, which returned above.)
       const config = { ...DEFAULT_CIRCUIT_CONFIG, ...(deps.circuit ?? {}) };
       const shed: RecoveryAction = {
         kind: 'WAITING_RESOURCE',
         resource: dependency,
-        retryAfterMs: gate.retryAfterMs ?? config.resetTimeoutMs,
+        retryAfterMs: config.resetTimeoutMs,
       };
       applyAction(deps, failure, shed, key);
       return shed;

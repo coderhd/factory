@@ -86,7 +86,7 @@ import {
   type WorkerStatus,
 } from '../../src/factory/workers/herdr';
 import { createWorkerManager } from '../../src/factory/workers/manager';
-import { createWorktreeManager } from '../../src/factory/worktrees/worktree';
+import { createWorktreeManager, taskWorktreeBranch } from '../../src/factory/worktrees/worktree';
 
 /**
  * E9.1 (#27) — server orchestration spine. These tests exercise the exact
@@ -2854,8 +2854,8 @@ describe('E9.8 head-SHA pin — verified code is the merged code (no TOCTOU)', (
   });
 });
 
-describe('E9.8 branch naming reconciled with E3 worktrees + the policy scope', () => {
-  it('names the E6 change-set branch in the E3 `wo-<woId>/task-<short>` namespace', async () => {
+describe('E9.8 branch naming namespace-consistent with E3 worktrees + the policy scope', () => {
+  it('names the E6 change-set branch in the E3 `wo-<woId>/task-<…>` namespace', async () => {
     const h = e9Harness();
     try {
       h.transport.issues.set(h.transport.issueKey(E9_ISSUE), E9_ISSUE);
@@ -2866,11 +2866,20 @@ describe('E9.8 branch naming reconciled with E3 worktrees + the policy scope', (
 
       const branch = await h.adapter.createBranch(workOrder);
 
-      // The branch is authorizable by the embedded `branch.create` scope
-      // (`wo-*/**`) without a bespoke deployment grant.
+      // Namespace-consistent with E3 + the embedded policy scope (`wo-*/**`), so
+      // no bespoke deployment grant is needed. The leaf is keyed on the Work Order
+      // (one PR per Work Order); E3's worktree leaf is keyed on the Task. Both
+      // share the prefix, so both are authorized by the same scope — the leaves
+      // differ by design (per-task alignment: #37).
       expect(branch.name).toBe(`wo-${workOrder.id}/task-${workOrder.id.slice(0, 8)}`);
       expect(branch.name.startsWith('wo-')).toBe(true);
       expect(branch.name).toMatch(/^wo-[^/]+\/task-.+/);
+      // The E3 worktree branch for the same Work Order shares the namespace but
+      // keys its leaf on the Task, so the strings are not equal — asserting the
+      // shared prefix, not a false equivalence.
+      const e3Branch = taskWorktreeBranch('task_abcdef123456', workOrder.id);
+      expect(e3Branch).toStartWith(`wo-${workOrder.id}/task-`);
+      expect(branch.name).not.toBe(e3Branch);
       const decision = h.store
         .list<{ action: { capability: string }; decision: string }>('policy_decisions')
         .find((row) => row.action.capability === 'branch.create');
@@ -2932,6 +2941,41 @@ describe('E9.8 path-level repo.write gating (the infra/** exclusion) at write ti
       '+resource "x" "y" {}',
     ].join('\n');
     expect(changedPathsFromDiff(diff).sort()).toEqual(['infra/main.tf', 'src/counter.ts']);
+  });
+
+  it('gates only the new path on a rename/delete (source path is not gated)', () => {
+    const rename = [
+      'diff --git a/infra/old.tf b/src/new.ts',
+      'similarity index 90%',
+      'rename from infra/old.tf',
+      'rename to src/new.ts',
+    ].join('\n');
+    // Only the destination (`b/`) path is read: the write concern is the new path.
+    expect(changedPathsFromDiff(rename)).toEqual(['src/new.ts']);
+
+    const deletion = [
+      'diff --git a/infra/gone.tf b/infra/gone.tf',
+      'deleted file mode 100644',
+      '--- a/infra/gone.tf',
+      '+++ /dev/null',
+    ].join('\n');
+    // A delete writes nothing protected; the removed path is not gated here.
+    expect(changedPathsFromDiff(deletion)).toEqual(['infra/gone.tf']);
+  });
+
+  it('treats a no-change diff as a vacuous allow (nothing written, nothing to gate)', () => {
+    const store = openStateStore(join(workDir, `e9-nodiff-${crypto.randomUUID()}.db`));
+    const events = openEventLog(store.db);
+    try {
+      const { wo, task } = seedExecutingWorkOrder(store, events);
+      const branch = expectedBranch(wo.id, task.id);
+      expect(changedPathsFromDiff('')).toEqual([]);
+      expect(
+        repoWriteGate({ store, events }, { taskId: task.id, workOrderId: wo.id }, branch, []),
+      ).toEqual({ allowed: true, denied: [] });
+    } finally {
+      store.close();
+    }
   });
 
   it('rejects a SUCCESS change set that writes infra/** at verification time (never verified)', async () => {

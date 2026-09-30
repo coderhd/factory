@@ -163,16 +163,21 @@ interface Harness {
 const FACTORY_BASE_URL = 'http://factory.local:8787';
 
 /**
- * The E6 branch is now the E3 namespace `wo-<workOrderId>/task-<workOrderIdShort>`
+ * The E6 branch lives in the E3 `wo-<workOrderId>/task-<…>` namespace
  * (RE5(c)/E9.8), which the embedded `branch.create`/`repo.write` scope
  * (`wo-*&#47;**`) already authorizes — no bespoke deployment grant is needed.
- * The helper is retained only to note the reconciliation at each call site.
+ * The helper is a no-op kept to mark where a grant used to be required.
  */
 function grantFactoryBranches(_h: Harness): void {
   // No-op: the default embedded policy authorizes the `wo-*` namespace.
 }
 
-/** The E6 change-set branch (the E3 worktree namespace, RE5(a)/E9.8). */
+/**
+ * The E6 change-set branch: the E3 `wo-<id>/task-<…>` namespace, with the leaf
+ * keyed on the **Work Order** (E6 opens one PR per Work Order). E3's worktree
+ * branch keys the leaf on the **Task** (`taskWorktreeBranch`); the leaves differ
+ * while the namespace (and so policy scope) agrees. Per-task alignment: #37.
+ */
 const expectedBranchName = (workOrderId: string): string =>
   `wo-${workOrderId}/task-${workOrderId.slice(0, 8)}`;
 
