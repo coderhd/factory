@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createFactoryClient } from '../factory/api/client';
+import { createFactoryClient, type FactoryClient } from '../factory/api/client';
 import { startFactoryServer, type FactoryServerDeps } from '../factory/api/server';
 import { createBackup, restoreBackup } from '../factory/backup/archive';
 import {
@@ -12,13 +12,23 @@ import {
   serializeFactoryConfig,
   type FactoryRuntimeConfig,
 } from '../factory/config/factoryConfig';
-import { openEventLog } from '../factory/events/log';
-import { createEmptyEvidenceReadPort } from '../factory/observatory/observatory';
-import { createScheduler } from '../factory/scheduler/scheduler';
-import { openStateStore } from '../factory/state/store';
+import type { EvidenceBundle } from '../factory/evidence/bundle';
+import {
+  createGitHubAdapter,
+  type GitHubAdapter,
+  type GitHubTransport,
+} from '../factory/github/adapter';
+import { openEventLog, type EventLog } from '../factory/events/log';
+import { createEvidenceReadPort } from '../factory/observatory/observatory';
+import { check, checkDetailed, repoWriteGate } from '../factory/policy/policy';
+import type { DAGProposalPayload } from '../factory/planning/dag';
+import { reconcileAfterRestart } from '../factory/recovery/recovery';
+import { createScheduler, type SchedulerPolicy } from '../factory/scheduler/scheduler';
+import { createArtifactStore, openStateStore, type StateStore } from '../factory/state/store';
+import type { WorkVerifier } from '../factory/verification/orchestrator';
 import { createHerdrWorker } from '../factory/workers/herdr';
-import { createWorkerManager } from '../factory/workers/manager';
-import { createWorktreeManager } from '../factory/worktrees/worktree';
+import { createWorkerManager, type SpawnWorker, type WorkerProfile } from '../factory/workers/manager';
+import { createWorktreeManager, taskWorktreeBranch } from '../factory/worktrees/worktree';
 
 /**
  * The E2 `factory` CLI (spec §20 operator interface): `init`, `start`, `stop`,
@@ -145,32 +155,154 @@ function ensureStorageDirs(runtime: FactoryRuntimeConfig): void {
 // Server lifecycle
 // ---------------------------------------------------------------------------
 
-function buildServerDeps(dir: string, runtime: FactoryRuntimeConfig): FactoryServerDeps {
+/**
+ * The E3 `SchedulerPolicy` adapter (E9.1 ruling RE5): assignment is an E7
+ * `repo.write` decision on the Task's real worktree branch
+ * (`wo-<workOrderId>/task-<short>`), binding `path: '**'` — the whole-worktree
+ * binding at assignment time. The **write-time** path gate (E9.8, RE6) folds
+ * `repo.write` over the change set's actual changed paths, so the embedded
+ * `infra/**` exclusion is enforced against the diff and not merely the branch.
+ * `ALLOW` assigns; a `REQUIRE_HUMAN`/`DENY` verdict leaves the Task `READY` and
+ * is surfaced by the scheduler's `blockedPolicy`.
+ */
+export function createSchedulerPolicy(deps: {
+  store: StateStore;
+  events: EventLog;
+}): SchedulerPolicy {
+  return {
+    canAssign: (task, workOrder) =>
+      check(deps, { taskId: task.id, workOrderId: workOrder.id }, {
+        capability: 'repo.write',
+        resource: { branch: taskWorktreeBranch(task.id, workOrder.id), path: '**' },
+      }),
+    canWriteChangeSet: (task, workOrder, branch, paths) =>
+      repoWriteGate(deps, { taskId: task.id, workOrderId: workOrder.id }, branch, paths),
+  };
+}
+
+/**
+ * Overridable seams for {@link buildServerDeps}. Production uses the real Herdr
+ * adapter factory and wall-clock `now`; tests inject a fake adapter (Ruling R5:
+ * hermetic — never spawn a real runtime) and a deterministic clock.
+ */
+export interface ServerDepsOptions {
+  spawn?: SpawnWorker;
+  now?: () => string;
+  /**
+   * E9.4 verification seam. Production wires an E5-backed verifier here;
+   * absent, the scheduler fails closed — a SUCCESS Task is never promoted
+   * without a persisted Evidence Bundle.
+   */
+  verifier?: WorkVerifier;
+  /**
+   * E9.6 boot reconciliation. On a real server start this runs first (spec
+   * §18.3), so a crash that left an in-flight Attempt behind is interrupted and
+   * recovered before the scheduler loop begins. Defaults to `true`; tests that
+   * build deps over pre-seeded state can opt out.
+   */
+  reconcileOnBoot?: boolean;
+}
+
+export function buildServerDeps(
+  runtime: FactoryRuntimeConfig,
+  options: ServerDepsOptions = {},
+): FactoryServerDeps {
+  ensureStorageDirs(runtime);
   const store = openStateStore(runtime.paths.db);
   const events = openEventLog(store.db);
-  const workers = createWorkerManager({ store, events, spawn: () => createHerdrWorker() });
-  const worktrees = createWorktreeManager({
-    rootDir: join(dir, '.factory', 'worktrees'),
-    baseBranch: 'main',
+  const workers = createWorkerManager({
+    store,
+    events,
+    spawn: options.spawn ?? (() => createHerdrWorker()),
+    ...(options.now ? { now: options.now } : {}),
   });
+  const worktrees = createWorktreeManager({
+    rootDir: runtime.worktrees.rootDir,
+    baseBranch: runtime.worktrees.baseBranch,
+  });
+  const artifacts = createArtifactStore(runtime.paths.artifacts);
+  // One store-backed evidence reader serves both the Observatory projection and
+  // E9.7's per-Attempt telemetry (human-leverage layer) — a single read seam.
+  const evidence = createEvidenceReadPort(store);
+  // E9.6 boot reconciliation (spec §18.3): walk durable state → event history →
+  // RUNNING Attempts → worker leases before the loop starts. Post-restart no
+  // adapter is live, so every lease is treated as stopped (via
+  // `ReconcileOptions.workerStatus`): an in-flight Attempt is interrupted (never
+  // claimed successful), its diff preserved as evidence, its Assignment closed,
+  // and recovery opens a new clean-baseline Attempt.
+  if (options.reconcileOnBoot !== false) {
+    reconcileAfterRestart(
+      {
+        store,
+        events,
+        artifacts,
+        ...(options.now ? { now: options.now } : {}),
+      },
+      { workerStatus: () => 'stopped' },
+    );
+  }
   // The resolved `factory.yaml` scheduler config drives the real E3 scheduler,
   // so an edited desired config changes the running instance. The serve path
   // owns the loop lifecycle (start/stop around the listener).
   const scheduler = createScheduler(
-    { store, events, workers, worktrees },
+    {
+      store,
+      events,
+      workers,
+      worktrees,
+      repoPath: runtime.repository.path,
+      artifacts,
+      policy: createSchedulerPolicy({ store, events }),
+      telemetry: { evidence },
+      ...(options.verifier ? { verifier: options.verifier } : {}),
+    },
     {
       maxConcurrentTasks: runtime.scheduler.maxConcurrentTasks,
       tickIntervalMs: runtime.scheduler.tickIntervalMs,
+      provisioning: {
+        ...runtime.scheduler.provisioning,
+        defaultProfile: runtime.scheduler.provisioning.defaultProfile as WorkerProfile,
+      },
     },
   );
   return {
     store,
     events,
-    evidence: createEmptyEvidenceReadPort(),
+    evidence,
     scheduler,
     version: runtime.factoryVersion,
     schemaVersion: runtime.schemaVersion,
   };
+}
+
+/**
+ * The E6 composition root (E9.8, #34): construct the GitHub adapter with the
+ * **real** deps — the E2 client (sole mutation authority), the E7
+ * `checkDetailed` policy (so `branch.create`/`pr.create`/merge gates run against
+ * live policy), and the durable `evidence_bundles` read-back (so the merge gate
+ * trusts the persisted receipt, never a caller-supplied bundle). Production
+ * supplies the concrete transport (a GitHub REST client); tests mock it (R6).
+ *
+ * The Factory never constructs a second GitHub path: this is the only place the
+ * E6 adapter is wired, mirroring `buildServerDeps`.
+ */
+export function buildGitHubAdapter(input: {
+  transport: GitHubTransport;
+  client: FactoryClient;
+  factoryBaseUrl: string;
+  store: StateStore;
+  events: EventLog;
+  baseBranch?: string;
+}): GitHubAdapter {
+  return createGitHubAdapter({
+    transport: input.transport,
+    client: input.client,
+    factoryBaseUrl: input.factoryBaseUrl,
+    ...(input.baseBranch ? { baseBranch: input.baseBranch } : {}),
+    checkPolicy: (subject, action) =>
+      checkDetailed({ store: input.store, events: input.events }, subject, action),
+    readEvidence: (id) => input.store.get<EvidenceBundle>('evidence_bundles', id),
+  });
 }
 
 async function cmdInit(args: ParsedArgs, io: CliIO): Promise<number> {
@@ -225,9 +357,13 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   const loaded = loadConfig(dir, io);
   if (!loaded) return 1;
   const port = flag(args, 'port') !== undefined ? Number(flag(args, 'port')) : loaded.runtime.server.port;
+  // The bind address is the resolved `server.hostname` (spec §20); `--hostname`
+  // overrides it for a container, where the loopback default is unreachable
+  // through a mapped port.
+  const hostname = flag(args, 'hostname') ?? loaded.runtime.server.hostname;
 
-  const deps = buildServerDeps(dir, loaded.runtime);
-  const handle = startFactoryServer(deps, { port });
+  const deps = buildServerDeps(loaded.runtime);
+  const handle = startFactoryServer(deps, { port, hostname });
   // Actually run the E3 scheduler loop for the life of the server (spec §7.2).
   deps.scheduler?.start();
   writeRuntimeFile(dir, {
@@ -256,9 +392,12 @@ async function cmdStart(args: ParsedArgs, io: CliIO): Promise<number> {
   const loaded = loadConfig(dir, io);
   if (!loaded) return 1;
   const port = flag(args, 'port') ?? String(loaded.runtime.server.port);
+  const hostname = flag(args, 'hostname') ?? loaded.runtime.server.hostname;
 
   if (!hasFlag(args, 'detached')) {
-    return cmdServe({ ...args, flags: withFlag(args, 'port', port) }, io);
+    const withPort = { ...args, flags: withFlag(args, 'port', port) };
+    const withPortAndHostname = { ...withPort, flags: withFlag(withPort, 'hostname', hostname) };
+    return cmdServe(withPortAndHostname, io);
   }
 
   // Guard on an existing runtime.json: a live server must not be shadowed by a
@@ -276,10 +415,13 @@ async function cmdStart(args: ParsedArgs, io: CliIO): Promise<number> {
   }
 
   const cliFile = fileURLToPath(import.meta.url);
-  const child = Bun.spawn([process.execPath, cliFile, '__serve', '--dir', dir, '--port', port], {
-    stdio: ['ignore', 'ignore', 'ignore'],
-    env: process.env,
-  });
+  const child = Bun.spawn(
+    [process.execPath, cliFile, '__serve', '--dir', dir, '--port', port, '--hostname', hostname],
+    {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      env: process.env,
+    },
+  );
   child.unref();
 
   // The child writes runtime.json once it is listening; wait for it.
@@ -425,14 +567,41 @@ async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
     return 0;
   }
 
+  if (sub === 'plan') {
+    const id = args.positionals[2];
+    const dagFile = flag(args, 'dag');
+    if (!id || !dagFile) {
+      io.err('usage: factory wo plan <workOrderId> --dag <file> [--url <url>]');
+      return 1;
+    }
+    const path = resolve(io.cwd ?? process.cwd(), dagFile);
+    if (!existsSync(path)) {
+      io.err(`dag file not found: ${path}`);
+      return 1;
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(readFileSync(path, 'utf8'));
+    } catch (error) {
+      io.err(`dag file is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+      return 1;
+    }
+    if (!payload || typeof payload !== 'object' || !Array.isArray((payload as { nodes?: unknown }).nodes)) {
+      io.err('dag file must be a JSON object with a "nodes" array');
+      return 1;
+    }
+    io.out(JSON.stringify(await client.commitDag(id, payload as DAGProposalPayload)));
+    return 0;
+  }
+
   if (sub === 'answer') {
     const id = args.positionals[2];
     const response = args.positionals.slice(3).join(' ') || flag(args, 'response');
     if (!id || !response) {
-      io.err('usage: factory wo answer <interactionId> <response>');
+      io.err('usage: factory wo answer <interactionId> <response> [--actor <id>]');
       return 1;
     }
-    io.out(JSON.stringify(await client.answerInteraction(id, response)));
+    io.out(JSON.stringify(await client.answerInteraction(id, response, flag(args, 'actor'))));
     return 0;
   }
 
@@ -451,6 +620,82 @@ async function cmdObservatory(args: ParsedArgs, io: CliIO): Promise<number> {
   return 0;
 }
 
+/**
+ * E9.6 factory-level controls (spec §10/§18.11): `factory control
+ * <status|pause|resume|emergency-stop> [--actor <id>]`. The durable flag and
+ * its event are E7's; the CLI only calls the API, so the server remains the
+ * sole mutation authority.
+ */
+async function cmdControl(args: ParsedArgs, io: CliIO): Promise<number> {
+  const sub = args.positionals[1];
+  const url = resolveUrl(args, io);
+  if (!url) {
+    io.err('no server URL; pass --url or start the server first');
+    return 1;
+  }
+  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+
+  if (sub === 'status') {
+    io.out(JSON.stringify(await client.factoryControls()));
+    return 0;
+  }
+  if (sub === 'pause' || sub === 'resume' || sub === 'emergency-stop') {
+    const actor = flag(args, 'actor');
+    if (!actor) {
+      io.err(`usage: factory control ${sub} --actor <id> [--url <url>]`);
+      return 1;
+    }
+    const controls =
+      sub === 'pause'
+        ? await client.pause(actor)
+        : sub === 'resume'
+          ? await client.resume(actor)
+          : await client.emergencyStop(actor);
+    io.out(JSON.stringify(controls));
+    return 0;
+  }
+
+  io.err(`unknown control subcommand: ${sub ?? ''}`);
+  return 1;
+}
+
+async function cmdApprovals(args: ParsedArgs, io: CliIO): Promise<number> {
+  const sub = args.positionals[1];
+  const url = resolveUrl(args, io);
+  if (!url) {
+    io.err('no server URL; pass --url or start the server first');
+    return 1;
+  }
+  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+
+  if (sub === 'list') {
+    const status = flag(args, 'status') as 'PENDING' | 'ANSWERED' | 'SPENT' | undefined;
+    io.out(JSON.stringify(await client.listApprovals(status)));
+    return 0;
+  }
+
+  if (sub === 'answer') {
+    const id = args.positionals[2];
+    const decision = flag(args, 'decision');
+    const actor = flag(args, 'actor');
+    if (!id || (decision !== 'APPROVAL' && decision !== 'DENY') || !actor) {
+      io.err('usage: factory approvals answer <approvalId> --decision APPROVAL|DENY --actor <id> [--comment <text>] [--url <url>]');
+      return 1;
+    }
+    const comment = flag(args, 'comment');
+    const approval = await client.answerApproval(id, {
+      decision,
+      actor,
+      ...(comment ? { comment } : {}),
+    });
+    io.out(JSON.stringify(approval));
+    return 0;
+  }
+
+  io.err(`unknown approvals subcommand: ${sub ?? ''}`);
+  return 1;
+}
+
 const HELP = [
   'factory <command>',
   '',
@@ -463,8 +708,13 @@ const HELP = [
   '  restore <archive> --into <dir> [--force]  restore a backup archive',
   '  wo submit --intent <text> [--url]      create a Work Order (DRAFT)',
   '  wo status <workOrderId> [--url]        read Work Order status',
-  '  wo answer <interactionId> <response>   answer a QUESTION',
+  '  wo plan <workOrderId> --dag <file>     commit a planner DAG proposal',
+  '  wo answer <interactionId> <response> [--actor <id>]  answer a QUESTION',
+  '  approvals list [--status <state>]      list policy approvals',
+  '  approvals answer <approvalId> --decision APPROVAL|DENY --actor <id>  answer an approval',
   '  observatory [--url]                    read Observatory projections',
+  '  control status [--url]                 read pause/e-stop controls',
+  '  control <pause|resume|emergency-stop> --actor <id>  set a factory control',
 ].join('\n');
 
 export async function runCli(argv: string[], io: CliIO): Promise<number> {
@@ -490,8 +740,12 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         return await cmdRestore(args, io);
       case 'wo':
         return await cmdWo(args, io);
+      case 'approvals':
+        return await cmdApprovals(args, io);
       case 'observatory':
         return await cmdObservatory(args, io);
+      case 'control':
+        return await cmdControl(args, io);
       case 'help':
       case undefined:
         io.out(HELP);

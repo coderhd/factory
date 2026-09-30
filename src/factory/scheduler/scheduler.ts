@@ -1,8 +1,24 @@
-import { completeAttempt, transitionTask, type Task, type WorkOrder } from '../domain/workOrder';
+import {
+  completeAttempt,
+  transitionTask,
+  transitionWorkOrder,
+  type Attempt,
+  type Task,
+  type WorkOrder,
+} from '../domain/workOrder';
+import type { WorkVerifier, VerificationOutcome } from '../verification/orchestrator';
 import type { EventLog } from '../events/log';
 import { getActiveDAG, type DAGVersion } from '../planning/dag';
+import { createEvidenceReadPort, type EvidenceReadPort } from '../observatory/observatory';
+import { changedPathsFromDiff, isEmergencyStopped, isFactoryPaused } from '../policy/policy';
+import { RESOURCE_UNAVAILABLE } from '../recovery/recovery';
+import { routeAssignment } from '../routing/assignment';
+import type { BudgetState, ModelId } from '../routing/decisionModel';
+import { persistRoutingDecision } from '../routing/persist';
+import { RoutingBlockedError, toRoutingDecisionRecord } from '../routing/rules';
 import type { ArtifactStore, StateStore } from '../state/store';
-import type { WorkerInteraction, WorkerResult } from '../workers/herdr';
+import { recordAttemptTelemetry, TELEMETRY_ATTEMPT_RECORDED } from '../telemetry/telemetry';
+import type { WorkerAnswer, WorkerInteraction, WorkerResult } from '../workers/herdr';
 import {
   assign,
   openAssignmentFor,
@@ -13,6 +29,7 @@ import {
   type WorkerRecord,
 } from '../workers/manager';
 import type { WorktreeManager } from '../worktrees/worktree';
+import { taskWorktreeBranch } from '../worktrees/worktree';
 
 /**
  * E3.2 capacity- and policy-aware scheduler (spec §7.2). In-process and
@@ -25,6 +42,19 @@ export type PolicyVerdict = 'ALLOW' | 'DENY' | 'REQUIRE_HUMAN';
 
 export interface SchedulerPolicy {
   canAssign(task: Task, workOrder: WorkOrder): PolicyVerdict;
+  /**
+   * E9.8 write-time path gate (RE6): given the changed paths a SUCCESS change
+   * set touches, authorize each as a `repo.write` on the Task's worktree branch.
+   * The assignment gate binds `path:'**'` for the whole worktree; this is the
+   * enforcement against the *actual* paths — the embedded `infra/**` exclusion.
+   * Absent, the write-time gate is not enforced (production wires it).
+   */
+  canWriteChangeSet?(
+    task: Task,
+    workOrder: WorkOrder,
+    branch: string,
+    paths: string[],
+  ): { allowed: boolean; denied: string[] };
 }
 
 export interface SchedulerConfig {
@@ -52,6 +82,32 @@ export interface SchedulerDeps {
   artifacts?: ArtifactStore;
   /** Lease TTL for `startTask` heartbeats; defaults to `idleTimeoutMs`. */
   leaseTtlMs?: number;
+  /**
+   * E4 routing gates the assignment pass routes with (E9.3): the budget
+   * snapshot and the unavailable model set. Both default to "no signal"
+   * (`FULL_BUDGET`, none unavailable), which routes purely on capability.
+   */
+  routing?: SchedulerRouting;
+  /**
+   * E9.4 verification seam. When wired, a Task reaching SUCCESS is verified by
+   * the E5 tiers and its Evidence Bundle is persisted before the Task/WO may
+   * advance. Absent, verification fails closed: a SUCCESS Task is never
+   * promoted (no silent pass).
+   */
+  verifier?: WorkVerifier;
+  /**
+   * E9.7 telemetry read port. When wired (production: the server's store-backed
+   * evidence reader), the per-Attempt receipt derives its human-leverage layer
+   * from the same reader the Observatory uses. Absent, a store-backed reader is
+   * built locally; either way the receipt is derived, never fabricated.
+   */
+  telemetry?: { evidence: EvidenceReadPort };
+}
+
+/** E4 routing signals for the assignment pass (RE7(b)). */
+export interface SchedulerRouting {
+  budget?: BudgetState;
+  unavailable?: ModelId[];
 }
 
 export interface SchedulerStatus {
@@ -66,6 +122,8 @@ export interface SchedulerStatus {
     readyTaskIds: string[];
     blocked: Array<{ taskId: string; waitingOnTaskIds: string[] }>;
     blockedPolicy: Array<{ taskId: string; verdict: PolicyVerdict }>;
+    /** E9.3: READY tasks a blocked route refused to assign (no model available). */
+    blockedRouting: Array<{ taskId: string; candidates: ModelId[]; unavailable: ModelId[] }>;
   };
   activeDAGs: Array<{ workOrderId: string; version: number; nodes: number }>;
 }
@@ -75,6 +133,12 @@ export interface Scheduler {
   start(): void;
   stop(): void;
   status(): SchedulerStatus;
+  /**
+   * Deliver a human answer into the runtime holding `workerId` (E9.5). The
+   * durable interaction is already persisted by the server; this is the live
+   * channel that unparks a `waiting_input` runtime.
+   */
+  deliverAnswer(workerId: string, answer: WorkerAnswer): Promise<void>;
 }
 
 /** Event vocabulary for persisted §12 interactions (E1 `<aggregate>.<verb>` style). */
@@ -86,6 +150,25 @@ export const INTERACTION_CREATED = 'interaction.created';
  * because `startTask` threw after `assign` had committed.
  */
 export const ASSIGNMENT_START_FAILED = 'assignment.start_failed';
+
+/**
+ * Process-wide one-time guard for the fail-closed missing-verifier warning. A
+ * `createScheduler` per test would otherwise repeat the same line many times;
+ * the warning is about a deployment misconfiguration, so once per process is
+ * loud enough (mirroring how a single running server has one scheduler).
+ */
+let warnedMissingVerifier = false;
+
+/**
+ * E9.4 diagnostic events. `EVIDENCE_BUNDLE_RECORDED` is appended in the same
+ * transaction that persists the immutable bundle, so the receipt and its log
+ * entry cannot diverge. `VERIFICATION_FAILED` carries the structured §14.4
+ * failures that drove REWORK; `VERIFICATION_REJECTED` records a run refused
+ * before any bundle could exist (e.g. writer = verifier) — never a pass.
+ */
+export const EVIDENCE_BUNDLE_RECORDED = 'evidence.bundle_recorded';
+export const VERIFICATION_FAILED = 'verification.failed';
+export const VERIFICATION_REJECTED = 'verification.rejected';
 
 /**
  * A persisted §12 interaction: the durable question a `waiting_input` Attempt
@@ -131,6 +214,22 @@ interface Completion {
   error?: string;
 }
 
+/**
+ * The fail-closed stand-in for an absent `SchedulerPolicy` (E9.1). A scheduler
+ * with no policy must never assign: defaulting to `ALLOW` would silently bypass
+ * the §5 policy gate. It DENIES every Task and logs once, loudly, at
+ * construction so a misconfigured server is visible in the logs rather than
+ * silently starved.
+ */
+function missingPolicy(): SchedulerPolicy {
+  console.error(
+    'scheduler: no policy wired (SchedulerDeps.policy is undefined); denying all assignments — wire the E7 policy check',
+  );
+  return {
+    canAssign: (_task, _workOrder) => 'DENY',
+  };
+}
+
 export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerConfig> = {}): Scheduler {
   const cfg: SchedulerConfig = {
     maxConcurrentTasks: config.maxConcurrentTasks ?? DEFAULT_CONFIG.maxConcurrentTasks,
@@ -141,21 +240,92 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     },
   };
   const now = deps.now ?? (() => new Date().toISOString());
-  const policy: SchedulerPolicy = deps.policy ?? { canAssign: () => 'ALLOW' };
+  const policy = deps.policy ?? missingPolicy();
   const leaseTtlMs = deps.leaseTtlMs ?? cfg.provisioning.idleTimeoutMs;
+  // E9.7: one evidence reader shared by telemetry and, in production, the
+  // server's Observatory projection (wired via `SchedulerDeps.telemetry`).
+  const telemetryEvidence =
+    deps.telemetry?.evidence ?? createEvidenceReadPort(deps.store);
 
   const completions: Completion[] = [];
   const pending = new Set<string>();
   /**
-   * Route-time settle guard: the exact `WorkerResult` object already routed for
-   * a worker. A resumed Task (WAITING_INPUT → RUNNING) would otherwise re-collect
-   * the adapter's still-settled report and re-ask the same question forever. The
-   * object identity is stable across polls (the adapter returns the same settled
-   * report until the next `execute`), so dropping the identical object is
-   * consume-once; a genuinely new run settles a fresh object and is routed.
+   * Route-time settle guard: the signature of the exact `WorkerResult` content
+   * already routed for a worker's live Attempt. A resumed Task
+   * (WAITING_INPUT → RUNNING) would otherwise re-collect the adapter's still-
+   * settled report and re-ask the same question forever. The guard is
+   * content-based (not object identity) so it holds even when an adapter returns
+   * a fresh copy of the same report on every poll; `attemptId` scopes it so a
+   * genuinely new Attempt (or a new question on the same Attempt) is routed.
    */
-  const routedReports = new Map<string, WorkerResult>();
+  const routedReports = new Map<string, { attemptId: string; signature: string }>();
+  /**
+   * E9.3: READY tasks a blocked route refused this tick, rendered by `status()`.
+   * Recomputed each assign pass; a blocked Task stays READY and is retried next
+   * tick (a model may become available again).
+   */
+  let blockedRouting: Array<{ taskId: string; candidates: ModelId[]; unavailable: ModelId[] }> = [];
+  /**
+   * Per-Task signature of the last blocked route, so a Task parked on a blocked
+   * pool records its `resource.unavailable` event once rather than once per
+   * tick. A changed blocked set (a model returning, budget shifting) records a
+   * fresh event; the Task stays READY throughout and is retried every tick.
+   */
+  const blockedSignatures = new Map<string, string>();
   let timer: ReturnType<typeof setInterval> | null = null;
+  /** One-time guard so a missing `repoPath` warns loudly but only once. */
+  let warnedMissingRepoPath = false;
+  /**
+   * E9.4: Tasks whose SUCCESS→VERIFIED/REWORK routing is in flight. The async
+   * verification runs off-tick (mirroring `pollWorker`) and its outcome is
+   * routed on the next tick; this set is the kind of "pending" guard that keeps
+   * a SUCCESS Task from being re-dispatched every tick while it settles.
+   */
+  const verifyPending = new Set<string>();
+  const verificationCompletions: Array<{
+    subject: { workOrderId: string; taskId: string; attemptId: string };
+    outcome: VerificationOutcome;
+  }> = [];
+
+  /**
+   * E9.7: Attempts whose six-layer telemetry receipt has already been appended.
+   * Seeded from the durable log on construction so a restart (or a replayed
+   * completion) never double-records — and therefore never double-counts cost.
+   */
+  const telemetryRecorded = new Set<string>(
+    deps.events
+      .readEvents()
+      .filter((event) => event.type === TELEMETRY_ATTEMPT_RECORDED)
+      .map((event) => event.aggregateId),
+  );
+
+  /**
+   * E9.7: append the six-layer telemetry receipt for a just-completed Attempt
+   * (the live path E8 had no caller for). One receipt per Attempt, idempotent,
+   * and read-only w.r.t. execution state: `recordAttemptTelemetry` derives the
+   * layers and appends a single `telemetry.attempt_recorded` event. It never
+   * fabricates data — an absent runtime observable is an honest `null`.
+   */
+  function recordTelemetry(attemptId: string): void {
+    if (telemetryRecorded.has(attemptId)) return;
+    telemetryRecorded.add(attemptId);
+    try {
+      recordAttemptTelemetry(
+        { store: deps.store, events: deps.events, evidence: telemetryEvidence },
+        attemptId,
+      );
+    } catch (error) {
+      // A telemetry receipt is derived state, not execution state: a projection
+      // failure must never strand a settled Attempt or abort the tick. Drop the
+      // guard so a later completion can retry, and surface it loudly.
+      telemetryRecorded.delete(attemptId);
+      console.error(
+        `scheduler: telemetry recording failed for attempt ${attemptId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
 
   // --- durable-state readers -------------------------------------------------
 
@@ -254,6 +424,21 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     );
   }
 
+  /**
+   * The content signature of a routed report (E9.5). Keyed per Attempt so the
+   * same report polled twice is consumed once, while a new question, a new
+   * completion or a new Attempt routes afresh.
+   */
+  function reportSignature(result: WorkerResult): string {
+    return JSON.stringify({
+      status: result.status,
+      interactions: result.interactions,
+      commits: result.commits,
+      diff: result.diff,
+      failure: result.failure,
+    });
+  }
+
   function storeArtifacts(attemptId: string, result: WorkerResult): string[] {
     return result.artifacts.map((artifact) => {
       if (!deps.artifacts) return artifact.name;
@@ -323,9 +508,15 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     const attemptId = worker.lease.attemptId;
     const result = item.result;
 
-    // Consume-once: a report already routed for this worker must not be routed
-    // again off a later poll (the answer loop would re-ask the same question).
-    if (result && routedReports.get(item.workerId) === result) return;
+    // Consume-once: a report whose content was already routed for this Attempt
+    // must not be routed again off a later poll (the answer loop would re-ask
+    // the same question).
+    if (result) {
+      const routed = routedReports.get(item.workerId);
+      if (routed && routed.attemptId === attemptId && routed.signature === reportSignature(result)) {
+        return;
+      }
+    }
 
     // A question is not a completion: worker stays BUSY, lease/assignment stay
     // open, and the durable §12 interaction(s) are written alongside the Task
@@ -336,7 +527,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         recordInteractions(worker.id, task.id, attemptId, result.interactions, t);
         transitionTask(deps, task.id, { to: 'WAITING_INPUT' });
       })();
-      routedReports.set(worker.id, result);
+      routedReports.set(worker.id, { attemptId, signature: reportSignature(result) });
       return;
     }
 
@@ -354,6 +545,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         transitionTask(deps, task.id, { to: 'SUCCESS' });
         release(worker, assignment, t);
       })();
+      recordTelemetry(attemptId);
       return;
     }
 
@@ -371,6 +563,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       });
       release(worker, assignment, t);
     })();
+    recordTelemetry(attemptId);
   }
 
   // --- passes ----------------------------------------------------------------
@@ -455,7 +648,57 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     })();
   }
 
+  /** Signature of a blocked route: the unavailable set that closed the pool. */
+  function blockedSignature(error: RoutingBlockedError): string {
+    return error.unavailable.join(',');
+  }
+
+  /**
+   * Route one candidate's assignment through E4 (E9.3, RE7(b)) and persist the
+   * decision's provenance. Returns the selected model, or `null` when the route
+   * is blocked — in which case no Attempt is created, the Task stays READY, and
+   * E4's `RoutingBlockedError` is mapped to E7's `resource.unavailable` park
+   * event bound to the Work Order (RE7(c)). Never substitutes a blocked model.
+   */
+  function routeForAssignment(candidate: { task: Task; workOrder: WorkOrder }): string | null {
+    try {
+      const { decision, derivedFrom } = routeAssignment({
+        workOrder: candidate.workOrder,
+        ...(deps.routing?.budget ? { budget: deps.routing.budget } : {}),
+        ...(deps.routing?.unavailable ? { unavailable: deps.routing.unavailable } : {}),
+      });
+      const record = toRoutingDecisionRecord(decision, {
+        workOrderId: candidate.workOrder.id,
+        taskId: candidate.task.id,
+        derivedFrom,
+      });
+      persistRoutingDecision({ store: deps.store, events: deps.events }, record);
+      return decision.selected;
+    } catch (error) {
+      if (!(error instanceof RoutingBlockedError)) throw error;
+      // Whole pool blocked: park on WAITING_RESOURCE semantics without a
+      // lifecycle change — Task stays READY, no Attempt, durable park event.
+      if (blockedSignatures.get(candidate.task.id) !== blockedSignature(error)) {
+        blockedSignatures.set(candidate.task.id, blockedSignature(error));
+        const at = now();
+        deps.events.appendEvent({
+          type: RESOURCE_UNAVAILABLE,
+          aggregateType: 'work_order',
+          aggregateId: candidate.workOrder.id,
+          payload: { resource: 'model', candidates: error.candidates, unavailable: error.unavailable, at },
+        });
+      }
+      blockedRouting.push({
+        taskId: candidate.task.id,
+        candidates: error.candidates,
+        unavailable: error.unavailable,
+      });
+      return null;
+    }
+  }
+
   function assignPass(): void {
+    blockedRouting = [];
     let slots = cfg.maxConcurrentTasks - countOccupied();
     const skipped = new Set<string>();
 
@@ -466,16 +709,38 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       if (!idleWorker) break;
 
       if (!deps.repoPath) {
+        // Without a repo the scheduler cannot create a worktree, so it would
+        // skip every candidate forever and silently. Warn once (not per tick)
+        // so a misconfigured server is visible, mirroring the fail-closed
+        // policy default's loudness.
+        if (!warnedMissingRepoPath) {
+          warnedMissingRepoPath = true;
+          console.error(
+            'scheduler: no repoPath wired (SchedulerDeps.repoPath is undefined); skipping all assignments — set repository.path in factory.yaml',
+          );
+        }
+        skipped.add(candidate.task.id);
+        continue;
+      }
+
+      // Route before committing anything: a blocked route must not burn the
+      // worker, a concurrency slot, or a worktree (RE7(b)/(c)).
+      const model = routeForAssignment(candidate);
+      if (model === null) {
         skipped.add(candidate.task.id);
         continue;
       }
 
       let assignment: AssignmentRecord | null = null;
       try {
-        const worktree = deps.worktrees.createTaskWorktree(candidate.task.id, deps.repoPath);
+        const worktree = deps.worktrees.createTaskWorktree(
+          candidate.task.id,
+          candidate.workOrder.id,
+          deps.repoPath,
+        );
         assignment = assign(
           { store: deps.store, events: deps.events, now },
-          { taskId: candidate.task.id, workerId: idleWorker.id, worktree },
+          { taskId: candidate.task.id, workerId: idleWorker.id, worktree, model },
         );
         startTask({ ...deps, leaseTtlMs }, assignment);
         pollWorker(idleWorker.id);
@@ -500,9 +765,217 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     );
   }
 
+  // --- E9.4 verification + evidence ------------------------------------------
+
+  /**
+   * The Tasks awaiting verification: SUCCESS Tasks whose Work Order is still in
+   * the execution states (EXECUTING/WAITING_INPUT). Read from durable state, so
+   * a crash mid-flight simply re-dispatches on the next tick.
+   */
+  function successSubjects(): Array<{ workOrder: WorkOrder; task: Task; attempt: Attempt }> {
+    const subjects: Array<{ workOrder: WorkOrder; task: Task; attempt: Attempt }> = [];
+    const workOrders = deps.store
+      .list<WorkOrder>('work_orders')
+      .filter((wo) => wo.state === 'EXECUTING' || wo.state === 'WAITING_INPUT');
+    const attempts = deps.store.list<Attempt>('attempts');
+    for (const workOrder of workOrders) {
+      for (const task of deps.store.list<Task>('tasks')) {
+        if (task.workOrderId !== workOrder.id || task.state !== 'SUCCESS') continue;
+        // The latest completed Attempt for the Task is the change set verified.
+        const attempt =
+          attempts
+            .filter((candidate) => candidate.taskId === task.id && candidate.outcome === 'success')
+            .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+            .at(-1) ?? null;
+        if (attempt) subjects.push({ workOrder, task, attempt });
+      }
+    }
+    return subjects;
+  }
+
+  /**
+   * Kick verification for every SUCCESS Task not already in flight. The
+   * verifier is async, so — like `pollWorker` — the durable routing happens on
+   * the next tick via {@link routeVerificationQueued}.
+   */
+  function verificationPass(): void {
+    const subjects = successSubjects();
+    if (!deps.verifier) {
+      if (subjects.length > 0 && !warnedMissingVerifier) {
+        warnedMissingVerifier = true;
+        console.error(
+          'scheduler: no verifier wired (SchedulerDeps.verifier is undefined); SUCCESS Tasks will not be verified or promoted — wire the E5 verification orchestration',
+        );
+      }
+      return;
+    }
+    for (const subject of subjects) {
+      if (verifyPending.has(subject.task.id)) continue;
+
+      // E9.8 write-time path gate (RE6): the assignment gate authorized the whole
+      // worktree (`path:'**'`); here the change set's *actual* paths are known
+      // from the diff, so a path outside the `repo.write` grant (the embedded
+      // `infra/**` exclusion) is refused before verification — never verified,
+      // never promoted. A denial settles as a structured rejection. An empty
+      // diff yields no paths (a vacuous, explicitly-non-denying case inside the
+      // gate) — nothing was written, so there is nothing to gate.
+      const gate = deps.policy?.canWriteChangeSet;
+      if (gate) {
+        const branch = taskWorktreeBranch(subject.task.id, subject.workOrder.id);
+        const paths = changedPathsFromDiff(subject.attempt.diff ?? '');
+        const check = gate(subject.task, subject.workOrder, branch, paths);
+        if (!check.allowed) {
+          verifyPending.add(subject.task.id);
+          verificationCompletions.push({
+            subject: keyOf(subject),
+            outcome: {
+              bundle: null,
+              passed: false,
+              failures: [],
+              rejection: `repo.write denied for ${check.denied.join(', ')} on ${branch}`,
+            },
+          });
+          continue;
+        }
+      }
+
+      verifyPending.add(subject.task.id);
+      const reject = (error: unknown): void => {
+        verificationCompletions.push({
+          subject: keyOf(subject),
+          outcome: {
+            bundle: null,
+            passed: false,
+            failures: [],
+            rejection: error instanceof Error ? error.message : String(error),
+          },
+        });
+      };
+      try {
+        // A custom verifier may be synchronous or throw before returning a
+        // promise. Both must settle as a rejection routed to REWORK — a raw
+        // throw here would escape `tick()` and strand the Task in `verifyPending`.
+        const verifier = deps.verifier;
+        Promise.resolve(verifier.verify(subject)).then(
+          (outcome) => verificationCompletions.push({ subject: keyOf(subject), outcome }),
+          reject,
+        );
+      } catch (error) {
+        reject(error);
+      }
+    }
+  }
+
+  function keyOf(subject: { task: Task; attempt: Attempt }): {
+    workOrderId: string;
+    taskId: string;
+    attemptId: string;
+  } {
+    return {
+      workOrderId: subject.task.workOrderId,
+      taskId: subject.task.id,
+      attemptId: subject.attempt.id,
+    };
+  }
+
+  /**
+   * Apply one settled verification to durable state, atomically. A pass persists
+   * the immutable bundle and advances Task → VERIFIED; when every active Task of
+   * the Work Order is VERIFIED, the Work Order advances
+   * `EXECUTING/WAITING_INPUT → VERIFYING → EVIDENCE_READY → HUMAN_GATE`. A
+   * failure (or a rejection: writer = verifier, no evidence) advances the Task
+   * `SUCCESS → VERIFYING → FAILED → REWORK` and the Work Order
+   * `→ VERIFYING → FAILED → REWORK`, recording the structured failures. Fail
+   * closed: no bundle means no gate.
+   */
+  function routeVerification(completion: (typeof verificationCompletions)[number]): void {
+    const { taskId, workOrderId } = completion.subject;
+    const task = deps.store.get<Task>('tasks', taskId);
+    const workOrder = deps.store.get<WorkOrder>('work_orders', workOrderId);
+    verifyPending.delete(taskId);
+    // Guard: only a Work Order still executing and a Task still at SUCCESS are
+    // routed. A crash/retry or a duplicate settle leaves state untouched.
+    if (!task || task.state !== 'SUCCESS' || !workOrder) return;
+    if (workOrder.state !== 'EXECUTING' && workOrder.state !== 'WAITING_INPUT') return;
+
+    const outcome = completion.outcome;
+    const at = now();
+
+    if (outcome.passed && outcome.bundle) {
+      const bundle = outcome.bundle;
+      deps.store.db.transaction(() => {
+        deps.store.set('evidence_bundles', bundle.id, bundle);
+        deps.events.appendEvent({
+          type: EVIDENCE_BUNDLE_RECORDED,
+          aggregateType: 'work_order',
+          aggregateId: workOrder.id,
+          payload: { bundle, taskId, attemptId: completion.subject.attemptId, at },
+        });
+        transitionTask(deps, taskId, { to: 'VERIFYING' });
+        transitionTask(deps, taskId, { to: 'VERIFIED', reason: 'evidence bundle recorded' });
+        if (allTasksVerified(workOrder.id)) {
+          transitionWorkOrder(deps, workOrder.id, { to: 'VERIFYING' });
+          transitionWorkOrder(deps, workOrder.id, { to: 'EVIDENCE_READY' });
+          transitionWorkOrder(deps, workOrder.id, { to: 'HUMAN_GATE', reason: 'evidence ready' });
+        }
+      })();
+      return;
+    }
+
+    // Failure or rejection: structured failure, REWORK, never a gate.
+    const eventType = outcome.rejection ? VERIFICATION_REJECTED : VERIFICATION_FAILED;
+    deps.store.db.transaction(() => {
+      deps.events.appendEvent({
+        type: eventType,
+        aggregateType: 'work_order',
+        aggregateId: workOrder.id,
+        payload: {
+          taskId,
+          attemptId: completion.subject.attemptId,
+          failures: outcome.failures,
+          diagnosis: outcome.rejection,
+          at,
+        },
+      });
+      transitionTask(deps, taskId, { to: 'VERIFYING' });
+      transitionTask(deps, taskId, { to: 'FAILED', reason: 'verification failed' });
+      transitionTask(deps, taskId, { to: 'REWORK', reason: 'verification failed' });
+      transitionWorkOrder(deps, workOrder.id, { to: 'VERIFYING' });
+      transitionWorkOrder(deps, workOrder.id, { to: 'FAILED' });
+      transitionWorkOrder(deps, workOrder.id, { to: 'REWORK', reason: 'verification failed' });
+    })();
+  }
+
+  function routeVerificationQueued(): void {
+    const queued = verificationCompletions.splice(0, verificationCompletions.length);
+    for (const completion of queued) routeVerification(completion);
+  }
+
+  /** True when every Task in the Work Order's active DAG is VERIFIED. */
+  function allTasksVerified(workOrderId: string): boolean {
+    const dag = getActiveDAG(deps, workOrderId);
+    if (!dag || dag.nodes.length === 0) return false;
+    return dag.nodes.every(
+      (node) => deps.store.get<Task>('tasks', node.taskId)?.state === 'VERIFIED',
+    );
+  }
+
   function tick(): void {
+    // E9.6 §10-2/§18.11: while an emergency stop or manual pause is active the
+    // tick takes no consequential action — no assignment, no provisioning, no
+    // verification dispatch and no new external side effect. State and evidence
+    // are preserved (nothing is destroyed or advanced); the flag is durable and
+    // event-derived, so a live scheduler observes a control set by any operator
+    // surface on the next tick, and an explicit resume releases it.
+    //
+    // The gate is read once at tick entry: a long tick that began before a stop
+    // completes all its passes. Accepted v0.1 per-tick model (passes are
+    // synchronous and short); a stop is observed from the following tick.
+    if (isEmergencyStopped(deps) || isFactoryPaused(deps)) return;
+    routeVerificationQueued();
     routeQueued();
     collectStep();
+    verificationPass();
     unblockPass();
     reclaimPass();
     provisionPass();
@@ -554,7 +1027,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         min: cfg.provisioning.min,
         max: cfg.provisioning.max,
       },
-      queue: { readyTaskIds, blocked, blockedPolicy },
+      queue: { readyTaskIds, blocked, blockedPolicy, blockedRouting },
       activeDAGs: scopeList.map((scope) => ({
         workOrderId: scope.workOrder.id,
         version: scope.dag.version,
@@ -575,5 +1048,8 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       timer = null;
     },
     status,
+    async deliverAnswer(workerId, answer): Promise<void> {
+      await deps.workers.deliverAnswer(workerId, answer);
+    },
   };
 }

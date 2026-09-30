@@ -114,6 +114,7 @@ class FakeHerdr implements WorkerAdapter {
   async collectArtifacts(): Promise<WorkerResult> {
     return this.result ?? failedResult('no result produced');
   }
+  async deliverAnswer(): Promise<void> {}
   async destroy(): Promise<void> {}
 }
 
@@ -476,7 +477,10 @@ function schedulerHarness(config: { tickIntervalMs?: number } = {}): SchedulerHa
     rootDir: join(workDir, 'worktrees'),
     baseBranch: 'main',
   });
-  const scheduler = createScheduler({ store, events, workers, worktrees, repoPath }, config);
+  const scheduler = createScheduler(
+    { store, events, workers, worktrees, repoPath, policy: { canAssign: () => 'ALLOW' } },
+    config,
+  );
   const server = startFactoryServer(
     { store, events, evidence: new FakeEvidence(), scheduler, version: '0.1.0', schemaVersion: '1' },
     { port: 0, hostname: '127.0.0.1' },

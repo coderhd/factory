@@ -9,14 +9,30 @@ import {
   type WorkOrderState,
 } from '../domain/workOrder';
 import type { EventLog } from '../events/log';
-import { projectDrillDown, projectObservatory, type EvidenceReadPort } from '../observatory/observatory';
-import { getActiveDAG } from '../planning/dag';
+import type { EvidenceReadPort } from '../observatory/observatory';
+import { commitDAG, getActiveDAG, proposeDAG, type DAGProposalPayload } from '../planning/dag';
+import {
+  answerApproval,
+  emergencyStop,
+  factoryControlState,
+  pauseFactory,
+  resumeFactory,
+  type ApprovalRecord,
+} from '../policy/policy';
 import type { Scheduler } from '../scheduler/scheduler';
 import type { StateStore } from '../state/store';
+import {
+  projectDrillDown as projectTelemetryDrillDown,
+  projectTelemetryMetrics,
+} from '../telemetry/telemetry';
 import {
   API_VERSION,
   type AnswerResultDto,
   type ApiErrorDto,
+  type ApprovalAnswerRequest,
+  type ApprovalsDto,
+  type CommitDagResultDto,
+  type FactoryControlsDto,
   type GateDecision,
   type HandshakeDto,
   type HealthDto,
@@ -64,11 +80,15 @@ const STATUS_BY_CODE: Record<string, number> = {
   TASK_NOT_FOUND: 404,
   ATTEMPT_NOT_FOUND: 404,
   WORKER_NOT_FOUND: 404,
+  APPROVAL_NOT_FOUND: 404,
   INVALID_TRANSITION: 409,
   INTERACTION_ALREADY_ANSWERED: 409,
+  APPROVAL_SPENT: 409,
   TASK_NOT_WAITING_INPUT: 409,
   TASK_NOT_READY: 409,
   WORKER_NOT_IDLE: 409,
+  APPROVAL_ACTOR_REQUIRED: 400,
+  OPERATOR_REQUIRED: 400,
   DAG_INVALID: 422,
 };
 
@@ -115,16 +135,17 @@ const GATE_TRANSITIONS: Record<GateDecision, WorkOrderState> = {
  *
  * This is the durable, state-level resume. There is deliberately no WO-level
  * `WAITING_INPUT` here: a Work Order only asks through its Tasks, so the resume
- * unit is the Task (spec §5.2). The live-runtime channel is also absent — E3's
- * `WorkerAdapter` has no `deliverAnswer`, so the human's response is recorded
- * but not yet pushed into the running worker. That channel is an E3 follow-up
- * (documented finding); the durable answer + Task resume is what E2 owns.
+ * unit is the Task (spec §5.2). The answer is also pushed into the live runtime
+ * (`WorkerAdapter.deliverAnswer`) so the worker can continue rather than sit
+ * parked with its answered question; delivery is attempted only when a
+ * scheduler/runtime is wired.
  */
-function answerInteraction(
+async function answerInteraction(
   deps: FactoryServerDeps,
   interactionId: string,
   response: string,
-): AnswerResultDto {
+  actor?: string,
+): Promise<AnswerResultDto> {
   const now = deps.now?.() ?? new Date().toISOString();
   const record = deps.store.get<InteractionDto>('interactions', interactionId);
   if (!record) {
@@ -152,7 +173,8 @@ function answerInteraction(
     status: 'ANSWERED',
     response,
     answeredAt: now,
-    answeredBy: 'human',
+    // The operator identity when supplied; `'human'` is the historical default.
+    answeredBy: actor ?? 'human',
     updatedAt: now,
   };
   let updatedTask = task;
@@ -172,7 +194,54 @@ function answerInteraction(
     });
   })();
 
+  // Deliver the answer into the live runtime (E9.5). The durable answer above is
+  // the source of truth; this is the channel that lets the worker continue. The
+  // worker holds an open assignment for a `waiting_input` Attempt, so it is
+  // present; a delivery failure is surfaced, never swallowed.
+  if (deps.scheduler) {
+    await deps.scheduler.deliverAnswer(record.workerId, {
+      interactionId,
+      question: record.question,
+      response,
+    });
+  }
+
   return { interaction: answered, task: updatedTask, workOrder };
+}
+
+/**
+ * Answer a PENDING E7 approval (spec §13). The approval ledger and the answer
+ * receipt are E7's (`answerApproval`); this route is only the server-side entry
+ * point that keeps the server the sole mutation authority. An `APPROVAL` is
+ * consumed (spent) by the *next* matching policy decision, not here.
+ *
+ * An answer is final: once `ANSWERED` (or `SPENT`) it may not be re-answered —
+ * otherwise a second answer would silently overwrite the first (last-writer-
+ * wins), letting a later `DENY` supersede a recorded `APPROVAL` or vice versa.
+ * A correction therefore requires a new approval park.
+ */
+function answerApprovalRoute(
+  deps: FactoryServerDeps,
+  approvalId: string,
+  body: ApprovalAnswerRequest,
+): ApprovalRecord {
+  const existing = deps.store.get<ApprovalRecord>('interactions', approvalId);
+  if (existing && existing.type === 'APPROVAL' && existing.status !== 'PENDING') {
+    throw new FactoryError(
+      'APPROVAL_SPENT',
+      `approval ${approvalId} is already ${existing.status}; a correction requires a new approval`,
+    );
+  }
+  const now = deps.now ?? (() => new Date().toISOString());
+  return answerApproval(
+    { store: deps.store, events: deps.events, now },
+    approvalId,
+    {
+      decision: body.decision,
+      actor: body.actor,
+      ...(body.comment ? { comment: body.comment } : {}),
+    },
+  );
 }
 
 /** The pure request handler: the entire server surface, no socket required. */
@@ -188,7 +257,14 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
     version,
     apiVersion: API_VERSION,
     schemaVersion,
-    capabilities: ['work_orders', 'interactions', 'observatory', 'scheduler'],
+    capabilities: [
+      'work_orders',
+      'interactions',
+      'approvals',
+      'observatory',
+      'scheduler',
+      'controls',
+    ],
   });
 
   return async function handle(request: Request): Promise<Response> {
@@ -231,19 +307,58 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
       return json({ scheduler: deps.scheduler.status() });
     }
 
+    // E9.6 factory-level controls (spec §10/§18.11). The durable flag + event
+    // are E7's (`emergencyStop`/`pauseFactory`/`resumeFactory`); these routes
+    // are only the operator entry point, so the server stays the sole mutation
+    // authority. The live scheduler observes the durable flag on its next tick.
+    if (resource === 'factory') {
+      if (method === 'GET' && id === 'controls') {
+        const state = factoryControlState({ events: deps.events });
+        const dto: FactoryControlsDto = { paused: state.paused, emergencyStopped: state.emergencyStopped };
+        return json(dto);
+      }
+      if (method === 'POST' && id !== undefined && action === undefined) {
+        const body = await readJson<{ actor?: unknown }>(request);
+        const actor = typeof body?.actor === 'string' ? body.actor.trim() : '';
+        if (actor.length === 0) return apiError('OPERATOR_REQUIRED', 'actor is required', 400);
+        const controlDeps = { store: deps.store, events: deps.events, now };
+        const state =
+          id === 'emergency-stop'
+            ? emergencyStop(controlDeps, { actor })
+            : id === 'pause'
+              ? pauseFactory(controlDeps, { actor })
+              : id === 'resume'
+                ? resumeFactory(controlDeps, { actor })
+                : null;
+        if (!state) return apiError('NOT_FOUND', `no route for ${method} ${url.pathname}`, 404);
+        const dto: FactoryControlsDto = { paused: state.paused, emergencyStopped: state.emergencyStopped };
+        return json(dto);
+      }
+    }
+
     if (resource === 'observatory') {
       if (method === 'GET' && id === undefined) {
-        const dto: ObservatoryDto = {
-          generatedAt: now(),
-          ...projectObservatory(deps.evidence),
-        };
+        // E9.7: the Observatory projection is E8's, over the same store/evidence
+        // seam — verified/day + throughput/human-hour from real evidence bundles,
+        // plus rework and recorded cost. Never fabricates: an empty Factory is
+        // zero/[], not invented data.
+        const dto: ObservatoryDto = projectTelemetryMetrics({
+          store: deps.store,
+          events: deps.events,
+          evidence: deps.evidence,
+        });
         return json(dto);
       }
       if (method === 'GET' && id === 'work-orders' && action !== undefined) {
         const workOrderId = segments[3];
         const tail = segments[4];
         if (tail === 'drill-down') {
-          const drillDown = projectDrillDown(deps.evidence, deps.store, workOrderId);
+          // E9.7: the full §23 chain from E8's projection (trace resolves from
+          // recorded telemetry; verification/evidence from E5's durable rows).
+          const drillDown = projectTelemetryDrillDown(
+            { store: deps.store, events: deps.events, evidence: deps.evidence },
+            workOrderId,
+          );
           if (!drillDown) {
             return apiError('WORK_ORDER_NOT_FOUND', `work order not found: ${workOrderId}`, 404);
           }
@@ -311,6 +426,20 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
         const workOrder = transitionWorkOrder(deps, id, { to: GATE_TRANSITIONS[decision] });
         return json({ workOrder });
       }
+      if (method === 'POST' && id !== undefined && action === 'dag') {
+        const body = await readJson<DAGProposalPayload>(request);
+        if (!body || typeof body !== 'object') {
+          return apiError('INVALID_REQUEST', 'dag requires a JSON proposal payload', 400);
+        }
+        // Planner proposes, Factory commits (spec §7.1): record the advisory
+        // proposal, then commit through E3. Both are Factory-owned; an invalid
+        // payload throws DAG_INVALID (422) after one rejection event, nothing
+        // else written. The route never touches tasks/edges directly.
+        const proposal = proposeDAG(deps, id, body);
+        const dag = commitDAG(deps, id, body);
+        const result: CommitDagResultDto = { proposal, dag };
+        return json(result, 201);
+      }
     }
 
     if (resource === 'interactions') {
@@ -318,16 +447,49 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
         const status = url.searchParams.get('status');
         const interactions = deps.store
           .list<InteractionDto>('interactions')
+          // Question-only: the `interactions` collection also holds E7 approval
+          // ledgers, which are answered through `/approvals`. Mixing them would
+          // let a CLI `wo answer` pick up an approval id.
+          .filter((interaction) => interaction.type === 'QUESTION')
           .filter((interaction) => status === null || interaction.status === status);
         return json({ interactions });
       }
       if (method === 'POST' && id !== undefined && action === 'answer') {
-        const body = await readJson<{ response?: unknown }>(request);
+        const body = await readJson<{ response?: unknown; actor?: unknown }>(request);
         const response = typeof body?.response === 'string' ? body.response : null;
         if (response === null || response.trim().length === 0) {
           return apiError('INVALID_REQUEST', 'response is required', 400);
         }
-        return json(answerInteraction(deps, id, response));
+        const actor = typeof body?.actor === 'string' ? body.actor.trim() : undefined;
+        return json(await answerInteraction(deps, id, response, actor || undefined));
+      }
+    }
+
+    if (resource === 'approvals') {
+      if (method === 'GET' && id === undefined) {
+        const status = url.searchParams.get('status');
+        const approvals = deps.store
+          .list<ApprovalRecord>('interactions')
+          .filter((row) => row.type === 'APPROVAL')
+          .filter((row) => status === null || row.status === status);
+        const dto: ApprovalsDto = { approvals };
+        return json(dto);
+      }
+      if (method === 'POST' && id !== undefined && action === 'answer') {
+        const body = await readJson<Partial<ApprovalAnswerRequest>>(request);
+        const decision = body?.decision;
+        if (decision !== 'APPROVAL' && decision !== 'DENY') {
+          return apiError('INVALID_REQUEST', 'decision must be APPROVAL or DENY', 400);
+        }
+        const actor = typeof body?.actor === 'string' ? body.actor.trim() : '';
+        if (actor.length === 0) return apiError('APPROVAL_ACTOR_REQUIRED', 'actor is required', 400);
+        const comment = typeof body?.comment === 'string' ? body.comment : undefined;
+        const approval = answerApprovalRoute(deps, id, {
+          decision,
+          actor,
+          ...(comment ? { comment } : {}),
+        });
+        return json({ approval });
       }
     }
 
@@ -346,10 +508,17 @@ export function startFactoryServer(
     port: options.port ?? 0,
     fetch: createApiHandler(deps),
   });
+  // `Bun.serve` always assigns a concrete port (including for `port: 0`), but
+  // its type is optional. Fail loudly rather than advertise "undefined".
+  const port = server.port;
+  if (port === undefined) {
+    server.stop(true);
+    throw new FactoryError('SERVER_PORT_UNAVAILABLE', 'Bun.serve did not report a bound port');
+  }
   return {
     hostname,
-    port: server.port,
-    url: `http://${hostname}:${server.port}`,
+    port,
+    url: `http://${hostname}:${port}`,
     stop(): void {
       server.stop(true);
     },

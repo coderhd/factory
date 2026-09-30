@@ -16,10 +16,7 @@ import { createVerificationEngine } from '../../src/factory/verification/engine'
 import { createSemanticVerifier } from '../../src/factory/verification/semantic';
 import type { WorkOrder } from '../../src/factory/domain/workOrder';
 import { checkDetailed as policyCheck, answerApproval, emergencyStop, type ApprovalRecord } from '../../src/factory/policy/policy';
-import {
-  createDefaultPolicy,
-  type PolicyDocument,
-} from '../../src/factory/policy/policy';
+import { type PolicyDocument } from '../../src/factory/policy/policy';
 import {
   acceptanceCriteriaFromIssue,
   buildPullRequestBody,
@@ -100,6 +97,7 @@ class MockGitHubTransport implements GitHubTransport {
     };
     this.prDetails.set(pr.number, {
       ...pr,
+      headSha: 'sha_head_1',
       body: input.body,
       state: 'open',
       merged: false,
@@ -165,26 +163,23 @@ interface Harness {
 const FACTORY_BASE_URL = 'http://factory.local:8787';
 
 /**
- * The E6 branch is `factory/<workOrderId>`; the embedded policy's `branch.create`
- * scope binds `wo-*`; a real deployment grants the Factory's own branch prefix
- * (`factory/wo_<id>`) so the E6 branch is authorized.
+ * The E6 branch lives in the E3 `wo-<workOrderId>/task-<…>` namespace
+ * (RE5(c)/E9.8), which the embedded `branch.create`/`repo.write` scope
+ * (`wo-*&#47;**`) already authorizes — no bespoke deployment grant is needed.
+ * The helper is a no-op kept to mark where a grant used to be required.
  */
-const FACTORY_BRANCH_PATTERN = 'factory/wo_*';
-
-/** Grant `branch.create` for the Factory's own branch prefix (E7 §8-1). */
-function grantFactoryBranches(h: Harness): void {
-  h.policy = {
-    ...createDefaultPolicy(),
-    organization: {
-      capabilities: {
-        ...createDefaultPolicy().organization.capabilities,
-        'branch.create': [
-          { decision: 'ALLOW', scope: { branchPattern: FACTORY_BRANCH_PATTERN } },
-        ],
-      },
-    },
-  };
+function grantFactoryBranches(_h: Harness): void {
+  // No-op: the default embedded policy authorizes the `wo-*` namespace.
 }
+
+/**
+ * The E6 change-set branch: the E3 `wo-<id>/task-<…>` namespace, with the leaf
+ * keyed on the **Work Order** (E6 opens one PR per Work Order). E3's worktree
+ * branch keys the leaf on the **Task** (`taskWorktreeBranch`); the leaves differ
+ * while the namespace (and so policy scope) agrees. Per-task alignment: #37.
+ */
+const expectedBranchName = (workOrderId: string): string =>
+  `wo-${workOrderId}/task-${workOrderId.slice(0, 8)}`;
 
 function harness(): Harness {
   const store = openStateStore(join(workDir, 'factory.db'));
@@ -197,7 +192,7 @@ function harness(): Harness {
   // A recording wrapper where the client is constructed, so we can prove every
   // HTTP request the adapter causes goes to the Factory server — never GitHub.
   const factoryRequests: string[] = [];
-  const recordingFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const recordingFetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     factoryRequests.push(url);
@@ -228,6 +223,9 @@ function harness(): Harness {
     // so the merge gate can bind the ALLOW to the approving human. Tests may
     // override `h.policy` before exercising a gated path.
     checkPolicy: (subject, action) => policyCheck({ store, events, policy: h.policy }, subject, action),
+    // E9.8: the durable Evidence Bundle read-back — the merge gate's source of
+    // truth. Tests persist the bundle (as E9.4's scheduler does) before merging.
+    readEvidence: (id) => store.get<EvidenceBundle>('evidence_bundles', id),
   });
 
   return h;
@@ -342,16 +340,16 @@ describe('E6.1 GitHub branch creation', () => {
         repository: issue.repository,
         number: issue.number,
       });
-      // The E6 branch is `factory/<wo>`; the embedded `branch.create` scope binds
-      // `wo-*/**`. A deployment grants the Factory prefix it actually uses.
+      // The E6 branch is the E3 namespace `wo-<woId>/task-<short>`; the embedded
+      // `branch.create` scope binds `wo-*&#47;**`, so it is authorized as-is.
       grantFactoryBranches(h);
 
       const branch = await h.adapter.createBranch(workOrder);
 
-      expect(branch.name).toBe(`factory/${workOrder.id}`);
+      expect(branch.name).toBe(expectedBranchName(workOrder.id));
       expect(branch.repository).toBe('acme/widgets');
       expect(h.transport.branchCalls).toEqual([
-        { repository: 'acme/widgets', branch: `factory/${workOrder.id}`, baseBranch: 'main' },
+        { repository: 'acme/widgets', branch: expectedBranchName(workOrder.id), baseBranch: 'main' },
       ]);
       // The side effect was authorized by an ALLOW decision for `branch.create`.
       const decision = h.store
@@ -375,7 +373,7 @@ describe('E6.1 GitHub branch creation', () => {
       grantFactoryBranches(h);
 
       const branch = await h.adapter.createBranch(workOrder, 'develop');
-      expect(branch.name).toBe(`factory/${workOrder.id}`);
+      expect(branch.name).toBe(expectedBranchName(workOrder.id));
       expect(h.transport.branchCalls[0]?.baseBranch).toBe('develop');
     } finally {
       h.stop();
@@ -512,7 +510,7 @@ describe('E6.1 openPR(evidence): PR body links the WO and Evidence Bundle', () =
       expect(h.transport.prCalls).toHaveLength(1);
       const call = h.transport.prCalls[0]!;
       expect(call.repository).toBe('acme/widgets');
-      expect(call.head).toBe(`factory/${workOrder.id}`);
+      expect(call.head).toBe(expectedBranchName(workOrder.id));
       expect(call.base).toBe('main');
 
       // The PR body links both the Work Order and the immutable Evidence Bundle.
@@ -522,7 +520,7 @@ describe('E6.1 openPR(evidence): PR body links the WO and Evidence Bundle', () =
       expect(call.body).toContain(`[${bundle.id}](${evidenceLink})`);
 
       expect(pr.url).toBe('https://github.com/acme/widgets/pull/101');
-      expect(pr.head).toBe(`factory/${workOrder.id}`);
+      expect(pr.head).toBe(expectedBranchName(workOrder.id));
 
       // The side effect was authorized by an ALLOW decision for `pr.create`.
       const decision = h.store
@@ -669,13 +667,18 @@ function sourceFiles(dir: string): string[] {
 describe('E6.1 adapter is the sole GitHub integration (spec §4.2)', () => {
   const repoRoot = join(import.meta.dir, '..', '..');
 
-  it('no module other than the adapter references the GitHub transport seam', () => {
+  it('only the adapter and its composition root reference the GitHub transport seam', () => {
     const integrators = sourceFiles(join(repoRoot, 'src'))
       .filter((file) => readFileSync(file, 'utf8').includes('GitHubTransport'))
       .map((file) => file.slice(repoRoot.length + 1))
       .sort();
 
-    expect(integrators).toEqual(['src/factory/github/adapter.ts']);
+    // The adapter owns the seam; the CLI composition root (`buildGitHubAdapter`)
+    // injects a transport, mirroring `buildServerDeps`. No other module does.
+    expect(integrators).toEqual([
+      'src/cli/factory.ts',
+      'src/factory/github/adapter.ts',
+    ]);
   });
 
   it('the GitHub REST transport is the only GitHub network code in src', () => {
@@ -731,7 +734,7 @@ function recordingFetch(respond: (request: RecordedRequest) => Response): {
   calls: RecordedRequest[];
 } {
   const calls: RecordedRequest[] = [];
-  const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const impl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const method = (init?.method ?? 'GET').toUpperCase();
@@ -908,12 +911,14 @@ async function approve(h: Harness, workOrder: WorkOrder): Promise<WorkOrder> {
   return h.client.applyGate(workOrder.id, 'APPROVE');
 }
 
-/** Import → … → APPROVED → a real E5 bundle → an opened PR. */
+/** Import → … → APPROVED → a real E5 bundle (persisted) → an opened PR. */
 async function approvedWorkOrderWithPr(
   h: Harness,
 ): Promise<{ workOrder: WorkOrder; bundle: EvidenceBundle; pr: GitHubPullRequest }> {
   const workOrder = await approve(h, await advanceToHumanGate(h, await importWorkOrder(h)));
   const bundle = await realBundle(workOrder);
+  // E9.8: the durable receipt must exist before the merge gate will consider it.
+  h.store.set('evidence_bundles', bundle.id, bundle);
   const pr = await h.adapter.openPR(bundle);
   return { workOrder, bundle, pr };
 }
@@ -1132,17 +1137,24 @@ describe('E6.2 merge(gate): blocked until APPROVED + ALLOW + hygiene + no self-m
     }
   });
 
-  it('blocks a merge when the Evidence Bundle is incomplete or for another Work Order', async () => {
+  it('blocks a merge when the durable Evidence Bundle is incomplete or for another Work Order', async () => {
     const h = harness();
     try {
       const { workOrder, bundle, pr } = await approvedWorkOrderWithPr(h);
 
+      // E9.8: the persisted receipt is the source of truth. A durable INCOMPLETE
+      // receipt blocks the merge even if the caller's copy claims complete.
+      h.store.set('evidence_bundles', bundle.id, { ...bundle, complete: false });
       await expect(
-        h.adapter.merge(mergeGate(workOrder.id, { ...bundle, complete: false }, pr)),
+        h.adapter.merge(mergeGate(workOrder.id, { ...bundle, complete: true }, pr)),
       ).rejects.toMatchObject({ name: 'MergeBlockedError', reason: 'EVIDENCE_INCOMPLETE' });
-      await expect(
-        h.adapter.merge(mergeGate(workOrder.id, { ...bundle, workOrderId: 'wo_other' }, pr)),
-      ).rejects.toMatchObject({ name: 'MergeBlockedError', reason: 'EVIDENCE_MISMATCH' });
+
+      // A durable receipt for a different Work Order is refused too.
+      h.store.set('evidence_bundles', bundle.id, { ...bundle, workOrderId: 'wo_other' });
+      await expect(h.adapter.merge(mergeGate(workOrder.id, bundle, pr))).rejects.toMatchObject({
+        name: 'MergeBlockedError',
+        reason: 'EVIDENCE_MISMATCH',
+      });
       expect(h.transport.mergeCalls).toHaveLength(0);
     } finally {
       h.stop();
@@ -1157,6 +1169,9 @@ describe('E6.2 merge(gate): blocked until APPROVED + ALLOW + hygiene + no self-m
         transport: h.transport,
         client: h.client,
         factoryBaseUrl: FACTORY_BASE_URL,
+        // The durable receipt is present, so the merge reaches the policy gate
+        // and fails closed there (the point of this test).
+        readEvidence: (id) => h.store.get<EvidenceBundle>('evidence_bundles', id),
       });
 
       await expect(unpolicied.merge(mergeGate(workOrder.id, bundle, pr))).rejects.toMatchObject({
@@ -1177,9 +1192,10 @@ describe('E6.2 merge(gate): blocked until APPROVED + ALLOW + hygiene + no self-m
 
       const outcome = await h.adapter.merge(mergeGate(workOrder.id, bundle, pr));
 
-      // GitHub was asked to merge exactly the PR, through the injected transport.
+      // GitHub was asked to merge exactly the PR, pinned to the verified head
+      // SHA, through the injected transport.
       expect(h.transport.mergeCalls).toEqual([
-        { repository: 'acme/widgets', number: pr.number },
+        { repository: 'acme/widgets', number: pr.number, sha: 'sha_head_1' },
       ]);
       expect(h.transport.getPrCalls).toEqual([{ repository: 'acme/widgets', number: pr.number }]);
       expect(outcome.merge.merged).toBe(true);
@@ -1223,7 +1239,7 @@ describe('E6.2 GitHub REST transport: read + merge a pull request', () => {
             ? {
                 number: 12,
                 html_url: 'https://github.com/acme/widgets/pull/12',
-                head: { ref: 'factory/wo_1' },
+                head: { ref: 'factory/wo_1', sha: 'head-sha-1' },
                 base: { ref: 'main' },
                 body: 'links the bundle',
                 state: 'open',
@@ -1242,13 +1258,19 @@ describe('E6.2 GitHub REST transport: read + merge a pull request', () => {
       number: 12,
       url: 'https://github.com/acme/widgets/pull/12',
       head: 'factory/wo_1',
+      headSha: 'head-sha-1',
       base: 'main',
       body: 'links the bundle',
       state: 'open',
       merged: false,
     });
 
-    const result = await transport.mergePullRequest({ repository: 'acme/widgets', number: 12 });
+    // The merge is pinned to the verified head SHA (no TOCTOU).
+    const result = await transport.mergePullRequest({
+      repository: 'acme/widgets',
+      number: 12,
+      sha: 'head-sha-1',
+    });
     expect(result).toEqual({
       repository: 'acme/widgets',
       number: 12,
@@ -1260,7 +1282,7 @@ describe('E6.2 GitHub REST transport: read + merge a pull request', () => {
       'GET https://api.github.com/repos/acme/widgets/pulls/12',
       'PUT https://api.github.com/repos/acme/widgets/pulls/12/merge',
     ]);
-    expect(calls[1]!.body).toBeUndefined();
+    expect(calls[1]!.body).toEqual({ sha: 'head-sha-1' });
   });
 
   it('fails loudly with the HTTP status when GitHub refuses the merge', async () => {

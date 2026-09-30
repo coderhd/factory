@@ -9,7 +9,7 @@ import {
 import type { EventLog } from '../events/log';
 import type { SchedulerDeps } from '../scheduler/scheduler';
 import type { StateStore } from '../state/store';
-import type { ExecutionEnvelope, WorkerAdapter, WorkerResult, WorkerStatus } from './herdr';
+import type { ExecutionEnvelope, WorkerAdapter, WorkerAnswer, WorkerResult, WorkerStatus } from './herdr';
 
 /**
  * E3.2 WorkerManager façade (spec §15/§16). Workers are durable JSON documents
@@ -68,6 +68,7 @@ export interface WorkerManager {
   listWorkers(): WorkerRecord[];
   status(workerId: string): Promise<WorkerStatus>;
   execute(workerId: string, envelope: ExecutionEnvelope): Promise<void>;
+  deliverAnswer(workerId: string, answer: WorkerAnswer): Promise<void>;
   collectArtifacts(workerId: string): Promise<WorkerResult>;
 }
 
@@ -244,6 +245,18 @@ export function createWorkerManager(deps: WorkerManagerDeps): WorkerManager {
       if (failure) return failedResult(failure);
       return adapter.collectArtifacts();
     },
+
+    async deliverAnswer(workerId, answer): Promise<void> {
+      const adapter = adapters.get(workerId);
+      if (!adapter) throw new FactoryError('WORKER_NOT_FOUND', `worker not found: ${workerId}`);
+      // The dispatch run must not still be in flight; an answer belongs to a
+      // runtime that has already reported `waiting_input`.
+      const run = runs.get(workerId);
+      if (run) await run;
+      const boot = boots.get(workerId);
+      if (boot) await boot;
+      await adapter.deliverAnswer(answer);
+    },
   };
 }
 
@@ -255,6 +268,11 @@ export interface AssignmentIntent {
   taskId: string;
   workerId: string;
   worktree: { taskId: string; branch: string; worktreePath: string; baseCommit: string };
+  /**
+   * The routed model for this attempt (E9.3): selected by E4 at assignment and
+   * carried through to the Attempt. `null`/absent leaves `attempt.model` null.
+   */
+  model?: string | null;
 }
 
 /**
@@ -266,6 +284,8 @@ export interface AssignmentRecord extends Assignment {
   worktreePath: string;
   baseCommit: string;
   closedAt: string | null;
+  /** The routed model for this assignment's Attempt (E9.3); null when unrouted. */
+  model: string | null;
 }
 
 export interface AssignDeps {
@@ -312,6 +332,7 @@ export function assign(deps: AssignDeps, intent: AssignmentIntent): AssignmentRe
       worktreePath: intent.worktree.worktreePath,
       baseCommit: intent.worktree.baseCommit,
       closedAt: null,
+      model: intent.model ?? null,
       createdAt: t,
       updatedAt: t,
     };
@@ -358,7 +379,7 @@ export function startTask(deps: SchedulerDeps, assignment: AssignmentRecord): Ex
   const attempt = createAttempt(deps, {
     taskId: task.id,
     workerId: assignment.workerId,
-    model: null,
+    model: assignment.model,
     context: envelopeContext(workOrder, task),
     environment: 'herdr/local',
   });

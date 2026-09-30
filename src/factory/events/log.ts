@@ -64,7 +64,7 @@ class SqliteEventLog implements EventLog {
 
   readEvents(options: ReadEventsOptions = {}): DomainEvent[] {
     const clauses: string[] = [];
-    const params: unknown[] = [];
+    const params: (string | number)[] = [];
     if (options.afterSeq !== undefined) {
       clauses.push('seq > ?');
       params.push(options.afterSeq);

@@ -1,0 +1,34 @@
+{
+  // The Factory type gate (E9.9 #35). The repo is Bun-first: sources and tests
+  // run directly on Bun with no build step, so this config is `noEmit` only —
+  // it never emits, it only checks. Run it via `scripts/check-tsc.sh`.
+  //
+  // Scope is the Factory runtime/test surface (`src/`, `tests/`). The
+  // `.opencode/plugins/factory-guard` package is deliberately excluded: it is a
+  // separate OpenCode plugin package with its own `package.json` and its own
+  // `@opencode/plugin` dependency (checked by `scripts/check-plugin.sh`), and
+  // its ambient host types are not part of the Factory build.
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext"],
+    // `@types/bun` (Bun's documented type package) supplies the ambient
+    // `Bun`/test globals this repo relies on. It is a pinned devDependency in
+    // the root package.json, not a globally/home-installed package, so the gate
+    // works on a clean checkout. `bun` is the `@types/*` name; `bun-types` is
+    // the package it shims.
+    "types": ["bun"],
+    "strict": true,
+    "noEmit": true,
+    // Dependencies are not vendored here; only check this repo's own code.
+    "skipLibCheck": true,
+    // Sources/tests are executed by Bun, which resolves extensionless TS
+    // imports; keep that resolution honest rather than rewriting imports.
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}

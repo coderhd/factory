@@ -25,6 +25,7 @@ import {
   proposeDAG,
   validateDAG,
   type DAGProposalPayload,
+  type DagRuleCode,
   type ProposalNode,
 } from '../../src/factory/planning/dag';
 import { createScheduler, INTERACTION_CREATED, ASSIGNMENT_START_FAILED, type InteractionRecord } from '../../src/factory/scheduler/scheduler';
@@ -43,7 +44,7 @@ import {
   type AssignmentRecord,
   type WorkerRecord,
 } from '../../src/factory/workers/manager';
-import { createWorktreeManager } from '../../src/factory/worktrees/worktree';
+import { createWorktreeManager, taskWorktreeBranch } from '../../src/factory/worktrees/worktree';
 
 let workDir: string;
 let dbPath: string;
@@ -123,6 +124,7 @@ class FakeHerdr implements WorkerAdapter {
   async collectArtifacts(): Promise<WorkerResult> {
     return this.result ?? failedResult('no result produced');
   }
+  async deliverAnswer(): Promise<void> {}
   async destroy(): Promise<void> {
     this.destroyed = true;
   }
@@ -223,6 +225,8 @@ function harness(opts: {
       worktrees,
       now: clock.now,
       repoPath,
+      // E9.1: the scheduler no longer defaults to ALLOW; E3 tests opt back in.
+      policy: { canAssign: () => 'ALLOW' },
       artifacts: opts.withArtifacts ? createArtifactStore(join(workDir, 'artifacts')) : undefined,
     },
     {
@@ -387,7 +391,7 @@ describe('E3 DAG propose / validate / commit', () => {
   });
 
   const invalidCases: Array<{
-    rule: string;
+    rule: DagRuleCode;
     state: WorkOrderState[];
     payload: DAGProposalPayload;
     reasons: number;
@@ -762,13 +766,17 @@ describe('E3 scheduler capacity + policy', () => {
 // ---------------------------------------------------------------------------
 
 describe('E3 worktree isolation', () => {
+  const woId = 'wo_test';
   it('gives every task a unique branch + worktree + baseCommit under the temp root', () => {
     const worktrees = createWorktreeManager({ rootDir: worktreeRoot, baseBranch: 'main' });
-    const a = worktrees.createTaskWorktree('task_a', repoPath);
-    const b = worktrees.createTaskWorktree('task_b', repoPath);
+    const a = worktrees.createTaskWorktree('task_a', woId, repoPath);
+    const b = worktrees.createTaskWorktree('task_b', woId, repoPath);
 
-    expect(a.branch).toBe('factory/task-task_a');
-    expect(b.branch).toBe('factory/task-task_b');
+    // E9.1 RE5: the Factory `wo-*` namespace — the same prefix the E7 embedded
+    // `repo.write`/`branch.create` scope grants.
+    expect(a.branch).toBe(taskWorktreeBranch('task_a', woId));
+    expect(b.branch).toBe(taskWorktreeBranch('task_b', woId));
+    expect(a.branch.startsWith('wo-')).toBe(true);
     expect(a.branch).not.toBe(b.branch);
     expect(a.worktreePath).not.toBe(b.worktreePath);
     expect(a.worktreePath.startsWith(worktreeRoot)).toBe(true);
@@ -777,9 +785,9 @@ describe('E3 worktree isolation', () => {
     expect(existsSync(a.worktreePath)).toBe(true);
     expect(existsSync(b.worktreePath)).toBe(true);
 
-    const branches = git(['branch', '--list', 'factory/task-*'], repoPath);
-    expect(branches).toContain('factory/task-task_a');
-    expect(branches).toContain('factory/task-task_b');
+    const branches = git(['branch', '--list', 'wo-*'], repoPath);
+    expect(branches).toContain(a.branch);
+    expect(branches).toContain(b.branch);
   });
 
   it('records the isolation triple on each assignment', async () => {
@@ -794,7 +802,7 @@ describe('E3 worktree isolation', () => {
       const assignments = h.store.list<AssignmentRecord>('assignments');
       expect(assignments).toHaveLength(2);
       for (const assignment of assignments) {
-        expect(assignment.branch).toBe(`factory/task-${assignment.taskId}`);
+        expect(assignment.branch).toMatch(/^wo-.*\/task-/);
         expect(assignment.baseCommit).toBe(baseCommit);
         expect(assignment.worktreePath.startsWith(worktreeRoot)).toBe(true);
         expect(existsSync(assignment.worktreePath)).toBe(true);
@@ -808,33 +816,34 @@ describe('E3 worktree isolation', () => {
     const worktrees = createWorktreeManager({ rootDir: worktreeRoot, baseBranch: 'main' });
 
     // Simulate a crashed assignment: the worktree + branch are left behind.
-    const crashed = worktrees.createTaskWorktree('task_crash', repoPath);
+    const crashed = worktrees.createTaskWorktree('task_crash', woId, repoPath);
     expect(existsSync(crashed.worktreePath)).toBe(true);
 
-    const retried = worktrees.createTaskWorktree('task_crash', repoPath);
+    const retried = worktrees.createTaskWorktree('task_crash', woId, repoPath);
     expect(retried.taskId).toBe('task_crash');
-    expect(retried.branch).toBe('factory/task-task_crash');
+    expect(retried.branch).toBe(taskWorktreeBranch('task_crash', woId));
     expect(retried.worktreePath).toBe(crashed.worktreePath);
     expect(retried.baseCommit).toBe(baseCommit);
     expect(existsSync(retried.worktreePath)).toBe(true);
 
     // A branch left behind without its worktree is cleaned too.
-    git(['branch', 'factory/task-orphan', baseCommit], repoPath);
-    const orphan = worktrees.createTaskWorktree('orphan', repoPath);
-    expect(orphan.branch).toBe('factory/task-orphan');
+    const orphanBranch = taskWorktreeBranch('orphan', woId);
+    git(['branch', orphanBranch, baseCommit], repoPath);
+    const orphan = worktrees.createTaskWorktree('orphan', woId, repoPath);
+    expect(orphan.branch).toBe(orphanBranch);
     expect(existsSync(orphan.worktreePath)).toBe(true);
   });
 
   it('removes a worktree + branch and preserves the diff as evidence (§18.4)', () => {
     const worktrees = createWorktreeManager({ rootDir: worktreeRoot, baseBranch: 'main' });
     const evidence = createArtifactStore(join(workDir, 'evidence'));
-    const task = worktrees.createTaskWorktree('task_cleanup', repoPath);
+    const task = worktrees.createTaskWorktree('task_cleanup', woId, repoPath);
     writeFileSync(join(task.worktreePath, 'README.md'), '# changed\n');
 
     worktrees.removeTaskWorktree(task, evidence);
 
     expect(existsSync(task.worktreePath)).toBe(false);
-    expect(git(['branch', '--list', 'factory/task-task_cleanup'], repoPath)).toBe('');
+    expect(git(['branch', '--list', task.branch], repoPath)).toBe('');
     const diff = Buffer.from(evidence.get('task_cleanup/diff.patch')).toString('utf8');
     expect(diff).toContain('README.md');
   });
@@ -848,7 +857,7 @@ describe('E3 assignment + completion rules', () => {
   it('rejects assign when the task is not READY or the worker is not IDLE', () => {
     const h = harness();
     try {
-      const { dag } = plan(h, [
+      const { woId, dag } = plan(h, [
         { nodeId: 'a', title: 'A' },
         { nodeId: 'b', title: 'B' },
       ]);
@@ -860,7 +869,7 @@ describe('E3 assignment + completion rules', () => {
         workerId: worker.id,
         worktree: {
           taskId,
-          branch: `factory/task-${taskId}`,
+          branch: taskWorktreeBranch(taskId, woId),
           worktreePath: '/tmp/x',
           baseCommit: 'c',
         },
@@ -870,7 +879,7 @@ describe('E3 assignment + completion rules', () => {
 
       transitionTask(deps(h), a, { to: 'READY' });
       const record = assign(deps(h), intent(a));
-      expect(record.branch).toBe(`factory/task-${a}`);
+      expect(record.branch).toBe(taskWorktreeBranch(a, woId));
       expect(record.closedAt).toBeNull();
       expect(workerOf(h, worker.id).runtimeState).toBe('BUSY');
 
@@ -1026,7 +1035,8 @@ describe('E3 assignment + completion rules', () => {
       expect(interactions).toHaveLength(1);
       expect(interactions[0].type).toBe('QUESTION');
       expect(interactions[0].taskId).toBe(a);
-      expect(interactions[0].attemptId).toBe(worker.lease?.attemptId);
+      expect(worker.lease).toBeDefined();
+      expect(interactions[0].attemptId).toBe(worker.lease!.attemptId);
       expect(interactions[0].workerId).toBe(worker.id);
       expect(interactions[0].question).toBe('which base branch?');
       expect(interactions[0].status).toBe('PENDING');
@@ -1248,7 +1258,7 @@ describe('E3 assignment + completion rules', () => {
         workerId: worker.id,
         worktree: {
           taskId: a,
-          branch: `factory/task-${a}`,
+          branch: taskWorktreeBranch(a, woId),
           worktreePath: join(worktreeRoot, a),
           baseCommit,
         },
@@ -1267,7 +1277,7 @@ describe('E3 assignment + completion rules', () => {
 
       expect(envelope.taskId).toBe(a);
       expect(envelope.workOrderId).toBe(woId);
-      expect(envelope.branch).toBe(`factory/task-${a}`);
+      expect(envelope.branch).toBe(taskWorktreeBranch(a, woId));
       expect(envelope.baseCommit).toBe(baseCommit);
       expect(envelope.worktree).toBe(join(worktreeRoot, a));
       expect(envelope.requiredVerification).toEqual(['accepted']);
@@ -1329,7 +1339,7 @@ describe('E3 real Herdr same-tick provision→assign→execute', () => {
         workerId: worker.id,
         worktree: {
           taskId,
-          branch: `factory/task-${taskId}`,
+          branch: taskWorktreeBranch(taskId, wo.id),
           worktreePath: join(worktreeRoot, taskId),
           baseCommit,
         },

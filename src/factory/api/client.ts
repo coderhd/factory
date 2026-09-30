@@ -1,7 +1,12 @@
 import type { WorkOrder, WorkOrderIntent, WorkOrderTransition } from '../domain/workOrder';
+import type { DAGProposalPayload } from '../planning/dag';
+import type { ApprovalRecord } from '../policy/policy';
 import type {
   AnswerResultDto,
+  ApprovalAnswerRequest,
+  CommitDagResultDto,
   DrillDownDto,
+  FactoryControlsDto,
   GateDecision,
   HandshakeDto,
   HealthDto,
@@ -43,11 +48,18 @@ export interface FactoryClient {
   getWorkOrder(id: string): Promise<WorkOrderSnapshotDto>;
   transitionWorkOrder(id: string, transition: WorkOrderTransition): Promise<WorkOrder>;
   applyGate(id: string, decision: GateDecision): Promise<WorkOrder>;
+  commitDag(id: string, payload: DAGProposalPayload): Promise<CommitDagResultDto>;
   listInteractions(status?: InteractionDto['status']): Promise<InteractionDto[]>;
-  answerInteraction(id: string, response: string): Promise<AnswerResultDto>;
+  answerInteraction(id: string, response: string, actor?: string): Promise<AnswerResultDto>;
+  listApprovals(status?: ApprovalRecord['status']): Promise<ApprovalRecord[]>;
+  answerApproval(id: string, answer: ApprovalAnswerRequest): Promise<ApprovalRecord>;
   schedulerStatus(): Promise<SchedulerStatusDto>;
   observatory(): Promise<ObservatoryDto>;
   drillDown(workOrderId: string): Promise<DrillDownDto>;
+  factoryControls(): Promise<FactoryControlsDto>;
+  emergencyStop(actor: string): Promise<FactoryControlsDto>;
+  pause(actor: string): Promise<FactoryControlsDto>;
+  resume(actor: string): Promise<FactoryControlsDto>;
 }
 
 export function createFactoryClient(options: FactoryClientOptions): FactoryClient {
@@ -107,6 +119,8 @@ export function createFactoryClient(options: FactoryClientOptions): FactoryClien
       });
       return workOrder;
     },
+    commitDag: (id, payload) =>
+      request<CommitDagResultDto>('POST', `/work-orders/${id}/dag`, payload),
     async listInteractions(status): Promise<InteractionDto[]> {
       const query = status === undefined ? '' : `?status=${encodeURIComponent(status)}`;
       const { interactions } = await request<{ interactions: InteractionDto[] }>(
@@ -115,11 +129,35 @@ export function createFactoryClient(options: FactoryClientOptions): FactoryClien
       );
       return interactions;
     },
-    answerInteraction: (id, response) =>
-      request<AnswerResultDto>('POST', `/interactions/${id}/answer`, { response }),
+    answerInteraction: (id, response, actor) =>
+      request<AnswerResultDto>('POST', `/interactions/${id}/answer`, {
+        response,
+        ...(actor ? { actor } : {}),
+      }),
+    async listApprovals(status): Promise<ApprovalRecord[]> {
+      const query = status === undefined ? '' : `?status=${encodeURIComponent(status)}`;
+      const { approvals } = await request<{ approvals: ApprovalRecord[] }>(
+        'GET',
+        `/approvals${query}`,
+      );
+      return approvals;
+    },
+    async answerApproval(id, answer): Promise<ApprovalRecord> {
+      const { approval } = await request<{ approval: ApprovalRecord }>(
+        'POST',
+        `/approvals/${id}/answer`,
+        answer,
+      );
+      return approval;
+    },
     schedulerStatus: () => request<SchedulerStatusDto>('GET', '/scheduler'),
     observatory: () => request<ObservatoryDto>('GET', '/observatory'),
     drillDown: (workOrderId) =>
       request<DrillDownDto>('GET', `/observatory/work-orders/${workOrderId}/drill-down`),
+    factoryControls: () => request<FactoryControlsDto>('GET', '/factory/controls'),
+    emergencyStop: (actor) =>
+      request<FactoryControlsDto>('POST', '/factory/emergency-stop', { actor }),
+    pause: (actor) => request<FactoryControlsDto>('POST', '/factory/pause', { actor }),
+    resume: (actor) => request<FactoryControlsDto>('POST', '/factory/resume', { actor }),
   };
 }

@@ -1,0 +1,9 @@
+# Keep the image to the runtime tree + pinned config. Never ship local state,
+# caches, worktrees or VCS metadata into the Factory Server image.
+.factory/
+.git/
+.github/
+node_modules/
+opencode.jsonc
+__pycache__/
+*.pyc

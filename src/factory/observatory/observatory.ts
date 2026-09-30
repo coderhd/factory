@@ -35,6 +35,73 @@ export function createEmptyEvidenceReadPort(): EvidenceReadPort {
   return { listVerifiedChanges: () => [] };
 }
 
+/** The E1 attempt fields the seam reads (kept local; the store is untyped JSON). */
+interface EvidenceAttemptRow {
+  id: string;
+  taskId: string;
+  workerId: string | null;
+  model: string | null;
+  diff: string | null;
+}
+
+/** The E5 bundle fields the seam reads. */
+interface EvidenceBundleRow {
+  id: string;
+  workOrderId: string;
+  changeSetId: string;
+  createdAt: string;
+  complete: boolean;
+  attempts: Array<{ attemptId: string }>;
+}
+
+/** Count non-empty diff lines (a cheap, deterministic size proxy). */
+function diffLineCount(diff: string | null): number {
+  if (!diff) return 0;
+  return diff.split('\n').filter((line) => line.length > 0).length;
+}
+
+/**
+ * The store-backed {@link EvidenceReadPort} seam (E9.1). E5 persists immutable
+ * `evidence_bundles`; this projects each **complete** bundle (the durable
+ * verified-change receipt) into the Observatory's read shape, resolving the
+ * generating Attempt from the store for the task/worker/model/diff. It never
+ * fabricates evidence — an incomplete bundle is not a verified change, and a
+ * bundle whose Attempt cannot be resolved is skipped. `humanMinutes` is `0`
+ * until E9.7 records the human-efficiency metadata the bundle does not yet
+ * carry; the seam exists so the server no longer wires a dead placeholder.
+ */
+export function createEvidenceReadPort(store: StateStore): EvidenceReadPort {
+  return {
+    listVerifiedChanges(): VerifiedChange[] {
+      const attempts = new Map(
+        store.list<EvidenceAttemptRow>('attempts').map((attempt) => [attempt.id, attempt]),
+      );
+      const changes: VerifiedChange[] = [];
+      for (const bundle of store.list<EvidenceBundleRow>('evidence_bundles')) {
+        if (!bundle.complete) continue;
+        // E5 stamps `changeSetId` as `cs_<attemptId>`; fall back to the last
+        // recorded attempt for a bundle assembled under a different convention.
+        const stamped = bundle.changeSetId.startsWith('cs_') ? bundle.changeSetId.slice(3) : null;
+        const attemptId = stamped ?? bundle.attempts[bundle.attempts.length - 1]?.attemptId;
+        const attempt = attemptId ? attempts.get(attemptId) : undefined;
+        if (!attempt) continue;
+        changes.push({
+          id: bundle.id,
+          workOrderId: bundle.workOrderId,
+          taskId: attempt.taskId,
+          attemptId: attempt.id,
+          verifiedAt: bundle.createdAt,
+          humanMinutes: 0,
+          linesChanged: diffLineCount(attempt.diff),
+          model: attempt.model,
+          workerId: attempt.workerId,
+        });
+      }
+      return changes;
+    },
+  };
+}
+
 export interface DailyThroughput {
   /** Calendar day (`YYYY-MM-DD`). */
   day: string;

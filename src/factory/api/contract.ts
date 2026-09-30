@@ -1,7 +1,9 @@
 import type { Attempt, Task, WorkOrder } from '../domain/workOrder';
-import type { DailyThroughput, HumanHourThroughput, DrillDownStage } from '../observatory/observatory';
-import type { DAGVersion } from '../planning/dag';
+import type { DrillDownStage } from '../observatory/observatory';
+import type { ApprovalRecord } from '../policy/policy';
+import type { DAGVersion, RecordedProposal } from '../planning/dag';
 import type { SchedulerStatus } from '../scheduler/scheduler';
+import type { TelemetryMetrics } from '../telemetry/telemetry';
 
 /**
  * The E2 Factory API contract (spec §6, §22): the request/response DTOs shared
@@ -43,7 +45,8 @@ export interface InteractionDto {
   createdAt: string;
   updatedAt: string;
   answeredAt?: string;
-  answeredBy?: 'human';
+  /** The answering operator identity; `'human'` when none was supplied. */
+  answeredBy?: string;
 }
 
 export interface WorkOrderSnapshotDto {
@@ -54,11 +57,13 @@ export interface WorkOrderSnapshotDto {
   dag: DAGVersion | null;
 }
 
-export interface ObservatoryDto {
-  generatedAt: string;
-  verifiedPerDay: DailyThroughput[];
-  throughputPerHumanHour: HumanHourThroughput;
-}
+/**
+ * The Observatory projection (E9.7; spec §23) — E8's `TelemetryMetrics`
+ * verbatim: verified changes/day, verified throughput per human hour, rework
+ * attempts, and recorded model/tool cost. All values derive from durable
+ * evidence/telemetry; an empty Factory is zero/[], never fabricated.
+ */
+export type ObservatoryDto = TelemetryMetrics;
 
 export interface DrillDownDto {
   workOrderId: string;
@@ -71,8 +76,44 @@ export interface AnswerResultDto {
   workOrder: WorkOrder | null;
 }
 
+/**
+ * The E9.5 approval answer (spec §13). A human answers a §5.2 approval park:
+ * `APPROVAL` authorizes the consuming decision (E7 spends it), `DENY` settles
+ * it as refused. The `actor` is the durable operator receipt.
+ */
+export interface ApprovalAnswerRequest {
+  decision: 'APPROVAL' | 'DENY';
+  actor: string;
+  comment?: string;
+}
+
+export interface ApprovalsDto {
+  approvals: ApprovalRecord[];
+}
+
 export interface SchedulerStatusDto {
   scheduler: SchedulerStatus;
+}
+
+/**
+ * E9.6 factory-level controls (spec §10/§18.11). `emergencyStopped` blocks new
+ * assignments/provisioning and external side effects; `paused` blocks new
+ * autonomous work. Both preserve state and evidence and require an explicit
+ * human resume.
+ */
+export interface FactoryControlsDto {
+  paused: boolean;
+  emergencyStopped: boolean;
+}
+
+/**
+ * The response from `POST /work-orders/:id/dag`: the recorded proposal plus the
+ * committed, immutable DAG version. The request body is E3's
+ * `DAGProposalPayload` verbatim; the client never names tasks or edges.
+ */
+export interface CommitDagResultDto {
+  proposal: RecordedProposal;
+  dag: DAGVersion;
 }
 
 export interface ApiErrorDto {

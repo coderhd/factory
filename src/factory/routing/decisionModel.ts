@@ -104,6 +104,18 @@ export interface DecisionModel {
 export type RoutingDecisionSource = 'rules' | 'override';
 
 /**
+ * Provenance of a derived `RouteInput` (E9.3): each classified dimension is
+ * `constraint` when a Work Order constraint supplied it, else `default`. Lets a
+ * record explain its own shape ("why this task/complexity/context") without
+ * re-reading mutable Work Order state at audit time.
+ */
+export interface RouteInputDerivation {
+  task: 'constraint' | 'default';
+  complexity: 'constraint' | 'default';
+  context: 'constraint' | 'default';
+}
+
+/**
  * The durable routing-decision record for the `routing_decisions` table
  * (spec §8 "Routing recommendations are recorded"). Carries the full
  * task/complexity/risk/context/budget snapshot plus the recommendation it
@@ -126,5 +138,11 @@ export interface RoutingDecisionRecord {
   reason: string;
   unavailable: ModelId[];
   budget: BudgetState;
+  /**
+   * Where the `task`/`complexity`/`context` this record was made from came from
+   * (E9.3). Absent for decisions whose input was supplied directly (E4's own
+   * callers); present when the runtime derived it from Work Order state.
+   */
+  derivedFrom?: RouteInputDerivation;
   createdAt: string;
 }

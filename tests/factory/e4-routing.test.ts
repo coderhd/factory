@@ -27,6 +27,7 @@ import {
   parseRouteOverride,
   selectModel,
   toRoutingDecisionRecord,
+  type CostTier,
 } from '../../src/factory/routing/rules';
 import { formatRoutingLogLine } from '../../src/factory/routing/log';
 import { persistRoutingDecision, ROUTING_DECISION_RECORDED } from '../../src/factory/routing/persist';
@@ -42,6 +43,14 @@ const ri = (
   risk: RouteInput['risk'] = 'low',
   context: RouteInput['context'] = 'small',
 ): RouteInput => ({ task, complexity, risk, context });
+
+/**
+ * The cost tier of any model id. `ModelId` is deliberately opaque (an override
+ * may name any model), so this mirrors the runtime's own safe access in
+ * `rules.ts` rather than assuming the id is a known pool member.
+ */
+const tierOf = (model: ModelId): CostTier | undefined =>
+  (MODEL_TIER as Record<string, CostTier | undefined>)[model];
 
 /**
  * Every runtime source under `src/factory/routing/` is scanned for provider
@@ -187,7 +196,7 @@ describe('E4.1 budget gates', () => {
     });
     expect(decision.candidates).toEqual(['frontier', 'adversarial', 'reviewer']);
     expect(decision.selected).toBe('reviewer');
-    expect(MODEL_TIER[decision.selected]).toBe('mid');
+    expect(tierOf(decision.selected)).toBe('mid');
     expect(decision.metadata.budget).toEqual({
       monthlyRemaining: 0.29,
       weeklyRemaining: 1,
@@ -205,7 +214,7 @@ describe('E4.1 budget gates', () => {
       fiveHourRemaining: 0.19,
     });
     expect(decision.selected).toBe('explorer');
-    expect(MODEL_TIER[decision.selected]).toBe('cheap');
+    expect(tierOf(decision.selected)).toBe('cheap');
     expect(decision.reason).toContain('last-resort');
   });
 });
@@ -224,7 +233,7 @@ describe('E4.1 availability fallback', () => {
       'loop-solver',
     ]);
     expect(decision.selected).toBe('explorer');
-    expect(MODEL_TIER[decision.selected]).toBe('cheap');
+    expect(tierOf(decision.selected)).toBe('cheap');
     expect(decision.reason).toContain('last-resort');
   });
 
@@ -547,11 +556,10 @@ describe('E4.2 routing.log line format', () => {
 
   it('is stable under key insertion order: hand-built records format identically', () => {
     // A record assembled in a different field order must produce the same line.
-    const reordered = {
-      createdAt: '2026-09-30T09:00:00.000Z',
-      budget: { monthlyRemaining: 1, weeklyRemaining: 1, fiveHourRemaining: 1 },
-      ...fullRecord(),
-    };
+    // Pull `createdAt`/`budget` out so they are declared once, at the end, in a
+    // genuinely different order from the formatter's.
+    const { createdAt, budget, ...rest } = fullRecord();
+    const reordered = { ...rest, createdAt, budget };
     expect(formatRoutingLogLine(reordered)).toBe(EXAMPLE_LINE);
   });
 

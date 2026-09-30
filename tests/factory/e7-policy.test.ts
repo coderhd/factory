@@ -1161,7 +1161,7 @@ function seedRunningAttempt(
     id: assignmentId,
     taskId,
     workerId,
-    branch: `factory/task-${taskId}`,
+    branch: `wo-${wo.id}/task-${taskId.slice(0, 8)}`,
     worktreePath: join(workDir, 'worktrees', taskId),
     baseCommit: 'base',
     closedAt: null,
@@ -1352,7 +1352,12 @@ describe('E7 recovery: bounded replanWorkOrder via E3 commitDAG', () => {
       expect(third.ok).toBe(false);
       if (!third.ok) {
         expect(third.action.kind).toBe('ESCALATE_HUMAN');
-        expect(third.action.reason).toContain('replan-budget-exhausted');
+        // Narrow on the discriminant so the escalation's reason is checked on
+        // the action that actually carries it.
+        const action = third.action;
+        if (action.kind === 'ESCALATE_HUMAN') {
+          expect(action.reason).toContain('replan-budget-exhausted');
+        }
       }
       expect(getActiveDAG(deps(h), wo.id)?.version).toBe(3);
     } finally {

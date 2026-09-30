@@ -749,6 +749,80 @@ export function check(deps: PolicyCheckDeps, subject: TaskRef, action: PolicyAct
   return checkDetailed(deps, subject, action).verdict;
 }
 
+// ---------------------------------------------------------------------------
+// Write-time `repo.write` path gating (RE6: the `infra/**` exclusion)
+// ---------------------------------------------------------------------------
+
+/** One changed path from a unified diff: the `b/<path>` side of a `diff --git`. */
+const DIFF_HEADER = /^diff --git a\/.+ b\/(.+)$/gm;
+
+/**
+ * The changed paths a git diff touches (the write-time input for path-scoped
+ * `repo.write`). Reads only the `diff --git a/… b/<path>` headers, which git
+ * emits for every touched file — no hunk parsing, no heuristic content
+ * sniffing. Deterministic and deduplicated, in first-seen order.
+ *
+ * Only the **new** (`b/<path>`) side is read. For a rename, git emits the source
+ * and destination on that header (`a/<old> b/<new>`), so the destination is
+ * gated and the source path is not. A **delete** is gated: git emits
+ * `diff --git a/<path> b/<path>` (the same path on the `b/` side), so the
+ * removed path is captured and gated like any other. The `repo.write` concern is
+ * the path the change set names, which this header gives for adds, edits and
+ * deletes alike.
+ */
+export function changedPathsFromDiff(diff: string): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  DIFF_HEADER.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = DIFF_HEADER.exec(diff)) !== null) {
+    const path = match[1];
+    if (path && !seen.has(path)) {
+      seen.add(path);
+      paths.push(path);
+    }
+  }
+  return paths;
+}
+
+export interface RepoWriteGateResult {
+  allowed: boolean;
+  /** The changed paths whose `repo.write` verdict was not `ALLOW`. */
+  denied: string[];
+}
+
+/**
+ * The write-time path-scoped `repo.write` gate (design §4; RE5(b)/RE6): the
+ * assignment gate binds `path:'**'` for the whole worktree, but the actual
+ * change's paths are only known once the diff exists. This folds E7's `check`
+ * over every changed path on the Task's real worktree branch, so the embedded
+ * `infra/**` exclusion (or any deployment narrowing) is enforced against the
+ * change set — not merely the branch.
+ *
+ * Fail-closed on paths that are not `ALLOW`: `REQUIRE_HUMAN` and `DENY` both deny
+ * the change set here (the caller routes it to REWORK), unlike the assignment
+ * gate which leaves a Task READY on `REQUIRE_HUMAN`. The asymmetry is deliberate
+ * — a change set that has already been written cannot park pending a human; it
+ * must be reworked or escalated rather than verified.
+ *
+ * No changed paths (an empty diff) is a vacuous allow: nothing was written, so
+ * there is nothing to gate. The caller treats a no-diff SUCCESS change set the
+ * same as any other; the short-circuit is explicit so the case is visible.
+ */
+export function repoWriteGate(
+  deps: PolicyCheckDeps,
+  subject: TaskRef,
+  branch: string,
+  paths: readonly string[],
+): RepoWriteGateResult {
+  if (paths.length === 0) return { allowed: true, denied: [] };
+  const denied = paths.filter(
+    (path) =>
+      check(deps, subject, { capability: 'repo.write', resource: { branch, path } }) !== 'ALLOW',
+  );
+  return { allowed: denied.length === 0, denied };
+}
+
 /** Build the resolved chain for a Work Order from deployment + durable state. */
 export function createPolicyChain(
   deps: { store: StateStore; policy?: PolicyDocument },

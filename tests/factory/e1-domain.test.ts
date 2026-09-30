@@ -72,14 +72,14 @@ describe('E1.1 SQLite schema + store seams', () => {
     const store = openStateStore(dbPath);
     const value = { id: 'wo_roundtrip', intent: 'ship the slice', meta: { n: 1 } };
     store.set('work_orders', value.id, value);
-    expect(store.get('work_orders', value.id)).toEqual(value);
+    expect(store.get<typeof value>('work_orders', value.id)).toEqual(value);
     expect(store.get('tasks', 'missing')).toBeNull();
-    expect(store.list('work_orders')).toEqual([value]);
+    expect(store.list<typeof value>('work_orders')).toEqual([value]);
     store.close();
 
     const reopened = openStateStore(dbPath);
     try {
-      expect(reopened.get('work_orders', value.id)).toEqual(value);
+      expect(reopened.get<typeof value>('work_orders', value.id)).toEqual(value);
     } finally {
       reopened.close();
     }
@@ -163,7 +163,7 @@ describe('E1.1 SQLite schema + store seams', () => {
 
 describe('E1.1 Work Order creation + in-process MessageBus', () => {
   it('exposes the full lifecycle state vocabulary for the E1.2 state machine', () => {
-    const workOrderStates = [
+    const workOrderStates: WorkOrderState[] = [
       'DRAFT',
       'READY',
       'PLANNING',
@@ -178,7 +178,7 @@ describe('E1.1 Work Order creation + in-process MessageBus', () => {
       'APPROVED',
       'MERGED',
     ];
-    const taskStates = [
+    const taskStates: TaskState[] = [
       'PLANNED',
       'READY',
       'ASSIGNED',
@@ -745,7 +745,7 @@ describe('E1.2 event-log replay restores identical state', () => {
       const snapshot = projectWorkOrder(deps.events.readEvents(), wo.id);
 
       expect(snapshot).not.toBeNull();
-      expect(snapshot!.workOrder).toEqual(deps.store.get<WorkOrder>('work_orders', wo.id));
+      expect(snapshot!.workOrder).toEqual(deps.store.get<WorkOrder>('work_orders', wo.id)!);
       expect(byId(snapshot!.tasks)).toEqual(byId(deps.store.list<Task>('tasks')));
       expect(byId(snapshot!.attempts)).toEqual(byId(deps.store.list<Attempt>('attempts')));
 
@@ -811,7 +811,7 @@ describe('E1.2 event-log replay restores identical state', () => {
     const events = openEventLog(reopened.db);
     try {
       const replayed = projectWorkOrder(events.readEvents(), woId!);
-      expect(replayed!.workOrder).toEqual(reopened.get<WorkOrder>('work_orders', woId!));
+      expect(replayed!.workOrder).toEqual(reopened.get<WorkOrder>('work_orders', woId!)!);
       expect(replayed!.workOrder).toEqual(expected!);
     } finally {
       reopened.close();

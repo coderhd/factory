@@ -19,8 +19,19 @@ export interface TaskWorktree {
 }
 
 export interface WorktreeManager {
-  createTaskWorktree(taskId: string, repoPath: string): TaskWorktree;
+  createTaskWorktree(taskId: string, workOrderId: string, repoPath: string): TaskWorktree;
   removeTaskWorktree(task: TaskWorktree, evidence: ArtifactStore): void;
+}
+
+/**
+ * The Factory branch namespace for a Task's worktree (E9.1 ruling RE5): the
+ * E3 worktree, E6 PR and the E7 embedded `repo.write`/`branch.create` scope
+ * (`wo-&#42;/&#42;&#42;`) must agree on one prefix, so policy can authorize exactly the
+ * branches the Factory writes. `taskShort` is the deterministic 8-char id
+ * prefix — enough to disambiguate while keeping ref names readable.
+ */
+export function taskWorktreeBranch(taskId: string, workOrderId: string): string {
+  return `wo-${workOrderId}/task-${taskId.slice(0, 8)}`;
 }
 
 export interface WorktreeManagerConfig {
@@ -49,9 +60,9 @@ export function createWorktreeManager(config: WorktreeManagerConfig): WorktreeMa
   const { rootDir, baseBranch } = config;
 
   return {
-    createTaskWorktree(taskId, repoPath): TaskWorktree {
+    createTaskWorktree(taskId, workOrderId, repoPath): TaskWorktree {
       const baseCommit = git(['rev-parse', baseBranch], repoPath);
-      const branch = `factory/task-${taskId}`;
+      const branch = taskWorktreeBranch(taskId, workOrderId);
       const worktreePath = join(rootDir, taskId);
 
       // A leftover worktree/branch from a crashed assignment must not starve
