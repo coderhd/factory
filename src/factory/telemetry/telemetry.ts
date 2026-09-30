@@ -266,11 +266,7 @@ function policyDecisionsFor(store: StateStore, attempt: Attempt) {
   return matched;
 }
 
-function gateDecisionsFor(
-  store: StateStore,
-  events: EventLog,
-  workOrder: WorkOrder | null,
-): GateWhy[] {
+function gateDecisionsFor(events: EventLog, workOrder: WorkOrder | null): GateWhy[] {
   if (!workOrder) return [];
   const gates: GateWhy[] = [];
   for (const event of events.readEvents({ aggregateType: 'work_order', aggregateId: workOrder.id })) {
@@ -316,7 +312,8 @@ function buildLayers(
   const interactions = store
     .list<Record<string, unknown>>('interactions')
     .filter((interaction) => nonEmpty(interaction.taskId) === attempt.taskId);
-  const gates = gateDecisionsFor(store, events, workOrder);
+  const questions = interactions.filter((interaction) => interaction.type === 'QUESTION');
+  const gates = gateDecisionsFor(events, workOrder);
   const humanMinutes = evidence
     .listVerifiedChanges()
     .filter((change) => change.attemptId === attempt.id)
@@ -370,7 +367,7 @@ function buildLayers(
     },
     human_leverage: {
       humanMinutes,
-      questions: interactions.length,
+      questions: questions.length,
       interventions: interactions.filter((interaction) => interaction.status === 'ANSWERED').length,
       gateDecisions: gates.length,
     },
@@ -553,15 +550,21 @@ export function projectDrillDown(deps: TelemetryDeps, workOrderId: string): Dril
   };
 }
 
-/** Every recorded telemetry receipt in the append-only log, in sequence order. */
-function readAllTelemetry(events: EventLog): AttemptTelemetry[] {
-  const records: AttemptTelemetry[] = [];
+/**
+ * The latest recorded telemetry receipt per Attempt, in first-recorded order.
+ * `recordAttemptTelemetry` may fire more than once for an Attempt; latest-wins
+ * matches `readAttemptTelemetry`, so a re-record never double-counts metrics.
+ */
+function readLatestTelemetry(events: EventLog): AttemptTelemetry[] {
+  const byAttempt = new Map<string, AttemptTelemetry>();
   for (const event of events.readEvents()) {
     if (event.type !== TELEMETRY_ATTEMPT_RECORDED) continue;
     const record = asRecord(event.payload)?.record;
-    if (record && typeof record === 'object') records.push(record as AttemptTelemetry);
+    if (!record || typeof record !== 'object') continue;
+    const typed = record as AttemptTelemetry;
+    byAttempt.set(typed.attemptId ?? event.aggregateId, typed);
   }
-  return records;
+  return [...byAttempt.values()];
 }
 
 /**
@@ -589,7 +592,7 @@ export function projectTelemetryMetrics(
   let total = 0;
   let currency = 'USD';
   let sawCurrency = false;
-  for (const record of readAllTelemetry(events)) {
+  for (const record of readLatestTelemetry(events)) {
     if (!inWindow(record.recordedAt, window)) continue;
     const costs = record.layers?.economics;
     if (!costs || costs.totalCost === null) continue;

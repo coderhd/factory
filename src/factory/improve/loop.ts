@@ -256,6 +256,15 @@ export function proposeImprovement(
 }
 
 /**
+ * States from which a candidate may be benchmarked (or re-benchmarked). The
+ * machine is forward-only: QUALIFIED has recorded a decision and PROMOTED has
+ * started work, so neither may silently regress to BENCHMARKED. A REJECTED
+ * candidate may be re-benchmarked — explicit iteration, not a regression — only
+ * once its re-run passes through qualify again.
+ */
+const BENCHMARKABLE_STATES = new Set<ImprovementState>(['PROPOSED', 'BENCHMARKED', 'REJECTED']);
+
+/**
  * Benchmark a candidate against a baseline. Only the benchmark corpus is
  * accepted: a dogfooding run can never qualify a promotion (spec §25/§26).
  */
@@ -269,6 +278,12 @@ export function benchmarkImprovement(
     throw new FactoryError('IMPROVEMENT_NOT_FOUND', `improvement not found: ${proposalId}`);
   }
   assertLevel(proposal.level);
+  if (!BENCHMARKABLE_STATES.has(proposal.state)) {
+    throw new FactoryError(
+      'IMPROVEMENT_NOT_BENCHMARKABLE',
+      `improvement ${proposalId} cannot be benchmarked from state ${proposal.state}: it is forward-only (QUALIFIED records a decision, PROMOTED starts work); only PROPOSED, BENCHMARKED or a REJECTED candidate may be benchmarked`,
+    );
+  }
   if (input.corpus !== BENCHMARK_CORPUS) {
     throw new FactoryError(
       'BENCHMARK_CORPUS_REQUIRED',
@@ -293,6 +308,12 @@ export function benchmarkImprovement(
 /**
  * Qualify or reject a benchmarked candidate. Qualification only records a
  * decision; it changes no production behavior.
+ *
+ * The decision is made against the benchmark **recorded in the trail**, never
+ * against a caller-supplied object: the `benchmark` argument is accepted only as
+ * an id-checked reference to that recorded run. A caller cannot hand in
+ * hand-written *improving* metrics for a run that actually regressed, and the
+ * `benchmarkId` appended to the decision always names a run that exists.
  */
 export function qualifyImprovement(
   deps: ImprovementDeps,
@@ -315,14 +336,27 @@ export function qualifyImprovement(
       `benchmark ${benchmark.id} belongs to improvement ${benchmark.proposalId}, not ${proposalId}`,
     );
   }
-  if (benchmark.corpus !== BENCHMARK_CORPUS) {
+  const recorded = readRecordedBenchmark(deps.events, proposalId);
+  if (!recorded) {
+    throw new FactoryError(
+      'IMPROVEMENT_NOT_BENCHMARKED',
+      `improvement ${proposalId} has no recorded benchmark; benchmark it before qualification`,
+    );
+  }
+  if (benchmark.id !== recorded.id) {
+    throw new FactoryError(
+      'IMPROVEMENT_BENCHMARK_MISMATCH',
+      `benchmark ${benchmark.id} is not the benchmark recorded for improvement ${proposalId} (recorded ${recorded.id}); qualify only against the recorded trail`,
+    );
+  }
+  if (recorded.corpus !== BENCHMARK_CORPUS) {
     throw new FactoryError(
       'BENCHMARK_CORPUS_REQUIRED',
-      `corpus "${benchmark.corpus}" cannot qualify an improvement: only a benchmark-corpus run qualifies`,
+      `corpus "${recorded.corpus}" cannot qualify an improvement: only a benchmark-corpus run qualifies`,
     );
   }
 
-  const improved = isImprovement(benchmark.baseline, benchmark.candidate);
+  const improved = isImprovement(recorded.baseline, recorded.candidate);
   const now = new Date().toISOString();
   const updated: ImprovementProposal = {
     ...proposal,
@@ -330,7 +364,7 @@ export function qualifyImprovement(
     updatedAt: now,
   };
   append(deps, improved ? IMPROVEMENT_QUALIFIED : IMPROVEMENT_REJECTED, updated, {
-    benchmarkId: benchmark.id,
+    benchmarkId: recorded.id,
   });
   return updated;
 }
@@ -376,4 +410,19 @@ export function readImprovement(events: EventLog, proposalId: string): Improveme
   if (!last) return null;
   const payload = last.payload as { proposal?: ImprovementProposal } | null;
   return payload?.proposal ?? null;
+}
+
+/**
+ * Read the latest benchmark recorded for a proposal from the append-only trail
+ * (the run `benchmarkImprovement` appended). Qualification decides only against
+ * this, so a caller-supplied object can never override the durable evidence.
+ */
+export function readRecordedBenchmark(events: EventLog, proposalId: string): BenchmarkResult | null {
+  const trail = events
+    .readEvents({ aggregateType: 'improvement_proposal', aggregateId: proposalId })
+    .filter((event) => event.type === IMPROVEMENT_BENCHMARKED);
+  const last = trail[trail.length - 1];
+  if (!last) return null;
+  const payload = last.payload as { benchmark?: BenchmarkResult } | null;
+  return payload?.benchmark ?? null;
 }

@@ -378,6 +378,25 @@ describe('E8.1 telemetry layers (spec §24)', () => {
     expect(leverage.interventions).toBe(1);
   });
 
+  it('counts only QUESTION interactions as human-leverage questions', () => {
+    const wo = seedWorkOrder();
+    const task = createTask({ store, events }, { workOrderId: wo.id, title: 'T' });
+    const attempt = seedAttempt(task);
+    seedInteraction(task, 'interaction_q', 'PENDING');
+    // A non-QUESTION interaction row must not inflate the question count.
+    store.set('interactions', 'interaction_note', {
+      id: 'interaction_note',
+      taskId: task.id,
+      type: 'NOTE',
+      question: 'for your information',
+      status: 'PENDING',
+      response: null,
+    });
+
+    const leverage = recordAttemptTelemetry(deps, attempt.id).layers.human_leverage;
+    expect(leverage.questions).toBe(1);
+  });
+
   it('projects telemetry without persisting, and returns null for an unknown Attempt', () => {
     const wo = seedWorkOrder();
     const task = createTask({ store, events }, { workOrderId: wo.id, title: 'T' });
@@ -564,6 +583,19 @@ describe('E8.1 Observatory metrics (spec §23)', () => {
     expect(metrics.rework).toBe(0);
     expect(metrics.cost).toEqual({ total: 0, currency: 'USD' });
   });
+
+  it('counts a re-recorded Attempt once, using its latest receipt, in Observatory cost', () => {
+    const wo = seedWorkOrder();
+    const task = createTask({ store, events }, { workOrderId: wo.id, title: 'T' });
+    const attempt = seedAttempt(task);
+    // `recordAttemptTelemetry` may fire more than once per Attempt; the metric
+    // must follow latest-wins (as `readAttemptTelemetry` does), not sum both.
+    recordAttemptTelemetry(deps, attempt.id, { economics: { modelCost: 1, toolCost: 0.5 } });
+    const latest = recordAttemptTelemetry(deps, attempt.id, { economics: { modelCost: 4, toolCost: 1 } });
+
+    expect(readAttemptTelemetry(events, attempt.id)).toEqual(latest);
+    expect(projectTelemetryMetrics(deps).cost).toEqual({ total: 5, currency: 'USD' });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -719,6 +751,80 @@ describe('E8.1 Improvement-as-Work loop (spec §26; self-improving-factory Level
     }
     expect(caught).toBeInstanceOf(FactoryError);
     expect((caught as FactoryError).code).toBe('IMPROVEMENT_BENCHMARK_MISMATCH');
+  });
+
+  it('qualifies only against the benchmark recorded in the trail, never a caller-supplied one', () => {
+    const { observed } = observeThenPropose(2);
+    // The recorded run is a regression: the candidate matches the baseline on
+    // every axis, so `isImprovement` is false and qualification must reject.
+    const { benchmark: recorded } = benchmarkImprovement({ store, events }, observed.proposal.id, {
+      ...benchmarkInput,
+      candidate: { ...benchmarkInput.baseline },
+    });
+
+    // A caller forges improving metrics while keeping the recorded run's id.
+    // Qualification still decides from the recorded (regressing) run.
+    const forged = { ...recorded, candidate: { ...benchmarkInput.candidate } };
+    const decision = qualifyImprovement({ store, events }, observed.proposal.id, forged);
+    expect(decision.state).toBe('REJECTED');
+    expect(readImprovement(events, observed.proposal.id)!.state).toBe('REJECTED');
+
+    // The decision names the recorded run, never a fabricated one.
+    const rejectedEvent = events
+      .readEvents({ aggregateType: 'improvement_proposal', aggregateId: observed.proposal.id })
+      .filter((event) => event.type === 'improvement.rejected')
+      .at(-1);
+    expect((rejectedEvent!.payload as { benchmarkId: string }).benchmarkId).toBe(recorded.id);
+
+    // A caller-invented benchmark id names a run that never existed and is refused.
+    const second = observeThenPropose(2).observed;
+    const { benchmark } = benchmarkImprovement({ store, events }, second.proposal.id, benchmarkInput);
+    let caught: unknown;
+    try {
+      qualifyImprovement({ store, events }, second.proposal.id, { ...benchmark, id: 'bench_forged' });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(FactoryError);
+    expect((caught as FactoryError).code).toBe('IMPROVEMENT_BENCHMARK_MISMATCH');
+  });
+
+  it('keeps the proposal state machine forward-only: no re-benchmark after qualify or promote', () => {
+    const { observed } = observeThenPropose(2);
+    const { benchmark } = benchmarkImprovement({ store, events }, observed.proposal.id, benchmarkInput);
+    qualifyImprovement({ store, events }, observed.proposal.id, benchmark);
+
+    // QUALIFIED has recorded a decision: it may not regress to BENCHMARKED.
+    let caught: unknown;
+    try {
+      benchmarkImprovement({ store, events }, observed.proposal.id, benchmarkInput);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(FactoryError);
+    expect((caught as FactoryError).code).toBe('IMPROVEMENT_NOT_BENCHMARKABLE');
+    expect(readImprovement(events, observed.proposal.id)!.state).toBe('QUALIFIED');
+
+    promoteImprovement({ store, events }, observed.proposal.id);
+    // PROMOTED is terminal: it may not be re-benchmarked under the same id.
+    expect(() => benchmarkImprovement({ store, events }, observed.proposal.id, benchmarkInput)).toThrow(
+      'forward-only',
+    );
+    expect(readImprovement(events, observed.proposal.id)!.state).toBe('PROMOTED');
+  });
+
+  it('allows a rejected candidate to be re-benchmarked as explicit iteration', () => {
+    const { observed } = observeThenPropose(2);
+    const { benchmark: regression } = benchmarkImprovement({ store, events }, observed.proposal.id, {
+      ...benchmarkInput,
+      candidate: { ...benchmarkInput.baseline },
+    });
+    expect(qualifyImprovement({ store, events }, observed.proposal.id, regression).state).toBe('REJECTED');
+
+    // Iteration is explicit: re-benchmark the same proposal, then re-qualify.
+    const { benchmark: improved } = benchmarkImprovement({ store, events }, observed.proposal.id, benchmarkInput);
+    expect(readImprovement(events, observed.proposal.id)!.state).toBe('BENCHMARKED');
+    expect(qualifyImprovement({ store, events }, observed.proposal.id, improved).state).toBe('QUALIFIED');
   });
 
   it('promotes only a qualified improvement, and only then does work start', () => {
