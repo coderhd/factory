@@ -13,5 +13,6 @@
 11. Staging is the qualification environment — Accepted
 12. Root is earned from real Factories — Accepted
 13. The DecisionModel seam stays generic; challengers stay shadow-only — Accepted
+14. Policy is monotonic-narrowing down Org→Project→Work Order→Task; sensitive actions are runtime-checked — Accepted ([ADR 14](adr-14-monotonic-policy-and-risk.md))
 
 The detailed Software Factory ADRs remain governed by its existing authoritative design document.
