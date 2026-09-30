@@ -762,10 +762,13 @@ const DIFF_HEADER = /^diff --git a\/.+ b\/(.+)$/gm;
  * emits for every touched file — no hunk parsing, no heuristic content
  * sniffing. Deterministic and deduplicated, in first-seen order.
  *
- * Only the **new** (`b/<path>`) side is read: for a rename the destination path
- * is gated and the source path is not, and for a delete the removed path is not
- * gated (a deletion changes no file the grant protects). This is deliberate for
- * v0.1 — the `repo.write` concern is what is written, not what is removed.
+ * Only the **new** (`b/<path>`) side is read. For a rename, git emits the source
+ * and destination on that header (`a/<old> b/<new>`), so the destination is
+ * gated and the source path is not. A **delete** is gated: git emits
+ * `diff --git a/<path> b/<path>` (the same path on the `b/` side), so the
+ * removed path is captured and gated like any other. The `repo.write` concern is
+ * the path the change set names, which this header gives for adds, edits and
+ * deletes alike.
  */
 export function changedPathsFromDiff(diff: string): string[] {
   const paths: string[] = [];

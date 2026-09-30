@@ -2943,14 +2943,15 @@ describe('E9.8 path-level repo.write gating (the infra/** exclusion) at write ti
     expect(changedPathsFromDiff(diff).sort()).toEqual(['infra/main.tf', 'src/counter.ts']);
   });
 
-  it('gates only the new path on a rename/delete (source path is not gated)', () => {
+  it('gates the new path on a rename; a delete is gated by its removed path', () => {
     const rename = [
       'diff --git a/infra/old.tf b/src/new.ts',
       'similarity index 90%',
       'rename from infra/old.tf',
       'rename to src/new.ts',
     ].join('\n');
-    // Only the destination (`b/`) path is read: the write concern is the new path.
+    // Only the destination (`b/`) path is read: a rename's source (`a/`) is not
+    // gated, the (possibly out-of-scope) destination is.
     expect(changedPathsFromDiff(rename)).toEqual(['src/new.ts']);
 
     const deletion = [
@@ -2959,7 +2960,8 @@ describe('E9.8 path-level repo.write gating (the infra/** exclusion) at write ti
       '--- a/infra/gone.tf',
       '+++ /dev/null',
     ].join('\n');
-    // A delete writes nothing protected; the removed path is not gated here.
+    // A delete carries the removed path on the `b/` side too, so it IS captured
+    // (and gated) — under the `infra/**` exclusion this would be denied.
     expect(changedPathsFromDiff(deletion)).toEqual(['infra/gone.tf']);
   });
 
