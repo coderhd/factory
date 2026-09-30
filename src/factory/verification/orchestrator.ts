@@ -44,6 +44,12 @@ export interface VerificationSubject {
   workOrder: WorkOrder;
   task: Task;
   attempt: Attempt;
+  /**
+   * The Attempt's worktree checkout (from its Assignment). Threaded to every
+   * check so command evidence is produced against the change under verification
+   * rather than the repository checkout. Optional: absent, checks fall back.
+   */
+  worktreePath?: string;
 }
 
 /**
@@ -222,6 +228,7 @@ export function createE5Verifier(options: E5VerifierOptions): WorkVerifier {
       const run = await engine.verify(changeSet, {
         criteria,
         criterionChecks: defaultCriterionChecks(engine, criteria),
+        ...(subject.worktreePath !== undefined ? { worktreePath: subject.worktreePath } : {}),
       });
 
       const semanticVerifier = createSemanticVerifier({

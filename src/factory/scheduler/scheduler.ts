@@ -771,12 +771,23 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
    * the execution states (EXECUTING/WAITING_INPUT). Read from durable state, so
    * a crash mid-flight simply re-dispatches on the next tick.
    */
-  function successSubjects(): Array<{ workOrder: WorkOrder; task: Task; attempt: Attempt }> {
-    const subjects: Array<{ workOrder: WorkOrder; task: Task; attempt: Attempt }> = [];
+  function successSubjects(): Array<{
+    workOrder: WorkOrder;
+    task: Task;
+    attempt: Attempt;
+    worktreePath?: string;
+  }> {
+    const subjects: Array<{
+      workOrder: WorkOrder;
+      task: Task;
+      attempt: Attempt;
+      worktreePath?: string;
+    }> = [];
     const workOrders = deps.store
       .list<WorkOrder>('work_orders')
       .filter((wo) => wo.state === 'EXECUTING' || wo.state === 'WAITING_INPUT');
     const attempts = deps.store.list<Attempt>('attempts');
+    const assignments = deps.store.list<AssignmentRecord>('assignments');
     for (const workOrder of workOrders) {
       for (const task of deps.store.list<Task>('tasks')) {
         if (task.workOrderId !== workOrder.id || task.state !== 'SUCCESS') continue;
@@ -786,7 +797,17 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
             .filter((candidate) => candidate.taskId === task.id && candidate.outcome === 'success')
             .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
             .at(-1) ?? null;
-        if (attempt) subjects.push({ workOrder, task, attempt });
+        if (!attempt) continue;
+        // E10.1 (#39): pin verification to the Attempt's worktree checkout. The
+        // Assignment carries it (it is closed by now, so it is provenance, not an
+        // open lease) — command checks must run against the change under
+        // verification, not the repository checkout. Absent an assignment the
+        // subject carries no path and a check falls back to the repo.
+        const worktreePath = assignments
+          .filter((assignment) => assignment.taskId === task.id)
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+          .at(-1)?.worktreePath;
+        subjects.push({ workOrder, task, attempt, ...(worktreePath ? { worktreePath } : {}) });
       }
     }
     return subjects;

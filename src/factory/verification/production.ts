@@ -44,7 +44,7 @@ export interface CommandRunner {
 }
 
 /** Run a command through the shell, capturing its exit code and output. */
-const defaultCommandRunner: CommandRunner = async ({ command, cwd }) => {
+export const defaultCommandRunner: CommandRunner = async ({ command, cwd }) => {
   const proc = Bun.spawn(['sh', '-c', command], { cwd, stdout: 'pipe', stderr: 'pipe' });
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -64,9 +64,11 @@ function evidenceSummary(command: string, exitCode: number, stdout: string, stde
 
 /**
  * Build a command-backed {@link CheckProvider}: the configured command runs in
- * the deployment working directory, and its exit code is the pass/fail verdict.
- * A provider that cannot produce usable evidence cannot pass (the engine's own
- * rule) — a runner that throws surfaces as a structured check failure.
+ * the Attempt's worktree checkout when one is threaded through the change set —
+ * so its evidence attests to the code actually under verification — falling back
+ * to the deployment working directory when absent. The exit code is the
+ * pass/fail verdict; a runner that throws cannot produce usable evidence and so
+ * cannot pass (the engine's own rule).
  */
 function commandCheckProvider(
   check: VerificationConfig['checks'][number],
@@ -77,8 +79,9 @@ function commandCheckProvider(
     id: check.id,
     category: check.category,
     kind: check.kind as CheckProvider['kind'],
-    async run() {
-      const result = await runCommand({ command: check.command, cwd: workingDirectory });
+    async run(context) {
+      const cwd = context.worktreePath ?? workingDirectory;
+      const result = await runCommand({ command: check.command, cwd });
       const summary = evidenceSummary(check.command, result.exitCode, result.stdout, result.stderr);
       if (result.exitCode === 0) {
         return { passed: true, evidence: { summary } };
@@ -128,15 +131,18 @@ export function createProductionVerifier(options: ProductionVerifierOptions): Wo
       'production verifier requires a semantic judge implementation (the model-calling seam)',
     );
   }
-  // The configured identity is authoritative provenance. A supplied judge that
-  // declares a different provider/model is a misconfiguration — the bundle must
-  // attest the model that actually ruled, and a mismatch would forge the
-  // writer ≠ verifier attestation. Refuse it rather than record a false receipt.
+  // The configured identity is authoritative provenance. A supplied judge must
+  // declare it: a judge lacking an identity, or one claiming a different
+  // provider/model, is a misconfiguration — the bundle must attest the model
+  // that actually ruled, and a mismatch would forge the writer ≠ verifier
+  // attestation. Refuse it rather than record a false receipt.
   const declared = options.judge.identity;
-  if (
-    declared &&
-    (declared.provider !== config.judge.provider || declared.model !== config.judge.model)
-  ) {
+  if (!declared || !declared.provider || !declared.model) {
+    throw new VerificationConfigurationError(
+      'production verifier requires a semantic judge that declares an identity (provider + model)',
+    );
+  }
+  if (declared.provider !== config.judge.provider || declared.model !== config.judge.model) {
     throw new VerificationConfigurationError(
       `production verifier judge identity "${declared.provider}/${declared.model}" does not match the configured judge identity "${config.judge.provider}/${config.judge.model}"`,
     );

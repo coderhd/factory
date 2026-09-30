@@ -453,17 +453,17 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
       ? [
           'verification:',
           '  judge:',
-          `    provider: ${config.verification.judge.provider}`,
-          `    model: ${config.verification.judge.model}`,
+          `    provider: ${JSON.stringify(config.verification.judge.provider)}`,
+          `    model: ${JSON.stringify(config.verification.judge.model)}`,
           ...(config.verification.judge.family
-            ? [`    family: ${config.verification.judge.family}`]
+            ? [`    family: ${JSON.stringify(config.verification.judge.family)}`]
             : []),
           ...(config.verification.judge.version
-            ? [`    version: "${config.verification.judge.version}"`]
+            ? [`    version: ${JSON.stringify(config.verification.judge.version)}`]
             : []),
           '  prompt:',
-          `    id: ${config.verification.prompt.id}`,
-          `    version: "${config.verification.prompt.version}"`,
+          `    id: ${JSON.stringify(config.verification.prompt.id)}`,
+          `    version: ${JSON.stringify(config.verification.prompt.version)}`,
           '  rubric:',
           // Rubric items and commands are arbitrary text (colons, quotes, `&&`),
           // so quote them as JSON scalars — a valid YAML double-quoted scalar —
@@ -471,9 +471,9 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
           ...config.verification.rubric.map((item) => `    - ${JSON.stringify(item)}`),
           '  checks:',
           ...config.verification.checks.flatMap((check) => [
-            `    - id: ${check.id}`,
-            `      category: ${check.category}`,
-            `      kind: ${check.kind}`,
+            `    - id: ${JSON.stringify(check.id)}`,
+            `      category: ${JSON.stringify(check.category)}`,
+            `      kind: ${JSON.stringify(check.kind)}`,
             `      command: ${JSON.stringify(check.command)}`,
           ]),
         ]
