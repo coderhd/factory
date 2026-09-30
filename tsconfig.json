@@ -13,9 +13,12 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "lib": ["ESNext"],
-    // Bun ships the ambient `Bun`/test globals this repo relies on; no
-    // Node/`@types/node` runtime is present.
-    "types": ["bun-types"],
+    // `@types/bun` (Bun's documented type package) supplies the ambient
+    // `Bun`/test globals this repo relies on. It is a pinned devDependency in
+    // the root package.json, not a globally/home-installed package, so the gate
+    // works on a clean checkout. `bun` is the `@types/*` name; `bun-types` is
+    // the package it shims.
+    "types": ["bun"],
     "strict": true,
     "noEmit": true,
     // Dependencies are not vendored here; only check this repo's own code.

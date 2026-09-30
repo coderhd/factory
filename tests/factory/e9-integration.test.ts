@@ -3189,12 +3189,29 @@ describe('E9.9 type gate', () => {
     };
     expect(tsconfig.compilerOptions.noEmit).toBe(true);
     expect(tsconfig.compilerOptions.strict).toBe(true);
-    expect(tsconfig.compilerOptions.types).toContain('bun-types');
+    // `bun` is the `@types/bun` name (Bun's documented type package).
+    expect(tsconfig.compilerOptions.types).toContain('bun');
     expect(tsconfig.include).toContain('src/**/*.ts');
     expect(tsconfig.include).toContain('tests/**/*.ts');
   });
 
-  it('ships an executable check-tsc.sh that pins the compiler (never latest)', () => {
+  it('pins the compiler and type packages as root devDependencies', () => {
+    // Self-contained reproducibility: the deps live in THIS repo's
+    // node_modules, not a developer's home/global install.
+    const pkg = JSON.parse(readRepoFile('package.json')) as {
+      private?: boolean;
+      devDependencies?: Record<string, string>;
+    };
+    expect(pkg.private).toBe(true);
+    const deps = pkg.devDependencies ?? {};
+    // Explicit versions, never a floating range.
+    expect(deps['typescript']).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(deps['@types/bun']).toMatch(/^\d+\.\d+\.\d+$/);
+    // A committed lockfile makes the install exact.
+    expect(existsSync(join(REPO_ROOT, 'bun.lock'))).toBe(true);
+  });
+
+  it('ships an executable, self-contained check-tsc.sh (no home/global types)', () => {
     const scriptPath = join(REPO_ROOT, 'scripts', 'check-tsc.sh');
     expect(existsSync(scriptPath)).toBe(true);
     // Executable, so CI can call it directly.
@@ -3202,8 +3219,14 @@ describe('E9.9 type gate', () => {
 
     const script = readRepoFile('scripts/check-tsc.sh');
     expect(script).toContain('tsc --noEmit');
-    expect(script).toMatch(/TSC_VERSION="\d+\.\d+\.\d+"/);
+    // Runs the repo-local compiler installed from package.json.
+    expect(script).toContain('node_modules/.bin/tsc');
+    // Installs the pinned deps on a clean checkout, or fails actionably.
+    expect(script).toContain('bun install');
+    expect(script).toContain('bun install --frozen-lockfile');
+    // No reliance on a remote/`latest` compile, which would not be reproducible.
     expect(script).not.toContain('typescript@latest');
+    expect(script).not.toContain('bunx');
   });
 });
 

@@ -5,6 +5,5 @@
 .github/
 node_modules/
 opencode.jsonc
-.factory/evidence.log
 __pycache__/
 *.pyc

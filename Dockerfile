@@ -34,4 +34,7 @@ EXPOSE 8787
 # daemonises a child and would exit immediately in the container). The bind
 # address is `--hostname`, so the mapped port is reachable from the host; the
 # loopback default in `factory.yaml` is for local dev.
+# NOTE: the port 8787 is repeated in three places that must stay in sync — this
+# CMD, `EXPOSE` above, and the `ports:`/`factory.yaml` port. Change all three
+# together (the flag pins the container port to the published mapping).
 CMD ["bun", "run", "src/cli/factory.ts", "__serve", "--dir", "/app", "--port", "8787", "--hostname", "0.0.0.0"]
