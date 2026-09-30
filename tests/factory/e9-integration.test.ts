@@ -4,7 +4,9 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildServerDeps, type ServerDepsOptions } from '../../src/cli/factory';
+import { buildServerDeps, runCli, type CliIO, type ServerDepsOptions } from '../../src/cli/factory';
+import { createFactoryClient, FactoryApiError } from '../../src/factory/api/client';
+import { startFactoryServer } from '../../src/factory/api/server';
 import {
   DEFAULT_FACTORY_CONFIG,
   parseFactoryConfig,
@@ -16,10 +18,11 @@ import {
   createWorkOrder,
   transitionWorkOrder,
   type Task,
+  type TaskDependency,
   type WorkOrder,
 } from '../../src/factory/domain/workOrder';
 import { openEventLog } from '../../src/factory/events/log';
-import { commitDAG } from '../../src/factory/planning/dag';
+import { commitDAG, listDAGVersions } from '../../src/factory/planning/dag';
 import { createEvidenceReadPort, projectObservatory } from '../../src/factory/observatory/observatory';
 import { check } from '../../src/factory/policy/policy';
 import { createScheduler } from '../../src/factory/scheduler/scheduler';
@@ -398,6 +401,231 @@ describe('E9.1 evidence read seam', () => {
       }
     } finally {
       store.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E9.2 (#28) — DAG-commit API/CLI surface (import → plan → committed Task DAG)
+// ---------------------------------------------------------------------------
+
+interface DagHarness {
+  store: ReturnType<typeof openStateStore>;
+  events: ReturnType<typeof openEventLog>;
+  server: ReturnType<typeof startFactoryServer>;
+  client: ReturnType<typeof createFactoryClient>;
+  url: string;
+  stop(): void;
+}
+
+/**
+ * A real server on real `buildServerDeps` wiring (hermetic: fake adapter,
+ * temp-dir store, loopback only). This is the exact surface `factory serve`
+ * exposes, so "the server is the sole mutation authority" is what is under test.
+ */
+function dagHarness(): DagHarness {
+  const runtime = runtimeFrom(configText());
+  const deps = buildServerDeps(runtime, { spawn: () => new FakeHerdr() });
+  const server = startFactoryServer(deps);
+  return {
+    store: deps.store,
+    events: deps.events,
+    server,
+    client: createFactoryClient({ baseUrl: server.url }),
+    url: server.url,
+    stop(): void {
+      server.stop();
+      deps.store.close();
+    },
+  };
+}
+
+interface Captured {
+  io: CliIO;
+  out(): string;
+  err(): string;
+}
+
+function capture(cwd: string): Captured {
+  const outLines: string[] = [];
+  const errLines: string[] = [];
+  return {
+    io: {
+      cwd,
+      out: (line) => outLines.push(line),
+      err: (line) => errLines.push(line),
+    },
+    out: () => outLines.join('\n'),
+    err: () => errLines.join('\n'),
+  };
+}
+
+/** Move a freshly-submitted DRAFT Work Order to the planning state over the API. */
+async function advanceToPlanning(client: ReturnType<typeof createFactoryClient>, id: string): Promise<void> {
+  for (const to of ['READY', 'PLANNING'] as const) {
+    await client.transitionWorkOrder(id, { to });
+  }
+}
+
+describe('E9.2 DAG-commit API surface', () => {
+  it('commits a proposal as Tasks + dependency rows and a readable DAG v1', async () => {
+    const h = dagHarness();
+    try {
+      const wo = await h.client.submitWorkOrder({ intent: 'import → plan', acceptanceCriteria: ['ok'] });
+      await advanceToPlanning(h.client, wo.id);
+
+      const result = await h.client.commitDag(wo.id, {
+        rationale: 'two independent roots then a join',
+        nodes: [
+          { nodeId: 'a', title: 'Root A' },
+          { nodeId: 'b', title: 'Root B' },
+          { nodeId: 'c', title: 'Join', dependsOn: ['a', 'b'] },
+        ],
+      });
+
+      expect(result.dag.version).toBe(1);
+      expect(result.dag.workOrderId).toBe(wo.id);
+      expect(result.dag.nodes).toHaveLength(3);
+
+      // Tasks exist in durable state (server wrote them through E3, not the test).
+      const tasks = h.store.list<Task>('tasks').filter((task) => task.workOrderId === wo.id);
+      expect(tasks).toHaveLength(3);
+      expect(tasks.map((task) => task.title).sort()).toEqual(['Join', 'Root A', 'Root B']);
+      expect(tasks.every((task) => task.state === 'PLANNED')).toBe(true);
+
+      // Dependency rows exist, and the join joins both roots.
+      const deps = h.store.list<TaskDependency>('task_dependencies');
+      const joinTask = tasks.find((task) => task.title === 'Join')!;
+      const rootIds = tasks.filter((task) => task.title !== 'Join').map((task) => task.id);
+      expect(deps.filter((edge) => edge.taskId === joinTask.id)).toHaveLength(2);
+      expect(deps.map((edge) => edge.dependsOnTaskId).sort()).toEqual([...rootIds].sort());
+      expect(joinTask.dependsOn.sort()).toEqual([...rootIds].sort());
+
+      // v1 is durable and readable through the Work Order snapshot.
+      const versions = listDAGVersions({ store: h.store, events: h.events }, wo.id);
+      expect(versions.map((version) => version.version)).toEqual([1]);
+      const snapshot = await h.client.getWorkOrder(wo.id);
+      expect(snapshot.dag?.version).toBe(1);
+      expect(snapshot.dag?.nodes).toHaveLength(3);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('rejects an invalid DAG with DAG_INVALID and writes nothing; then v2 commits with v1 preserved', async () => {
+    const h = dagHarness();
+    try {
+      const wo = await h.client.submitWorkOrder({ intent: 'replan' });
+      await advanceToPlanning(h.client, wo.id);
+
+      const v1 = await h.client.commitDag(wo.id, { nodes: [{ nodeId: 'a', title: 'A' }] });
+      expect(v1.dag.version).toBe(1);
+
+      // A replan requires EXECUTING (E3's REPLAN state guard); move there first.
+      await h.client.transitionWorkOrder(wo.id, { to: 'EXECUTING' });
+
+      // A cycle is rejected with a typed DAG_INVALID (422) and no partial write.
+      const before = h.store.list<Task>('tasks').length;
+      const cycleFailure = h.client.commitDag(wo.id, {
+        nodes: [
+          { nodeId: 'x', title: 'X', dependsOn: ['y'] },
+          { nodeId: 'y', title: 'Y', dependsOn: ['x'] },
+        ],
+      });
+      const error = await cycleFailure.catch((thrown: unknown) => thrown);
+      expect(error).toBeInstanceOf(FactoryApiError);
+      expect((error as FactoryApiError).code).toBe('DAG_INVALID');
+      expect((error as FactoryApiError).status).toBe(422);
+      expect((error as FactoryApiError).message).toMatch(/DAG_CYCLE/);
+      expect(h.store.list<Task>('tasks')).toHaveLength(before);
+      expect(listDAGVersions({ store: h.store, events: h.events }, wo.id).map((v) => v.version)).toEqual([1]);
+
+      // An unknown dependency is rejected too, still writing nothing.
+      const unknown = await h.client
+        .commitDag(wo.id, { nodes: [{ nodeId: 'z', title: 'Z', dependsOn: ['ghost'] }] })
+        .catch((thrown: unknown) => thrown);
+      expect(unknown).toBeInstanceOf(FactoryApiError);
+      expect((unknown as FactoryApiError).code).toBe('DAG_INVALID');
+      expect((unknown as FactoryApiError).message).toMatch(/DAG_UNKNOWN_DEP/);
+      expect(h.store.list<Task>('tasks')).toHaveLength(before);
+
+      const v2 = await h.client.commitDag(wo.id, {
+        nodes: [
+          { nodeId: 'a2', title: 'A2' },
+          { nodeId: 'b2', title: 'B2', dependsOn: ['a2'] },
+        ],
+      });
+      expect(v2.dag.version).toBe(2);
+
+      // Both versions remain readable and v1 is untouched.
+      const versions = listDAGVersions({ store: h.store, events: h.events }, wo.id);
+      expect(versions.map((version) => version.version)).toEqual([1, 2]);
+      expect(versions[0]).toEqual(v1.dag);
+      expect(versions[1]).toEqual(v2.dag);
+      expect((await h.client.getWorkOrder(wo.id)).dag?.version).toBe(2);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('rejects a first plan while the Work Order is not PLANNING (state guard surfaced)', async () => {
+    const h = dagHarness();
+    try {
+      const wo = await h.client.submitWorkOrder({ intent: 'still draft' });
+      const error = await h.client
+        .commitDag(wo.id, { nodes: [{ nodeId: 'a', title: 'A' }] })
+        .catch((thrown: unknown) => thrown);
+      expect(error).toBeInstanceOf(FactoryApiError);
+      expect((error as FactoryApiError).code).toBe('DAG_INVALID');
+      expect((error as FactoryApiError).status).toBe(422);
+      expect((error as FactoryApiError).message).toMatch(/DRAFT; cannot propose DAG v1/);
+      expect(h.store.list<Task>('tasks')).toHaveLength(0);
+      expect(listDAGVersions({ store: h.store, events: h.events }, wo.id)).toEqual([]);
+    } finally {
+      h.stop();
+    }
+  });
+});
+
+describe('E9.2 DAG-commit CLI surface', () => {
+  it('imports a Work Order and plans it with `factory wo plan <id> --dag <file>`', async () => {
+    const h = dagHarness();
+    try {
+      const wo = await h.client.submitWorkOrder({ intent: 'cli plan' });
+      await advanceToPlanning(h.client, wo.id);
+
+      const dagFile = join(workDir, 'proposal.json');
+      writeFileSync(
+        dagFile,
+        JSON.stringify({
+          rationale: 'onboarding',
+          nodes: [
+            { nodeId: 'a', title: 'Scaffold' },
+            { nodeId: 'b', title: 'Ship', dependsOn: ['a'] },
+          ],
+        }),
+      );
+
+      const cap = capture(workDir);
+      expect(await runCli(['wo', 'plan', wo.id, '--dag', dagFile, '--url', h.url], cap.io)).toBe(0);
+      const out = JSON.parse(cap.out()) as { dag: { version: number; nodes: Array<{ taskId: string }> } };
+      expect(out.dag.version).toBe(1);
+      expect(out.dag.nodes).toHaveLength(2);
+
+      const tasks = h.store.list<Task>('tasks').filter((task) => task.workOrderId === wo.id);
+      expect(tasks).toHaveLength(2);
+      expect(h.store.list<TaskDependency>('task_dependencies')).toHaveLength(1);
+
+      // A server rejection is surfaced as a non-zero exit + message (no shell mutation).
+      const badFile = join(workDir, 'bad.json');
+      writeFileSync(badFile, JSON.stringify({ nodes: [{ nodeId: 'loop', title: 'L', dependsOn: ['loop'] }] }));
+      await h.client.transitionWorkOrder(wo.id, { to: 'EXECUTING' });
+      const bad = capture(workDir);
+      expect(await runCli(['wo', 'plan', wo.id, '--dag', badFile, '--url', h.url], bad.io)).toBe(1);
+      expect(bad.err()).toMatch(/DAG_INVALID|DAG_SELF_DEP/);
+      expect(h.store.list<Task>('tasks')).toHaveLength(2);
+    } finally {
+      h.stop();
     }
   });
 });

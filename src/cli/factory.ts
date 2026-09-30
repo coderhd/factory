@@ -15,6 +15,7 @@ import {
 import { openEventLog, type EventLog } from '../factory/events/log';
 import { createEvidenceReadPort } from '../factory/observatory/observatory';
 import { check } from '../factory/policy/policy';
+import type { DAGProposalPayload } from '../factory/planning/dag';
 import { createScheduler, type SchedulerPolicy } from '../factory/scheduler/scheduler';
 import { createArtifactStore, openStateStore, type StateStore } from '../factory/state/store';
 import { createHerdrWorker } from '../factory/workers/herdr';
@@ -482,6 +483,33 @@ async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
     return 0;
   }
 
+  if (sub === 'plan') {
+    const id = args.positionals[2];
+    const dagFile = flag(args, 'dag');
+    if (!id || !dagFile) {
+      io.err('usage: factory wo plan <workOrderId> --dag <file> [--url <url>]');
+      return 1;
+    }
+    const path = resolve(io.cwd ?? process.cwd(), dagFile);
+    if (!existsSync(path)) {
+      io.err(`dag file not found: ${path}`);
+      return 1;
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(readFileSync(path, 'utf8'));
+    } catch (error) {
+      io.err(`dag file is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+      return 1;
+    }
+    if (!payload || typeof payload !== 'object' || !Array.isArray((payload as { nodes?: unknown }).nodes)) {
+      io.err('dag file must be a JSON object with a "nodes" array');
+      return 1;
+    }
+    io.out(JSON.stringify(await client.commitDag(id, payload as DAGProposalPayload)));
+    return 0;
+  }
+
   if (sub === 'answer') {
     const id = args.positionals[2];
     const response = args.positionals.slice(3).join(' ') || flag(args, 'response');
@@ -520,6 +548,7 @@ const HELP = [
   '  restore <archive> --into <dir> [--force]  restore a backup archive',
   '  wo submit --intent <text> [--url]      create a Work Order (DRAFT)',
   '  wo status <workOrderId> [--url]        read Work Order status',
+  '  wo plan <workOrderId> --dag <file>     commit a planner DAG proposal',
   '  wo answer <interactionId> <response>   answer a QUESTION',
   '  observatory [--url]                    read Observatory projections',
 ].join('\n');

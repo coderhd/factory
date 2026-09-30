@@ -1,6 +1,6 @@
 import type { Attempt, Task, WorkOrder } from '../domain/workOrder';
 import type { DailyThroughput, HumanHourThroughput, DrillDownStage } from '../observatory/observatory';
-import type { DAGVersion } from '../planning/dag';
+import type { DAGVersion, RecordedProposal } from '../planning/dag';
 import type { SchedulerStatus } from '../scheduler/scheduler';
 
 /**
@@ -73,6 +73,16 @@ export interface AnswerResultDto {
 
 export interface SchedulerStatusDto {
   scheduler: SchedulerStatus;
+}
+
+/**
+ * The response from `POST /work-orders/:id/dag`: the recorded proposal plus the
+ * committed, immutable DAG version. The request body is E3's
+ * `DAGProposalPayload` verbatim; the client never names tasks or edges.
+ */
+export interface CommitDagResultDto {
+  proposal: RecordedProposal;
+  dag: DAGVersion;
 }
 
 export interface ApiErrorDto {

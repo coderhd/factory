@@ -10,13 +10,14 @@ import {
 } from '../domain/workOrder';
 import type { EventLog } from '../events/log';
 import { projectDrillDown, projectObservatory, type EvidenceReadPort } from '../observatory/observatory';
-import { getActiveDAG } from '../planning/dag';
+import { commitDAG, getActiveDAG, proposeDAG, type DAGProposalPayload } from '../planning/dag';
 import type { Scheduler } from '../scheduler/scheduler';
 import type { StateStore } from '../state/store';
 import {
   API_VERSION,
   type AnswerResultDto,
   type ApiErrorDto,
+  type CommitDagResultDto,
   type GateDecision,
   type HandshakeDto,
   type HealthDto,
@@ -310,6 +311,20 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
         }
         const workOrder = transitionWorkOrder(deps, id, { to: GATE_TRANSITIONS[decision] });
         return json({ workOrder });
+      }
+      if (method === 'POST' && id !== undefined && action === 'dag') {
+        const body = await readJson<DAGProposalPayload>(request);
+        if (!body || typeof body !== 'object') {
+          return apiError('INVALID_REQUEST', 'dag requires a JSON proposal payload', 400);
+        }
+        // Planner proposes, Factory commits (spec §7.1): record the advisory
+        // proposal, then commit through E3. Both are Factory-owned; an invalid
+        // payload throws DAG_INVALID (422) after one rejection event, nothing
+        // else written. The route never touches tasks/edges directly.
+        const proposal = proposeDAG(deps, id, body);
+        const dag = commitDAG(deps, id, body);
+        const result: CommitDagResultDto = { proposal, dag };
+        return json(result, 201);
       }
     }
 

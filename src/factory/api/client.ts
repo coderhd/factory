@@ -1,6 +1,8 @@
 import type { WorkOrder, WorkOrderIntent, WorkOrderTransition } from '../domain/workOrder';
+import type { DAGProposalPayload } from '../planning/dag';
 import type {
   AnswerResultDto,
+  CommitDagResultDto,
   DrillDownDto,
   GateDecision,
   HandshakeDto,
@@ -43,6 +45,7 @@ export interface FactoryClient {
   getWorkOrder(id: string): Promise<WorkOrderSnapshotDto>;
   transitionWorkOrder(id: string, transition: WorkOrderTransition): Promise<WorkOrder>;
   applyGate(id: string, decision: GateDecision): Promise<WorkOrder>;
+  commitDag(id: string, payload: DAGProposalPayload): Promise<CommitDagResultDto>;
   listInteractions(status?: InteractionDto['status']): Promise<InteractionDto[]>;
   answerInteraction(id: string, response: string): Promise<AnswerResultDto>;
   schedulerStatus(): Promise<SchedulerStatusDto>;
@@ -107,6 +110,8 @@ export function createFactoryClient(options: FactoryClientOptions): FactoryClien
       });
       return workOrder;
     },
+    commitDag: (id, payload) =>
+      request<CommitDagResultDto>('POST', `/work-orders/${id}/dag`, payload),
     async listInteractions(status): Promise<InteractionDto[]> {
       const query = status === undefined ? '' : `?status=${encodeURIComponent(status)}`;
       const { interactions } = await request<{ interactions: InteractionDto[] }>(
