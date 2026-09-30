@@ -4,6 +4,11 @@
 #
 # The pinned image is built from `Dockerfile` (`docker compose build`), so the
 # `image:` ref has a real build path rather than an unbuilt registry tag.
+#
+# Trust boundary: the server's control plane has **no authentication** yet, so
+# the published port is bound to loopback only (`127.0.0.1:8787`) — the API is
+# reachable from the host, never from the network. Real auth is tracked in
+# GitHub issue #40; widen the bind only once it lands.
 services:
   factory:
     image: ghcr.io/coderhd/factory:0.1.0
@@ -11,7 +16,7 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
     volumes:
       # Mount onto the `.factory/*` storage paths `factory.yaml` declares, so the
       # volumes are the persistence the spec requires (not empty host paths).

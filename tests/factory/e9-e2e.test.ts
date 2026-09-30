@@ -633,7 +633,9 @@ describe('E9.10 end-to-end acceptance — the roadmap #1 trace', () => {
       expect(failure.some((record) => record.diagnosis.includes('does not compile'))).toBe(true);
 
       // A real **worker failure** driven through the scheduler's worker-failure
-      // branch (scheduler.ts:552-566) on a dedicated probe Work Order: the
+      // branch (a failed/missing-evidence `WorkerResult` settles as a failed
+      // Attempt and releases the worker, leaving the Task RUNNING) on a
+      // dedicated probe Work Order: the
       // failed Task stays RUNNING (invariant 9) with no re-dispatch caller (the
       // producer is tracked in #38), so it is kept off the main Work Order —
       // an in-flight Task would make the rework replan fail DAG_IN_FLIGHT.

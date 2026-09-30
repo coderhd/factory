@@ -189,8 +189,11 @@ export interface ServerDepsOptions {
   spawn?: SpawnWorker;
   now?: () => string;
   /**
-   * E9.4 verification seam. Production wires an E5-backed verifier here;
-   * absent, the scheduler fails closed — a SUCCESS Task is never promoted
+   * E9.4 verification seam. Tests wire a verifier here; `cmdServe` calls
+   * {@link buildServerDeps} with no options, so production does **not** yet
+   * compose one (`createE5Verifier` currently has no non-test caller).
+   * Production verifier composition is tracked in GitHub issue #39. Absent the
+   * verifier, the scheduler fails closed — a SUCCESS Task is never promoted
    * without a persisted Evidence Bundle.
    */
   verifier?: WorkVerifier;
@@ -203,10 +206,44 @@ export interface ServerDepsOptions {
   reconcileOnBoot?: boolean;
 }
 
+/**
+ * The supported worker profiles, as a runtime list. `WorkerProfile` is a union
+ * of string literals; this array is the single runtime source of truth for the
+ * membership check below, and the `satisfies` keeps it exhaustive.
+ */
+const SUPPORTED_WORKER_PROFILES = ['herdr'] as const satisfies readonly WorkerProfile[];
+
+/**
+ * Resolve `provisioning.defaultProfile` into a `WorkerProfile`, failing loudly
+ * on a value the runtime cannot honour. `factory.yaml` validation only checks
+ * the string is non-empty, so this closes the gap between "a string was
+ * configured" and "a profile this deployment actually supports and declares".
+ * Throws (rather than casting) so a misconfiguration is visible at boot, not
+ * silently provisioned.
+ */
+function resolveDefaultWorkerProfile(runtime: FactoryRuntimeConfig): WorkerProfile {
+  const configured = runtime.scheduler.provisioning.defaultProfile;
+  const profiles = runtime.workers.profiles;
+  if (!(SUPPORTED_WORKER_PROFILES as readonly string[]).includes(configured)) {
+    throw new Error(
+      `scheduler.provisioning.defaultProfile "${configured}" is not a supported worker profile (supported: ${SUPPORTED_WORKER_PROFILES.join(', ')})`,
+    );
+  }
+  if (!profiles.includes(configured)) {
+    throw new Error(
+      `scheduler.provisioning.defaultProfile "${configured}" is not declared in workers.profiles (${profiles.join(', ')})`,
+    );
+  }
+  return configured as WorkerProfile;
+}
+
 export function buildServerDeps(
   runtime: FactoryRuntimeConfig,
   options: ServerDepsOptions = {},
 ): FactoryServerDeps {
+  // Validate the provisioning profile before opening any resource, so a
+  // misconfiguration fails fast without leaving a half-built store behind.
+  const defaultProfile = resolveDefaultWorkerProfile(runtime);
   ensureStorageDirs(runtime);
   const store = openStateStore(runtime.paths.db);
   const events = openEventLog(store.db);
@@ -261,7 +298,7 @@ export function buildServerDeps(
       tickIntervalMs: runtime.scheduler.tickIntervalMs,
       provisioning: {
         ...runtime.scheduler.provisioning,
-        defaultProfile: runtime.scheduler.provisioning.defaultProfile as WorkerProfile,
+        defaultProfile,
       },
     },
   );

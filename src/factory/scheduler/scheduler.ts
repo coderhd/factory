@@ -152,14 +152,6 @@ export const INTERACTION_CREATED = 'interaction.created';
 export const ASSIGNMENT_START_FAILED = 'assignment.start_failed';
 
 /**
- * Process-wide one-time guard for the fail-closed missing-verifier warning. A
- * `createScheduler` per test would otherwise repeat the same line many times;
- * the warning is about a deployment misconfiguration, so once per process is
- * loud enough (mirroring how a single running server has one scheduler).
- */
-let warnedMissingVerifier = false;
-
-/**
  * E9.4 diagnostic events. `EVIDENCE_BUNDLE_RECORDED` is appended in the same
  * transaction that persists the immutable bundle, so the receipt and its log
  * entry cannot diverge. `VERIFICATION_FAILED` carries the structured §14.4
@@ -275,6 +267,13 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
   let timer: ReturnType<typeof setInterval> | null = null;
   /** One-time guard so a missing `repoPath` warns loudly but only once. */
   let warnedMissingRepoPath = false;
+  /**
+   * One-time guard so a missing verifier warns loudly but only once. Per
+   * instance (like `warnedMissingRepoPath`), so a scheduler created over a
+   * fresh deployment state warns again rather than staying silent off a
+   * process-global latch.
+   */
+  let warnedMissingVerifier = false;
   /**
    * E9.4: Tasks whose SUCCESS→VERIFIED/REWORK routing is in flight. The async
    * verification runs off-tick (mirroring `pollWorker`) and its outcome is
@@ -893,15 +892,22 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     const task = deps.store.get<Task>('tasks', taskId);
     const workOrder = deps.store.get<WorkOrder>('work_orders', workOrderId);
     verifyPending.delete(taskId);
-    // Guard: only a Work Order still executing and a Task still at SUCCESS are
-    // routed. A crash/retry or a duplicate settle leaves state untouched.
+    // Guard: a crash/retry or a duplicate settle of an already-routed Task
+    // leaves state untouched. A Task still at SUCCESS is not a duplicate settle.
     if (!task || task.state !== 'SUCCESS' || !workOrder) return;
-    if (workOrder.state !== 'EXECUTING' && workOrder.state !== 'WAITING_INPUT') return;
+    // The Work Order must still be executing for the Work Order-level
+    // transitions. Two completions can settle in one batch: the first moves the
+    // WO to REWORK, so by the second's turn the WO is no longer executing. The
+    // Task-level failure transition (and, above all, the failure *event*) must
+    // still be recorded for the second Task, or its evidence is silently lost.
+    const workOrderExecuting =
+      workOrder.state === 'EXECUTING' || workOrder.state === 'WAITING_INPUT';
 
     const outcome = completion.outcome;
     const at = now();
 
     if (outcome.passed && outcome.bundle) {
+      if (!workOrderExecuting) return;
       const bundle = outcome.bundle;
       deps.store.db.transaction(() => {
         deps.store.set('evidence_bundles', bundle.id, bundle);
@@ -922,7 +928,10 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       return;
     }
 
-    // Failure or rejection: structured failure, REWORK, never a gate.
+    // Failure or rejection: structured failure, REWORK, never a gate. The event
+    // is appended first and unconditionally (given a SUCCESS Task) so a second
+    // settle in the same batch cannot lose its evidence record; the Work Order
+    // transitions are skipped once it has already left execution.
     const eventType = outcome.rejection ? VERIFICATION_REJECTED : VERIFICATION_FAILED;
     deps.store.db.transaction(() => {
       deps.events.appendEvent({
@@ -940,9 +949,11 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       transitionTask(deps, taskId, { to: 'VERIFYING' });
       transitionTask(deps, taskId, { to: 'FAILED', reason: 'verification failed' });
       transitionTask(deps, taskId, { to: 'REWORK', reason: 'verification failed' });
-      transitionWorkOrder(deps, workOrder.id, { to: 'VERIFYING' });
-      transitionWorkOrder(deps, workOrder.id, { to: 'FAILED' });
-      transitionWorkOrder(deps, workOrder.id, { to: 'REWORK', reason: 'verification failed' });
+      if (workOrderExecuting) {
+        transitionWorkOrder(deps, workOrder.id, { to: 'VERIFYING' });
+        transitionWorkOrder(deps, workOrder.id, { to: 'FAILED' });
+        transitionWorkOrder(deps, workOrder.id, { to: 'REWORK', reason: 'verification failed' });
+      }
     })();
   }
 

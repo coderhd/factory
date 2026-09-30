@@ -163,16 +163,6 @@ interface Harness {
 const FACTORY_BASE_URL = 'http://factory.local:8787';
 
 /**
- * The E6 branch lives in the E3 `wo-<workOrderId>/task-<…>` namespace
- * (RE5(c)/E9.8), which the embedded `branch.create`/`repo.write` scope
- * (`wo-*&#47;**`) already authorizes — no bespoke deployment grant is needed.
- * The helper is a no-op kept to mark where a grant used to be required.
- */
-function grantFactoryBranches(_h: Harness): void {
-  // No-op: the default embedded policy authorizes the `wo-*` namespace.
-}
-
-/**
  * The E6 change-set branch: the E3 `wo-<id>/task-<…>` namespace, with the leaf
  * keyed on the **Work Order** (E6 opens one PR per Work Order). E3's worktree
  * branch keys the leaf on the **Task** (`taskWorktreeBranch`); the leaves differ
@@ -341,8 +331,8 @@ describe('E6.1 GitHub branch creation', () => {
         number: issue.number,
       });
       // The E6 branch is the E3 namespace `wo-<woId>/task-<short>`; the embedded
-      // `branch.create` scope binds `wo-*&#47;**`, so it is authorized as-is.
-      grantFactoryBranches(h);
+      // `branch.create` scope binds `wo-*&#47;**`, so it is authorized as-is
+      // with no bespoke deployment grant.
 
       const branch = await h.adapter.createBranch(workOrder);
 
@@ -370,7 +360,6 @@ describe('E6.1 GitHub branch creation', () => {
         repository: issue.repository,
         number: issue.number,
       });
-      grantFactoryBranches(h);
 
       const branch = await h.adapter.createBranch(workOrder, 'develop');
       expect(branch.name).toBe(expectedBranchName(workOrder.id));
@@ -389,7 +378,6 @@ describe('E6.1 GitHub branch creation', () => {
         repository: issue.repository,
         number: issue.number,
       });
-      grantFactoryBranches(h);
       emergencyStop({ store: h.store, events: h.events }, { actor: 'operator-1' });
 
       await expect(h.adapter.createBranch(workOrder)).rejects.toMatchObject({
@@ -700,7 +688,6 @@ describe('E6.1 adapter is the sole GitHub integration (spec §4.2)', () => {
         repository: issue.repository,
         number: issue.number,
       });
-      grantFactoryBranches(h);
       await h.adapter.createBranch(workOrder);
       await h.adapter.openPR(await realBundle(workOrder));
 

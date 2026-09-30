@@ -1238,8 +1238,10 @@ describe('E2 CLI', () => {
       await runCli(['status', '--dir', dir], stoppedCap.io);
       expect((JSON.parse(stoppedCap.out()) as { status: string }).status).toBe('stopped');
     } finally {
-      // Safety net: never leak a detached server if an assertion fails.
-      await runCli(['stop', '--dir', dir], capture(dir).io);
+      // Safety net: never leak a detached server if an assertion fails. Assert
+      // the exit code so a broken `stop` (which would leave the child running)
+      // cannot pass silently.
+      expect(await runCli(['stop', '--dir', dir], capture(dir).io)).toBe(0);
     }
   });
 });

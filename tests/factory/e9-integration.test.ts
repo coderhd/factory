@@ -362,6 +362,53 @@ describe('E9.1 server orchestration spine — policy', () => {
       store.close();
     }
   });
+
+  it('warns once per scheduler instance (not per process) when no verifier is wired', async () => {
+    const store = openStateStore(join(workDir, 'noverifier.db'));
+    const events = openEventLog(store.db);
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
+    try {
+      const workers = createWorkerManager({ store, events, spawn: () => new FakeHerdr() });
+      const worktrees = createWorktreeManager({ rootDir: join(workDir, 'wt'), baseBranch: 'main' });
+      const scheduler = createScheduler({
+        store,
+        events,
+        workers,
+        worktrees,
+        repoPath,
+        policy: { canAssign: () => 'ALLOW' },
+      });
+      const { wo, task } = seedExecutingWorkOrder(store, events);
+      driveTaskToSuccess(store, events, task.id, 'writer-nv', 'diff --git a/src/x.ts b/src/x.ts\n+x');
+
+      // No verifier: the SUCCESS Task parks, warning once across repeated ticks.
+      scheduler.tick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      scheduler.tick();
+      const firstWarnings = errors.filter((line) => /no verifier wired/.test(line));
+      expect(firstWarnings).toHaveLength(1);
+      expect(store.get<Task>('tasks', task.id)!.state).toBe('SUCCESS');
+
+      // A fresh scheduler instance over a different Work Order warns again: the
+      // guard is per instance, not a process global.
+      const second = createScheduler({
+        store,
+        events,
+        workers,
+        worktrees,
+        repoPath,
+        policy: { canAssign: () => 'ALLOW' },
+      });
+      second.tick();
+      const allWarnings = errors.filter((line) => /no verifier wired/.test(line));
+      expect(allWarnings.length).toBeGreaterThan(firstWarnings.length);
+    } finally {
+      console.error = originalError;
+      store.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -398,6 +445,39 @@ describe('E9.1 factory.yaml — repository/worktrees/provisioning keys', () => {
     // A wholly absent repository block also fails loudly, not silently.
     const dropped = configText().replace(/repository:\n {2}path:.*\n/, '');
     expect(parseFactoryConfig(dropped).ok).toBe(false);
+  });
+
+  it('fails loudly when defaultProfile is not a supported/declared worker profile', () => {
+    // `factory.yaml` validation only checks the string is non-empty, so an
+    // undeclared default profile would otherwise be cast to `WorkerProfile`.
+    const runtime = runtimeFrom(configText());
+    const undeclared = {
+      ...runtime,
+      scheduler: {
+        ...runtime.scheduler,
+        provisioning: { ...runtime.scheduler.provisioning, defaultProfile: 'ghost' },
+      },
+    };
+    expect(() => buildServerDeps(undeclared)).toThrow(/not a supported worker profile/);
+
+    // Declared in `workers.profiles` but not one the runtime supports.
+    const unsupported = {
+      ...runtime,
+      workers: { profiles: ['herdr', 'ghost'] },
+      scheduler: {
+        ...runtime.scheduler,
+        provisioning: { ...runtime.scheduler.provisioning, defaultProfile: 'ghost' },
+      },
+    };
+    expect(() => buildServerDeps(unsupported)).toThrow(/not a supported worker profile/);
+
+    // The supported, declared profile builds normally.
+    const deps = buildServerDeps(runtime);
+    try {
+      expect(deps.scheduler).toBeDefined();
+    } finally {
+      deps.store.close();
+    }
   });
 });
 
@@ -1496,6 +1576,47 @@ describe('E9.4 verification + evidence orchestration', () => {
       h.close();
     }
   });
+
+  it('records a failure event for every Task when two fail in one batch', async () => {
+    const failTasks = new Set<string>();
+    const h = verificationHarness({
+      providers: [
+        { id: 'typecheck', category: 'deterministic', kind: 'typecheck', passed: true },
+        { id: 'playwright', category: 'behavioral', kind: 'playwright', passed: true },
+      ],
+      judgeModel: 'judge-1',
+      controlled: { failTasks },
+    });
+    try {
+      const { wo, tasks } = seedTwoTaskWorkOrder(h.store, h.events);
+      const [taskA, taskB] = tasks as [Task, Task];
+      driveTaskToSuccess(h.store, h.events, taskA.id, 'writer-a');
+      driveTaskToSuccess(h.store, h.events, taskB.id, 'writer-b');
+      // Both fail, settling in the same batch (A then B). The first failure
+      // moves the Work Order EXECUTING → REWORK, so the second Task settles
+      // with the Work Order no longer executing — its failure event must still
+      // be recorded (the event append runs before the WO-state guard).
+      failTasks.add(taskA.id);
+      failTasks.add(taskB.id);
+
+      h.scheduler.tick();
+      h.settle(taskA.id);
+      h.settle(taskB.id);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      h.scheduler.tick();
+
+      expect(h.store.get<Task>('tasks', taskA.id)!.state).toBe('REWORK');
+      expect(h.store.get<Task>('tasks', taskB.id)!.state).toBe('REWORK');
+      expect(h.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      const failedTaskIds = h.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .filter((event) => event.type === 'verification.failed')
+        .map((event) => (event.payload as { taskId: string }).taskId);
+      expect(failedTaskIds.sort()).toEqual([taskA.id, taskB.id].sort());
+    } finally {
+      h.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1696,7 +1817,17 @@ describe('E9.5 approval answering — REQUIRE_HUMAN park answerable end-to-end',
       expect(h.store.get<ApprovalRecord>('interactions', parked.id)!.status).toBe('ANSWERED');
       // No duplicate approval is parked while the answered one stands.
       expect(approvalsIn(h.store)).toHaveLength(1);
-      expect(wo.id).toBe(parked.workOrderId);
+      // The DENY receipt is durable in the event log: an `approval_answered`
+      // event carries the DENY decision + actor, bound to this Work Order's
+      // approval — the evidence record that the gate was refused.
+      const denyReceipt = h.events
+        .readEvents({ aggregateType: 'interaction', aggregateId: parked.id })
+        .find((event) => event.type === 'interaction.approval_answered');
+      expect(denyReceipt).toBeDefined();
+      const recorded = (denyReceipt!.payload as { approval: ApprovalRecord }).approval;
+      expect(recorded.workOrderId).toBe(wo.id);
+      expect(recorded.response?.decision).toBe('DENY');
+      expect(recorded.response?.actor).toBe('operator-2');
     } finally {
       h.close();
     }
@@ -2943,16 +3074,17 @@ describe('E9.8 path-level repo.write gating (the infra/** exclusion) at write ti
     expect(changedPathsFromDiff(diff).sort()).toEqual(['infra/main.tf', 'src/counter.ts']);
   });
 
-  it('gates the new path on a rename; a delete is gated by its removed path', () => {
+  it('gates both sides of a rename (source and destination); a delete is gated', () => {
+    // `git mv infra/x docs/x`: the `b/` header names only the destination, so
+    // the `rename from` extended header supplies the source. Both are gated —
+    // without the source, `infra/**` content could be relocated out un-gated.
     const rename = [
-      'diff --git a/infra/old.tf b/src/new.ts',
+      'diff --git a/infra/old.tf b/docs/new.tf',
       'similarity index 90%',
       'rename from infra/old.tf',
-      'rename to src/new.ts',
+      'rename to docs/new.tf',
     ].join('\n');
-    // Only the destination (`b/`) path is read: a rename's source (`a/`) is not
-    // gated, the (possibly out-of-scope) destination is.
-    expect(changedPathsFromDiff(rename)).toEqual(['src/new.ts']);
+    expect(changedPathsFromDiff(rename).sort()).toEqual(['docs/new.tf', 'infra/old.tf']);
 
     const deletion = [
       'diff --git a/infra/gone.tf b/infra/gone.tf',
@@ -2963,6 +3095,39 @@ describe('E9.8 path-level repo.write gating (the infra/** exclusion) at write ti
     // A delete carries the removed path on the `b/` side too, so it IS captured
     // (and gated) — under the `infra/**` exclusion this would be denied.
     expect(changedPathsFromDiff(deletion)).toEqual(['infra/gone.tf']);
+
+    // A delete rendered with an explicit `delete from` header (and no `b/`
+    // path beyond the destination echo) is still captured from the source side.
+    const deleteHeaderOnly = [
+      'diff --git a/infra/gone.tf b/infra/gone.tf',
+      'deleted file mode 100644',
+      'delete from infra/gone.tf',
+    ].join('\n');
+    expect(changedPathsFromDiff(deleteHeaderOnly)).toEqual(['infra/gone.tf']);
+  });
+
+  it('denies a rename that moves infra/** out of the protected zone (source gated)', () => {
+    const store = openStateStore(join(workDir, `e9-rename-gate-${crypto.randomUUID()}.db`));
+    const events = openEventLog(store.db);
+    try {
+      const { wo, task } = seedExecutingWorkOrder(store, events);
+      const branch = expectedBranch(wo.id, task.id);
+      const diff = [
+        'diff --git a/infra/app.tf b/docs/app.tf',
+        'similarity index 100%',
+        'rename from infra/app.tf',
+        'rename to docs/app.tf',
+      ].join('\n');
+      const paths = changedPathsFromDiff(diff);
+      expect(paths.sort()).toEqual(['docs/app.tf', 'infra/app.tf']);
+      const gate = repoWriteGate({ store, events }, { taskId: task.id, workOrderId: wo.id }, branch, paths);
+      // The source path `infra/app.tf` is outside the repo.write grant, so the
+      // relocation is denied — the protected-zone content cannot escape.
+      expect(gate.allowed).toBe(false);
+      expect(gate.denied).toEqual(['infra/app.tf']);
+    } finally {
+      store.close();
+    }
   });
 
   it('treats a no-change diff as a vacuous allow (nothing written, nothing to gate)', () => {
@@ -3259,6 +3424,14 @@ describe('E9.9 compose honesty', () => {
     expect(compose).toContain('factory-state:/app/.factory/state');
     expect(compose).toContain('factory-artifacts:/app/.factory/artifacts');
     expect(compose).toContain('factory-knowledge:/app/.factory/knowledge');
+  });
+
+  it('publishes the unauthenticated control plane on loopback only (#40)', () => {
+    const compose = readRepoFile('compose.yaml');
+    // The API has no auth yet, so the published port is bound to loopback —
+    // never all interfaces. Widening the bind requires real auth (#40).
+    expect(compose).toContain('- "127.0.0.1:8787:8787"');
+    expect(compose).not.toContain('- "8787:8787"');
   });
 });
 

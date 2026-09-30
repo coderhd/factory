@@ -8,3 +8,14 @@ jobs:
       - run: |
           test -f .factory/evidence.log || (echo "missing evidence log" && exit 1)
           git log --format=%B -n 5 | grep -qE "spec:|plan:" || (echo "PR needs spec:/plan: links" && exit 1)
+      # The type gate. Bun strips types at runtime, so without this step a
+      # test-only type slip is invisible until it breaks. `check-tsc.sh` is
+      # self-contained: it installs the pinned type deps (`bun install`) when
+      # they are absent, then runs `tsc --noEmit` over `src/` + `tests/`.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - run: sh scripts/check-tsc.sh
+      # The suite is hermetic (no network, no daemon: fake adapters, temp dirs),
+      # so it runs on the type-gate deps without a separate install step.
+      - run: bun test

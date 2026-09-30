@@ -753,35 +753,49 @@ export function check(deps: PolicyCheckDeps, subject: TaskRef, action: PolicyAct
 // Write-time `repo.write` path gating (RE6: the `infra/**` exclusion)
 // ---------------------------------------------------------------------------
 
-/** One changed path from a unified diff: the `b/<path>` side of a `diff --git`. */
+/**
+ * The `b/<path>` (new) side of every `diff --git a/… b/<path>` header. Git emits
+ * one per touched file, so this alone covers adds, edits and same-path deletes.
+ */
 const DIFF_HEADER = /^diff --git a\/.+ b\/(.+)$/gm;
+/**
+ * The **source** (`a/`) side of a rename/copy/delete. Git emits these extended
+ * headers *in addition to* `diff --git`, and the `diff --git` header only names
+ * the destination on the `b/` side. Without these, `git mv infra/x docs/x` would
+ * gate only `docs/x` and let `infra/**` content leave the protected zone
+ * un-gated. Captured so both the source and the destination are gated.
+ */
+const DIFF_SOURCE_HEADER = /^(?:rename|copy|delete) from (.+)$/gm;
 
 /**
  * The changed paths a git diff touches (the write-time input for path-scoped
- * `repo.write`). Reads only the `diff --git a/… b/<path>` headers, which git
- * emits for every touched file — no hunk parsing, no heuristic content
- * sniffing. Deterministic and deduplicated, in first-seen order.
+ * `repo.write`). Reads the `diff --git a/… b/<path>` headers plus the
+ * `rename from`/`copy from`/`delete from` extended headers — no hunk parsing, no
+ * heuristic content sniffing. Deterministic and deduplicated, in first-seen
+ * order.
  *
- * Only the **new** (`b/<path>`) side is read. For a rename, git emits the source
- * and destination on that header (`a/<old> b/<new>`), so the destination is
- * gated and the source path is not. A **delete** is gated: git emits
- * `diff --git a/<path> b/<path>` (the same path on the `b/` side), so the
- * removed path is captured and gated like any other. The `repo.write` concern is
- * the path the change set names, which this header gives for adds, edits and
- * deletes alike.
+ * Both sides of a rename are captured: the `b/<path>` header gives the
+ * destination and the `rename from <path>` header gives the source, so
+ * `git mv infra/x docs/x` gates both `docs/x` and `infra/x` — content cannot be
+ * relocated out of a protected zone un-gated. A **delete** is gated either way:
+ * git emits `diff --git a/<path> b/<path>` (same path on the `b/` side) and,
+ * for a tracked delete, a `delete from <path>` header. The `repo.write` concern
+ * is every path the change set names.
  */
 export function changedPathsFromDiff(diff: string): string[] {
   const paths: string[] = [];
   const seen = new Set<string>();
-  DIFF_HEADER.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = DIFF_HEADER.exec(diff)) !== null) {
-    const path = match[1];
+  const add = (path: string | undefined): void => {
     if (path && !seen.has(path)) {
       seen.add(path);
       paths.push(path);
     }
-  }
+  };
+  DIFF_HEADER.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = DIFF_HEADER.exec(diff)) !== null) add(match[1]);
+  DIFF_SOURCE_HEADER.lastIndex = 0;
+  while ((match = DIFF_SOURCE_HEADER.exec(diff)) !== null) add(match[1]);
   return paths;
 }
 
