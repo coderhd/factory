@@ -67,17 +67,27 @@ import {
  * Every step asserts **durable** evidence — state + event log + the persisted
  * Evidence Bundle — not merely the final state.
  *
- * ## One seam is exercised at its module level, deliberately
+ * ## Two seams are exercised deliberately
  *
  * The live scheduler has no caller that re-dispatches a failed/reworked Task
- * (E7's bounded recovery is wired into boot reconciliation and the circuit,
- * and the *live dependency-failure producer* is tracked in #37). So the trace's
- * `failure+recovery` step calls the real E7 `recover()` entry point exactly as
- * a runtime caller would — the same module-level seam the E9.6 suite exercises
- * — to open a new clean-baseline Attempt, and the Factory's documented
- * rework/replan path (`commitDAG` v2 in REWORK; §5.1 `REWORK → EXECUTING`) is
- * driven to re-execute. Nothing is faked: the store, policy, recovery,
- * verification and evidence modules are the production ones.
+ * (E7's bounded recovery is wired into boot reconciliation and the circuit;
+ * the live producer is tracked in #37, and the worker-failure re-dispatch
+ * producer in #38). So:
+ *
+ * - the trace's `failure+recovery` step drives a **real worker failure** through
+ *   the scheduler's worker-failure branch on a dedicated probe Work Order and
+ *   asserts its exact durable effects (failed Attempt, closed Assignment,
+ *   released worker, Task stays RUNNING per invariant 9), then calls the real
+ *   E7 `recover()` entry point exactly as a runtime caller would — the same
+ *   module-level seam the E9.6 suite exercises — to open a new clean-baseline
+ *   Attempt, and the Factory's documented rework/replan path (`commitDAG` v2 in
+ *   REWORK; §5.1 `REWORK → EXECUTING`) is driven to re-execute.
+ *
+ * The probe Work Order is separate on purpose: a worker-failed Task stays
+ * RUNNING and would make the main Work Order's rework replan fail
+ * `DAG_IN_FLIGHT`, so a dead-end would otherwise be hidden. Nothing is faked:
+ * the store, policy, recovery, verification and evidence modules are the
+ * production ones.
  */
 
 let workDir: string;
@@ -114,8 +124,10 @@ function runtimeFrom(): FactoryRuntimeConfig {
     repository: { path: repoPath },
     scheduler: {
       ...DEFAULT_FACTORY_CONFIG.scheduler,
-      // Two concurrent Tasks prove the isolated-worktree concurrency claim.
-      maxConcurrentTasks: 2,
+      // Two concurrent Tasks prove the isolated-worktree concurrency claim; a
+      // third slot lets the worker-failure probe Work Order (whose failed Task
+      // stays RUNNING, invariant 9) hold a slot without starving the trace.
+      maxConcurrentTasks: 3,
       provisioning: { ...DEFAULT_FACTORY_CONFIG.scheduler.provisioning, max: 5 },
     },
   });
@@ -189,6 +201,19 @@ function completedResult(diff: string): WorkerResult {
     verificationRequests: [],
     diff,
     failure: null,
+  };
+}
+
+function failedResult(failure: string): WorkerResult {
+  return {
+    status: 'failed',
+    commits: [],
+    artifacts: [],
+    interactions: [],
+    observations: [],
+    verificationRequests: [],
+    diff: 'diff --git a/src/store.ts b/src/store.ts\n+partial work',
+    failure,
   };
 }
 
@@ -435,6 +460,8 @@ function createHarness(options: { failOnce?: Set<string> } = {}): E2EHarness {
     },
     close(): void {
       server.stop();
+      // `events` shares `store`'s database handle (`openEventLog(store.db)`), so
+      // closing the two store handles releases the readers too.
       deps.store.close();
       readStore.close();
     },
@@ -605,6 +632,47 @@ describe('E9.10 end-to-end acceptance — the roadmap #1 trace', () => {
       expect(failure.some((record) => record.verifier === 'typecheck')).toBe(true);
       expect(failure.some((record) => record.diagnosis.includes('does not compile'))).toBe(true);
 
+      // A real **worker failure** driven through the scheduler's worker-failure
+      // branch (scheduler.ts:552-566) on a dedicated probe Work Order: the
+      // failed Task stays RUNNING (invariant 9) with no re-dispatch caller (the
+      // producer is tracked in #38), so it is kept off the main Work Order —
+      // an in-flight Task would make the rework replan fail DAG_IN_FLIGHT.
+      const probe = await h.client.submitWorkOrder({
+        intent: 'worker-failure probe',
+        acceptanceCriteria: ['probe'],
+      });
+      await h.client.transitionWorkOrder(probe.id, { to: 'READY' });
+      await h.client.transitionWorkOrder(probe.id, { to: 'PLANNING' });
+      const probeDag = await h.client.commitDag(probe.id, { nodes: [{ nodeId: 'probe', title: 'Probe' }] });
+      await h.client.transitionWorkOrder(probe.id, { to: 'EXECUTING' });
+      const probeTaskId = probeDag.dag.nodes[0]!.taskId;
+      await h.until('probe-assigned', () => taskById(h.store, probeTaskId).state === 'RUNNING');
+      const probeAssignmentBefore = h.store
+        .list<{ id: string; taskId: string; workerId: string; closedAt: string | null }>('assignments')
+        .find((row) => row.taskId === probeTaskId)!;
+      h.adapterFor(probeTaskId).release(failedResult('worker blew up'));
+      await h.until(
+        'probe-worker-failed',
+        () => attemptFor(h.store, probeTaskId)?.outcome === 'failed',
+      );
+
+      // The worker-failure branch's durable effects, exactly:
+      const probeAttempt = attemptFor(h.store, probeTaskId)!;
+      expect(probeAttempt.outcome).toBe('failed');
+      expect(probeAttempt.failureHistory.map((entry) => entry.failure)).toContain('worker blew up');
+      const probeAssignmentAfter = h.store
+        .list<{ id: string; taskId: string; workerId: string; closedAt: string | null }>('assignments')
+        .find((row) => row.id === probeAssignmentBefore.id)!;
+      expect(probeAssignmentAfter.closedAt).not.toBeNull();
+      const probeWorker = h.store.get<{ runtimeState: string; lease: unknown }>(
+        'workers',
+        probeAssignmentBefore.workerId,
+      )!;
+      expect(probeWorker.runtimeState).toBe('IDLE');
+      expect(probeWorker.lease).toBeNull();
+      // Invariant 9: the Task stays RUNNING — no dead-end assertion hidden.
+      expect(taskById(h.store, probeTaskId).state).toBe('RUNNING');
+
       // E7 bounded recovery: a VERIFICATION_FAILURE opens a new clean-baseline
       // Attempt (module-level seam; the live producer is tracked in #37).
       const failedAttempt = attemptFor(h.store, taskBId)!;
@@ -670,11 +738,13 @@ describe('E9.10 end-to-end acceptance — the roadmap #1 trace', () => {
 
       const bundles = h.store.list<EvidenceBundle>('evidence_bundles');
       expect(bundles).toHaveLength(3); // A(v1) + A2 + B2
-      const bundle = bundles.find((candidate) => candidate.changeSetId === `cs_${attemptFor(h.store, taskA2Id)!.id}`)!;
+      const bundle = bundles.find((candidate) => candidate.changeSetId === `cs_${attemptFor(h.store, taskA2Id)!.id}`);
+      // A nullable lookup, so a missing bundle fails here cleanly rather than at
+      // an unguarded `.complete` dereference below.
       expect(bundle).toBeDefined();
-      expect(bundle.complete).toBe(true);
-      expect(bundle.gates).toMatchObject({ deterministic: true, behavioral: true, semantic: true, run: true });
-      expect(bundle.criteria.every((criterion) => criterion.status === 'pass')).toBe(true);
+      expect(bundle!.complete).toBe(true);
+      expect(bundle!.gates).toMatchObject({ deterministic: true, behavioral: true, semantic: true, run: true });
+      expect(bundle!.criteria.every((criterion) => criterion.status === 'pass')).toBe(true);
       // Each assembled bundle is recorded in the same transaction that persists it.
       const recorded = h.events
         .readEvents({ aggregateType: 'work_order', aggregateId: woId })
@@ -682,6 +752,7 @@ describe('E9.10 end-to-end acceptance — the roadmap #1 trace', () => {
       expect(recorded).toHaveLength(3);
 
       // The human gate is a Factory-owned approval over the durable evidence.
+      const verifiedBundle = bundle!;
       const woStates = h.events
         .readEvents({ aggregateType: 'work_order', aggregateId: woId })
         .filter((event) => event.type === 'work_order.transitioned')
@@ -705,11 +776,11 @@ describe('E9.10 end-to-end acceptance — the roadmap #1 trace', () => {
       expect(branch.name).toBe(`wo-${woId}/task-${woId.slice(0, 8)}`);
       expect(h.transport.branchCalls).toHaveLength(1);
 
-      const pr = await h.github.openPR(bundle, { title: gated.intent });
+      const pr = await h.github.openPR(verifiedBundle, { title: gated.intent });
       expect(pr.head).toBe(branch.name);
       expect(h.transport.prCalls).toHaveLength(1);
       // The PR body links the Work Order and the Evidence Bundle (§28).
-      expect(h.transport.prCalls[0]!.body).toContain(bundle.id);
+      expect(h.transport.prCalls[0]!.body).toContain(verifiedBundle.id);
       expect(h.transport.prCalls[0]!.body).toContain(woId);
 
       // Park + answer the production merge approval (the only §13.2 path to ALLOW):
@@ -734,7 +805,7 @@ describe('E9.10 end-to-end acceptance — the roadmap #1 trace', () => {
       const outcome = await h.github.merge({
         workOrderId: woId,
         pullRequest: { repository: pr.repository, number: pr.number },
-        evidence: bundle,
+        evidence: verifiedBundle,
         actor: 'operator-1',
       });
       expect(outcome.merge.merged).toBe(true);
@@ -759,7 +830,7 @@ describe('E9.10 end-to-end acceptance — the roadmap #1 trace', () => {
         .list<Attempt>('attempts')
         .filter((attempt) => attempt.outcome === 'success')
         .map((attempt) => attempt.id);
-      expect(attemptIds.length).toBeGreaterThanOrEqual(4);
+      expect(attemptIds.length).toBe(4);
       for (const attemptId of attemptIds) {
         const receipts = h.events
           .readEvents({ aggregateType: 'attempt', aggregateId: attemptId })
@@ -811,9 +882,14 @@ describe('E9.10 end-to-end acceptance — the roadmap #1 trace', () => {
         expect(second.store.get<WorkOrder>('work_orders', woId)!.state).toBe('MERGED');
         expect(second.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(3);
       } finally {
+        // Closing the store releases `second.events`: the EventLog shares its
+        // store's database handle (`openEventLog(store.db)`), so there is no
+        // separate reader to close — closing the store is the symmetry.
         second.store.close();
       }
     } finally {
+      // Likewise `restartDeps.events` shares `restartDeps.store`'s database
+      // handle and is released when the store closes.
       restartDeps?.store.close();
       // The restart step tears the harness down itself; only close it here when
       // the trace failed before reaching that point.
