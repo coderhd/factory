@@ -1,4 +1,12 @@
-import { completeAttempt, transitionTask, type Task, type WorkOrder } from '../domain/workOrder';
+import {
+  completeAttempt,
+  transitionTask,
+  transitionWorkOrder,
+  type Attempt,
+  type Task,
+  type WorkOrder,
+} from '../domain/workOrder';
+import type { WorkVerifier, VerificationOutcome } from '../verification/orchestrator';
 import type { EventLog } from '../events/log';
 import { getActiveDAG, type DAGVersion } from '../planning/dag';
 import { RESOURCE_UNAVAILABLE } from '../recovery/recovery';
@@ -63,6 +71,13 @@ export interface SchedulerDeps {
    * (`FULL_BUDGET`, none unavailable), which routes purely on capability.
    */
   routing?: SchedulerRouting;
+  /**
+   * E9.4 verification seam. When wired, a Task reaching SUCCESS is verified by
+   * the E5 tiers and its Evidence Bundle is persisted before the Task/WO may
+   * advance. Absent, verification fails closed: a SUCCESS Task is never
+   * promoted (no silent pass).
+   */
+  verifier?: WorkVerifier;
 }
 
 /** E4 routing signals for the assignment pass (RE7(b)). */
@@ -105,6 +120,25 @@ export const INTERACTION_CREATED = 'interaction.created';
  * because `startTask` threw after `assign` had committed.
  */
 export const ASSIGNMENT_START_FAILED = 'assignment.start_failed';
+
+/**
+ * Process-wide one-time guard for the fail-closed missing-verifier warning. A
+ * `createScheduler` per test would otherwise repeat the same line many times;
+ * the warning is about a deployment misconfiguration, so once per process is
+ * loud enough (mirroring how a single running server has one scheduler).
+ */
+let warnedMissingVerifier = false;
+
+/**
+ * E9.4 diagnostic events. `EVIDENCE_BUNDLE_RECORDED` is appended in the same
+ * transaction that persists the immutable bundle, so the receipt and its log
+ * entry cannot diverge. `VERIFICATION_FAILED` carries the structured §14.4
+ * failures that drove REWORK; `VERIFICATION_REJECTED` records a run refused
+ * before any bundle could exist (e.g. writer = verifier) — never a pass.
+ */
+export const EVIDENCE_BUNDLE_RECORDED = 'evidence.bundle_recorded';
+export const VERIFICATION_FAILED = 'verification.failed';
+export const VERIFICATION_REJECTED = 'verification.rejected';
 
 /**
  * A persisted §12 interaction: the durable question a `waiting_input` Attempt
@@ -206,6 +240,17 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
   let timer: ReturnType<typeof setInterval> | null = null;
   /** One-time guard so a missing `repoPath` warns loudly but only once. */
   let warnedMissingRepoPath = false;
+  /**
+   * E9.4: Tasks whose SUCCESS→VERIFIED/REWORK routing is in flight. The async
+   * verification runs off-tick (mirroring `pollWorker`) and its outcome is
+   * routed on the next tick; this set is the kind of "pending" guard that keeps
+   * a SUCCESS Task from being re-dispatched every tick while it settles.
+   */
+  const verifyPending = new Set<string>();
+  const verificationCompletions: Array<{
+    subject: { workOrderId: string; taskId: string; attemptId: string };
+    outcome: VerificationOutcome;
+  }> = [];
 
   // --- durable-state readers -------------------------------------------------
 
@@ -622,9 +667,171 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     );
   }
 
+  // --- E9.4 verification + evidence ------------------------------------------
+
+  /**
+   * The Tasks awaiting verification: SUCCESS Tasks whose Work Order is still in
+   * the execution states (EXECUTING/WAITING_INPUT). Read from durable state, so
+   * a crash mid-flight simply re-dispatches on the next tick.
+   */
+  function successSubjects(): Array<{ workOrder: WorkOrder; task: Task; attempt: Attempt }> {
+    const subjects: Array<{ workOrder: WorkOrder; task: Task; attempt: Attempt }> = [];
+    const workOrders = deps.store
+      .list<WorkOrder>('work_orders')
+      .filter((wo) => wo.state === 'EXECUTING' || wo.state === 'WAITING_INPUT');
+    const attempts = deps.store.list<Attempt>('attempts');
+    for (const workOrder of workOrders) {
+      for (const task of deps.store.list<Task>('tasks')) {
+        if (task.workOrderId !== workOrder.id || task.state !== 'SUCCESS') continue;
+        // The latest completed Attempt for the Task is the change set verified.
+        const attempt =
+          attempts
+            .filter((candidate) => candidate.taskId === task.id && candidate.outcome === 'success')
+            .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+            .at(-1) ?? null;
+        if (attempt) subjects.push({ workOrder, task, attempt });
+      }
+    }
+    return subjects;
+  }
+
+  /**
+   * Kick verification for every SUCCESS Task not already in flight. The
+   * verifier is async, so — like `pollWorker` — the durable routing happens on
+   * the next tick via {@link routeVerificationQueued}.
+   */
+  function verificationPass(): void {
+    const subjects = successSubjects();
+    if (!deps.verifier) {
+      if (subjects.length > 0 && !warnedMissingVerifier) {
+        warnedMissingVerifier = true;
+        console.error(
+          'scheduler: no verifier wired (SchedulerDeps.verifier is undefined); SUCCESS Tasks will not be verified or promoted — wire the E5 verification orchestration',
+        );
+      }
+      return;
+    }
+    for (const subject of subjects) {
+      if (verifyPending.has(subject.task.id)) continue;
+      verifyPending.add(subject.task.id);
+      const verifier = deps.verifier;
+      void verifier
+        .verify(subject)
+        .then(
+          (outcome) => verificationCompletions.push({ subject: keyOf(subject), outcome }),
+          (error: unknown) =>
+            verificationCompletions.push({
+              subject: keyOf(subject),
+              outcome: {
+                bundle: null,
+                passed: false,
+                failures: [],
+                rejection: error instanceof Error ? error.message : String(error),
+              },
+            }),
+        );
+    }
+  }
+
+  function keyOf(subject: { task: Task; attempt: Attempt }): {
+    workOrderId: string;
+    taskId: string;
+    attemptId: string;
+  } {
+    return {
+      workOrderId: subject.task.workOrderId,
+      taskId: subject.task.id,
+      attemptId: subject.attempt.id,
+    };
+  }
+
+  /**
+   * Apply one settled verification to durable state, atomically. A pass persists
+   * the immutable bundle and advances Task → VERIFIED; when every active Task of
+   * the Work Order is VERIFIED, the Work Order advances
+   * `EXECUTING/WAITING_INPUT → VERIFYING → EVIDENCE_READY → HUMAN_GATE`. A
+   * failure (or a rejection: writer = verifier, no evidence) advances the Task
+   * `SUCCESS → VERIFYING → FAILED → REWORK` and the Work Order
+   * `→ VERIFYING → FAILED → REWORK`, recording the structured failures. Fail
+   * closed: no bundle means no gate.
+   */
+  function routeVerification(completion: (typeof verificationCompletions)[number]): void {
+    const { taskId, workOrderId } = completion.subject;
+    const task = deps.store.get<Task>('tasks', taskId);
+    const workOrder = deps.store.get<WorkOrder>('work_orders', workOrderId);
+    verifyPending.delete(taskId);
+    // Guard: only a Work Order still executing and a Task still at SUCCESS are
+    // routed. A crash/retry or a duplicate settle leaves state untouched.
+    if (!task || task.state !== 'SUCCESS' || !workOrder) return;
+    if (workOrder.state !== 'EXECUTING' && workOrder.state !== 'WAITING_INPUT') return;
+
+    const outcome = completion.outcome;
+    const at = now();
+
+    if (outcome.passed && outcome.bundle) {
+      const bundle = outcome.bundle;
+      deps.store.db.transaction(() => {
+        deps.store.set('evidence_bundles', bundle.id, bundle);
+        deps.events.appendEvent({
+          type: EVIDENCE_BUNDLE_RECORDED,
+          aggregateType: 'work_order',
+          aggregateId: workOrder.id,
+          payload: { bundle, taskId, attemptId: completion.subject.attemptId, at },
+        });
+        transitionTask(deps, taskId, { to: 'VERIFYING' });
+        transitionTask(deps, taskId, { to: 'VERIFIED', reason: 'evidence bundle recorded' });
+        if (allTasksVerified(workOrder.id)) {
+          transitionWorkOrder(deps, workOrder.id, { to: 'VERIFYING' });
+          transitionWorkOrder(deps, workOrder.id, { to: 'EVIDENCE_READY' });
+          transitionWorkOrder(deps, workOrder.id, { to: 'HUMAN_GATE', reason: 'evidence ready' });
+        }
+      })();
+      return;
+    }
+
+    // Failure or rejection: structured failure, REWORK, never a gate.
+    const eventType = outcome.rejection ? VERIFICATION_REJECTED : VERIFICATION_FAILED;
+    deps.store.db.transaction(() => {
+      deps.events.appendEvent({
+        type: eventType,
+        aggregateType: 'work_order',
+        aggregateId: workOrder.id,
+        payload: {
+          taskId,
+          attemptId: completion.subject.attemptId,
+          failures: outcome.failures,
+          diagnosis: outcome.rejection,
+          at,
+        },
+      });
+      transitionTask(deps, taskId, { to: 'VERIFYING' });
+      transitionTask(deps, taskId, { to: 'FAILED', reason: 'verification failed' });
+      transitionTask(deps, taskId, { to: 'REWORK', reason: 'verification failed' });
+      transitionWorkOrder(deps, workOrder.id, { to: 'VERIFYING' });
+      transitionWorkOrder(deps, workOrder.id, { to: 'FAILED' });
+      transitionWorkOrder(deps, workOrder.id, { to: 'REWORK', reason: 'verification failed' });
+    })();
+  }
+
+  function routeVerificationQueued(): void {
+    const queued = verificationCompletions.splice(0, verificationCompletions.length);
+    for (const completion of queued) routeVerification(completion);
+  }
+
+  /** True when every Task in the Work Order's active DAG is VERIFIED. */
+  function allTasksVerified(workOrderId: string): boolean {
+    const dag = getActiveDAG(deps, workOrderId);
+    if (!dag || dag.nodes.length === 0) return false;
+    return dag.nodes.every(
+      (node) => deps.store.get<Task>('tasks', node.taskId)?.state === 'VERIFIED',
+    );
+  }
+
   function tick(): void {
+    routeVerificationQueued();
     routeQueued();
     collectStep();
+    verificationPass();
     unblockPass();
     reclaimPass();
     provisionPass();

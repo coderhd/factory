@@ -15,14 +15,26 @@ import {
   type FactoryDesiredConfig,
 } from '../../src/factory/config/factoryConfig';
 import {
+  completeAttempt,
+  createAttempt,
   createWorkOrder,
+  transitionTask,
   transitionWorkOrder,
   type Attempt,
   type Task,
   type TaskDependency,
   type WorkOrder,
 } from '../../src/factory/domain/workOrder';
+import type { EvidenceBundle } from '../../src/factory/evidence/bundle';
 import { openEventLog } from '../../src/factory/events/log';
+import {
+  createVerificationEngine,
+  type FailureRecord,
+} from '../../src/factory/verification/engine';
+import {
+  createE5Verifier,
+  type SemanticJudge,
+} from '../../src/factory/verification/orchestrator';
 import { commitDAG, listDAGVersions } from '../../src/factory/planning/dag';
 import { createEvidenceReadPort, projectObservatory } from '../../src/factory/observatory/observatory';
 import { check } from '../../src/factory/policy/policy';
@@ -874,6 +886,310 @@ describe('E9.3 routing → assignment', () => {
       expect(decision.budget).toEqual(drained);
     } finally {
       h.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E9.4 (#30) — verification + evidence orchestration on the live path
+// ---------------------------------------------------------------------------
+
+/**
+ * A scheduler harness wired with an E5-backed {@link WorkVerifier}. Uses real
+ * `createVerificationEngine` + `createSemanticVerifier` + `buildEvidenceBundle`
+ * with fake check providers and a fake judge: the live orchestration path is
+ * under test, nothing reaches a network or a model.
+ */
+function verificationHarness(options: {
+  providers: Array<{
+    id: string;
+    category: 'deterministic' | 'behavioral';
+    kind: string;
+    passed: boolean;
+    diagnosis?: string;
+  }>;
+  judgeModel: string;
+  falsified?: string[];
+}) {
+  const store = openStateStore(join(workDir, `verify-${crypto.randomUUID()}.db`));
+  const events = openEventLog(store.db);
+  const engine = createVerificationEngine();
+  for (const provider of options.providers) {
+    engine.registerCheck({
+      id: provider.id,
+      category: provider.category,
+      kind: provider.kind as never,
+      run: () =>
+        provider.passed
+          ? { passed: true, evidence: { summary: `${provider.id} ok` } }
+          : {
+              passed: false,
+              evidence: { summary: `${provider.id} failed` },
+              diagnosis: provider.diagnosis ?? `${provider.id} failed`,
+              action: `fix ${provider.id}`,
+            },
+    });
+  }
+  const judge: SemanticJudge = {
+    identity: { provider: 'judge-co', model: options.judgeModel, family: 'judge-family' },
+    falsify: (context) =>
+      context.criteria.map((criterion) => ({
+        criterion,
+        falsified: (options.falsified ?? []).includes(criterion),
+        evidence: { summary: `judge reviewed "${criterion}"` },
+        diagnosis: `judge falsified "${criterion}"`,
+        action: `address "${criterion}"`,
+      })),
+  };
+  const verifier = createE5Verifier({
+    store,
+    engine,
+    judge,
+    prompt: { id: 'e9-verify', version: '1' },
+    rubric: ['Does the change set satisfy the criterion as written?'],
+    provider: 'factory',
+    now: () => '2026-09-30T12:00:00.000Z',
+  });
+  const workers = createWorkerManager({ store, events, spawn: () => new FakeHerdr() });
+  const worktrees = createWorktreeManager({ rootDir: join(workDir, 'wt'), baseBranch: 'main' });
+  const scheduler = createScheduler({
+    store,
+    events,
+    workers,
+    worktrees,
+    repoPath,
+    policy: { canAssign: () => 'ALLOW' },
+    verifier,
+  });
+  return { store, events, scheduler, close: () => store.close() };
+}
+
+/** Drive a seeded Task through the real §5.2 edges to SUCCESS, with an Attempt. */
+function driveTaskToSuccess(
+  store: ReturnType<typeof openStateStore>,
+  events: ReturnType<typeof openEventLog>,
+  taskId: string,
+  model: string,
+): Attempt {
+  const deps = { store, events };
+  const attempt = createAttempt(deps, { taskId, model });
+  completeAttempt(deps, attempt.id, {
+    outcome: 'success',
+    diff: 'diff --git a/x b/x\n+export const x = 1;',
+    artifactIds: ['art_1'],
+  });
+  for (const to of ['READY', 'ASSIGNED', 'RUNNING', 'SUCCESS'] as const) {
+    transitionTask(deps, taskId, { to });
+  }
+  return store.get<Attempt>('attempts', attempt.id)!;
+}
+
+/** Run a tick, let the async verification settle, then route it on the next tick. */
+async function verifyTick(scheduler: ReturnType<typeof createScheduler>): Promise<void> {
+  scheduler.tick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  scheduler.tick();
+}
+
+describe('E9.4 verification + evidence orchestration', () => {
+  it('persists an immutable Evidence Bundle mapping every AC, then gates the WO at HUMAN_GATE', async () => {
+    const h = verificationHarness({
+      providers: [
+        { id: 'typecheck', category: 'deterministic', kind: 'typecheck', passed: true },
+        { id: 'playwright', category: 'behavioral', kind: 'playwright', passed: true },
+      ],
+      judgeModel: 'judge-1',
+    });
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events);
+      driveTaskToSuccess(h.store, h.events, task.id, 'writer-xl');
+
+      await verifyTick(h.scheduler);
+
+      // The Task's AC maps to a persisted bundle retrievable by id.
+      const bundles = h.store.list<EvidenceBundle>('evidence_bundles');
+      expect(bundles).toHaveLength(1);
+      const bundle = h.store.get<EvidenceBundle>('evidence_bundles', bundles[0]!.id)!;
+      expect(bundle.id.startsWith('eb_')).toBe(true);
+      expect(bundle.workOrderId).toBe(wo.id);
+      expect(bundle.changeSetId.startsWith('cs_')).toBe(true);
+
+      // Every acceptance criterion maps to concrete proof (never uncovered).
+      expect(bundle.criteria).toHaveLength(1);
+      expect(bundle.criteria[0]!.criterion).toBe('accepted');
+      expect(bundle.criteria[0]!.status).toBe('pass');
+      expect(bundle.criteria[0]!.proofs.length).toBeGreaterThan(0);
+      expect(bundle.criteria.every((criterion) => criterion.status === 'pass')).toBe(true);
+      expect(bundle.complete).toBe(true);
+
+      // The bundle is a copy of its inputs: mutating the store row cannot rewrite
+      // the receipt the scheduler already persisted (idempotent re-read).
+      const snapshot = structuredClone(bundle);
+      expect(h.store.get<EvidenceBundle>('evidence_bundles', bundle.id)).toEqual(snapshot);
+
+      // Verification drives the Work Order lifecycle to the human gate, and the
+      // Task to VERIFIED.
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('VERIFIED');
+      expect(h.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('HUMAN_GATE');
+
+      // The WO passed through the §5.1 verification states in order.
+      const states = h.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .filter((event) => event.type === 'work_order.transitioned')
+        .map((event) => (event.payload as { workOrder: WorkOrder }).workOrder.state);
+      expect(states).toContain('VERIFYING');
+      expect(states).toContain('EVIDENCE_READY');
+      expect(states.indexOf('VERIFYING')).toBeLessThan(states.indexOf('EVIDENCE_READY'));
+      expect(states.indexOf('EVIDENCE_READY')).toBeLessThan(states.indexOf('HUMAN_GATE'));
+
+      // A later tick does not re-verify or duplicate the evidence (task is VERIFIED).
+      h.scheduler.tick();
+      expect(h.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(1);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('turns a failing AC into a structured failure and REWORK, never a gate', async () => {
+    const h = verificationHarness({
+      providers: [
+        { id: 'typecheck', category: 'deterministic', kind: 'typecheck', passed: true },
+        {
+          id: 'playwright',
+          category: 'behavioral',
+          kind: 'playwright',
+          passed: false,
+          diagnosis: 'checkout button missing',
+        },
+      ],
+      judgeModel: 'judge-1',
+    });
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events);
+      driveTaskToSuccess(h.store, h.events, task.id, 'writer-xl');
+
+      await verifyTick(h.scheduler);
+
+      // No evidence, no gate: fail closed and drive rework.
+      expect(h.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      expect(h.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('REWORK');
+
+      // The failure is structured with every §14.4 field, durably recorded.
+      const failures = h.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .filter((event) => event.type === 'verification.failed');
+      expect(failures).toHaveLength(1);
+      const records = (failures[0]!.payload as { failures: FailureRecord[] }).failures;
+      expect(records.length).toBeGreaterThan(0);
+      const record = records[0]!;
+      expect(record.category).toBe('behavioral');
+      expect(record.criterion).toBe('accepted');
+      expect(record.verifier).toBe('playwright');
+      expect(record.evidence.summary).toContain('failed');
+      expect(record.diagnosis).toBe('checkout button missing');
+      expect(record.action).toBe('fix playwright');
+
+      // The WO never reached a gate.
+      const states = h.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .filter((event) => event.type === 'work_order.transitioned')
+        .map((event) => (event.payload as { workOrder: WorkOrder }).workOrder.state);
+      expect(states).not.toContain('HUMAN_GATE');
+      expect(states[states.length - 1]).toBe('REWORK');
+    } finally {
+      h.close();
+    }
+  });
+
+  it('rejects same-model self-sign-off on the live path: no bundle, REWORK', async () => {
+    const h = verificationHarness({
+      providers: [{ id: 'typecheck', category: 'deterministic', kind: 'typecheck', passed: true }],
+      // The judge is the writer: the semantic verifier must refuse to sign off.
+      judgeModel: 'writer-xl',
+    });
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events);
+      driveTaskToSuccess(h.store, h.events, task.id, 'writer-xl');
+
+      await verifyTick(h.scheduler);
+
+      expect(h.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      expect(h.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('REWORK');
+
+      const rejection = h.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .find((event) => event.type === 'verification.rejected');
+      expect(rejection).toBeDefined();
+      expect((rejection!.payload as { diagnosis: string }).diagnosis).toMatch(
+        /same-model self-sign-off/i,
+      );
+    } finally {
+      h.close();
+    }
+  });
+
+  it('drives REWORK from a semantic falsification with a structured semantic failure', async () => {
+    const h = verificationHarness({
+      providers: [{ id: 'typecheck', category: 'deterministic', kind: 'typecheck', passed: true }],
+      judgeModel: 'judge-1',
+      falsified: ['accepted'],
+    });
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events);
+      driveTaskToSuccess(h.store, h.events, task.id, 'writer-xl');
+
+      await verifyTick(h.scheduler);
+
+      // All deterministic checks passed, yet the independent verifier falsified
+      // the criterion: the semantic tier alone drives rework, never a gate.
+      expect(h.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      expect(h.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('REWORK');
+
+      const failure = h.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .find((event) => event.type === 'verification.failed');
+      const record = (failure!.payload as { failures: FailureRecord[] }).failures[0]!;
+      expect(record.category).toBe('semantic');
+      expect(record.criterion).toBe('accepted');
+      expect(record.verifier).toBe('judge-co/judge-1');
+      expect(record.diagnosis).toContain('falsified');
+    } finally {
+      h.close();
+    }
+  });
+
+  it('fails closed when no verifier is wired: a SUCCESS task is never promoted', () => {
+    const store = openStateStore(join(workDir, 'noverifier.db'));
+    const events = openEventLog(store.db);
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
+    try {
+      const workers = createWorkerManager({ store, events, spawn: () => new FakeHerdr() });
+      const worktrees = createWorktreeManager({ rootDir: join(workDir, 'wt'), baseBranch: 'main' });
+      const scheduler = createScheduler({
+        store,
+        events,
+        workers,
+        worktrees,
+        repoPath,
+        policy: { canAssign: () => 'ALLOW' },
+      });
+      const { wo, task } = seedExecutingWorkOrder(store, events);
+      driveTaskToSuccess(store, events, task.id, 'writer-xl');
+
+      scheduler.tick();
+
+      expect(store.get<Task>('tasks', task.id)!.state).toBe('SUCCESS');
+      expect(store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('EXECUTING');
+      expect(store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      expect(errors.some((line) => /verifier/i.test(line))).toBe(true);
+    } finally {
+      console.error = originalError;
+      store.close();
     }
   });
 });

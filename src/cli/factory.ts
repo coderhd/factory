@@ -18,6 +18,7 @@ import { check } from '../factory/policy/policy';
 import type { DAGProposalPayload } from '../factory/planning/dag';
 import { createScheduler, type SchedulerPolicy } from '../factory/scheduler/scheduler';
 import { createArtifactStore, openStateStore, type StateStore } from '../factory/state/store';
+import type { WorkVerifier } from '../factory/verification/orchestrator';
 import { createHerdrWorker } from '../factory/workers/herdr';
 import { createWorkerManager, type SpawnWorker, type WorkerProfile } from '../factory/workers/manager';
 import { createWorktreeManager, taskWorktreeBranch } from '../factory/worktrees/worktree';
@@ -180,6 +181,12 @@ export function createSchedulerPolicy(deps: {
 export interface ServerDepsOptions {
   spawn?: SpawnWorker;
   now?: () => string;
+  /**
+   * E9.4 verification seam. Production wires an E5-backed verifier here;
+   * absent, the scheduler fails closed — a SUCCESS Task is never promoted
+   * without a persisted Evidence Bundle.
+   */
+  verifier?: WorkVerifier;
 }
 
 export function buildServerDeps(
@@ -211,6 +218,7 @@ export function buildServerDeps(
       repoPath: runtime.repository.path,
       artifacts: createArtifactStore(runtime.paths.artifacts),
       policy: createSchedulerPolicy({ store, events }),
+      ...(options.verifier ? { verifier: options.verifier } : {}),
     },
     {
       maxConcurrentTasks: runtime.scheduler.maxConcurrentTasks,
