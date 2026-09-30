@@ -8,6 +8,11 @@ import {
   type DAGVersion,
 } from '../planning/dag';
 import { isEmergencyStopped, isFactoryPaused } from '../policy/policy';
+import {
+  beforeDependencyRequest,
+  recordDependencyFailure,
+  type CircuitConfig,
+} from './circuitBreaker';
 import type { ArtifactStore, StateStore } from '../state/store';
 import type { AssignmentRecord, WorkerLease, WorkerRecord } from '../workers/manager';
 
@@ -86,6 +91,11 @@ export interface FailureContext {
   attemptCount?: number;
   sameClassCount?: number;
   /**
+   * The dependency whose outage this failure reports (spec §18.9). Keys the
+   * circuit breaker; derived from the failure class when omitted.
+   */
+  dependency?: string;
+  /**
    * The durable failure index (`failureHistory.length` at delivery time). The
    * §9.6 idempotency key is `recover:{attemptId}:{failureIndex}`; callers
    * delivering a failure pass it so a replay computes the same key even after
@@ -139,6 +149,8 @@ export interface RecoveryDeps {
   workerStatus?: WorkerStatusFn;
   budgets?: Partial<RecoveryBudgets>;
   rand?: () => number;
+  /** §18.9 circuit-breaker tuning for dependency outages. */
+  circuit?: Partial<CircuitConfig>;
 }
 
 const AUTOMATIC_KINDS: ReadonlySet<RecoveryAction['kind']> = new Set([
@@ -399,16 +411,55 @@ function applyAction(deps: RecoveryDeps, failure: FailureContext, action: Recove
 }
 
 /**
+ * The §18.9 failure classes that represent a dependency becoming unavailable:
+ * these feed the circuit breaker instead of walking the retry ladder blindly.
+ */
+const CIRCUIT_FAILURE_CLASSES: ReadonlySet<FailureClass> = new Set([
+  'DEPENDENCY_UNAVAILABLE',
+  'PROVIDER_OUTAGE',
+  'MODEL_UNAVAILABLE',
+]);
+
+/** The circuit key for a failure: the named dependency, or the pinned model/provider. */
+export function dependencyKeyFor(failure: FailureContext): string {
+  if (failure.dependency) return failure.dependency;
+  if (failure.failureClass === 'DEPENDENCY_UNAVAILABLE') return 'dependency';
+  return failure.requiredModel ?? 'provider';
+}
+
+/**
  * The bounded recovery entry point (design §9.2). Returns the decided
  * `RecoveryAction` and applies its durable side effects (new Attempt from a
  * clean baseline, `waiting_resource` outcome + event, idempotency record).
  * Duplicate deliveries of the same idempotency key are `NO_OP_DUPLICATE`.
+ *
+ * §18.9: a dependency outage (DEPENDENCY_UNAVAILABLE / PROVIDER_OUTAGE /
+ * MODEL_UNAVAILABLE) feeds the circuit breaker first. While the circuit is
+ * OPEN the dependent operation is shed — a `WAITING_RESOURCE` park that spends
+ * no per-class/per-Task/Work-Order recovery budget — rather than retried. After
+ * the reset window the circuit half-opens: the next failure is admitted as a
+ * probe through the ordinary bounded wheel, and a failed probe re-opens.
  */
 export function recover(deps: RecoveryDeps, failure: FailureContext): RecoveryAction {
   if (isEmergencyStopped(deps) || isFactoryPaused(deps)) return { kind: 'HOLD' };
 
   const key = actionKey(deps, failure);
   if (key && alreadyApplied(deps, key)) return { kind: 'NO_OP_DUPLICATE' };
+
+  if (CIRCUIT_FAILURE_CLASSES.has(failure.failureClass)) {
+    const dependency = dependencyKeyFor(failure);
+    recordDependencyFailure(deps, dependency, deps.circuit);
+    const gate = beforeDependencyRequest(deps, dependency, deps.circuit);
+    if (!gate.allowed) {
+      const shed: RecoveryAction = {
+        kind: 'WAITING_RESOURCE',
+        resource: dependency,
+        ...(gate.retryAfterMs !== undefined ? { retryAfterMs: gate.retryAfterMs } : {}),
+      };
+      applyAction(deps, failure, shed, key);
+      return shed;
+    }
+  }
 
   const derived = deriveCounts(deps, failure);
   const counts = {

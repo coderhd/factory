@@ -93,6 +93,17 @@ export interface SchedulerStatusDto {
 }
 
 /**
+ * E9.6 factory-level controls (spec §10/§18.11). `emergencyStopped` blocks new
+ * assignments/provisioning and external side effects; `paused` blocks new
+ * autonomous work. Both preserve state and evidence and require an explicit
+ * human resume.
+ */
+export interface FactoryControlsDto {
+  paused: boolean;
+  emergencyStopped: boolean;
+}
+
+/**
  * The response from `POST /work-orders/:id/dag`: the recorded proposal plus the
  * committed, immutable DAG version. The request body is E3's
  * `DAGProposalPayload` verbatim; the client never names tasks or edges.

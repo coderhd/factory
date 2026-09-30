@@ -16,6 +16,7 @@ import { openEventLog, type EventLog } from '../factory/events/log';
 import { createEvidenceReadPort } from '../factory/observatory/observatory';
 import { check } from '../factory/policy/policy';
 import type { DAGProposalPayload } from '../factory/planning/dag';
+import { reconcileAfterRestart } from '../factory/recovery/recovery';
 import { createScheduler, type SchedulerPolicy } from '../factory/scheduler/scheduler';
 import { createArtifactStore, openStateStore, type StateStore } from '../factory/state/store';
 import type { WorkVerifier } from '../factory/verification/orchestrator';
@@ -187,6 +188,13 @@ export interface ServerDepsOptions {
    * without a persisted Evidence Bundle.
    */
   verifier?: WorkVerifier;
+  /**
+   * E9.6 boot reconciliation. On a real server start this runs first (spec
+   * §18.3), so a crash that left an in-flight Attempt behind is interrupted and
+   * recovered before the scheduler loop begins. Defaults to `true`; tests that
+   * build deps over pre-seeded state can opt out.
+   */
+  reconcileOnBoot?: boolean;
 }
 
 export function buildServerDeps(
@@ -206,6 +214,24 @@ export function buildServerDeps(
     rootDir: runtime.worktrees.rootDir,
     baseBranch: runtime.worktrees.baseBranch,
   });
+  const artifacts = createArtifactStore(runtime.paths.artifacts);
+  // E9.6 boot reconciliation (spec §18.3): walk durable state → event history →
+  // RUNNING Attempts → worker leases before the loop starts. Post-restart no
+  // adapter is live, so every lease is treated as stopped: an in-flight Attempt
+  // is interrupted (never claimed successful), its diff preserved as evidence,
+  // its Assignment closed, and recovery opens a new clean-baseline Attempt.
+  if (options.reconcileOnBoot !== false) {
+    reconcileAfterRestart(
+      {
+        store,
+        events,
+        artifacts,
+        workerStatus: () => 'stopped',
+        ...(options.now ? { now: options.now } : {}),
+      },
+      { workerStatus: () => 'stopped' },
+    );
+  }
   // The resolved `factory.yaml` scheduler config drives the real E3 scheduler,
   // so an edited desired config changes the running instance. The serve path
   // owns the loop lifecycle (start/stop around the listener).
@@ -216,7 +242,7 @@ export function buildServerDeps(
       workers,
       worktrees,
       repoPath: runtime.repository.path,
-      artifacts: createArtifactStore(runtime.paths.artifacts),
+      artifacts,
       policy: createSchedulerPolicy({ store, events }),
       ...(options.verifier ? { verifier: options.verifier } : {}),
     },
@@ -544,6 +570,45 @@ async function cmdObservatory(args: ParsedArgs, io: CliIO): Promise<number> {
   return 0;
 }
 
+/**
+ * E9.6 factory-level controls (spec §10/§18.11): `factory control
+ * <status|pause|resume|emergency-stop> [--actor <id>]`. The durable flag and
+ * its event are E7's; the CLI only calls the API, so the server remains the
+ * sole mutation authority.
+ */
+async function cmdControl(args: ParsedArgs, io: CliIO): Promise<number> {
+  const sub = args.positionals[1];
+  const url = resolveUrl(args, io);
+  if (!url) {
+    io.err('no server URL; pass --url or start the server first');
+    return 1;
+  }
+  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+
+  if (sub === 'status') {
+    io.out(JSON.stringify(await client.factoryControls()));
+    return 0;
+  }
+  if (sub === 'pause' || sub === 'resume' || sub === 'emergency-stop') {
+    const actor = flag(args, 'actor');
+    if (!actor) {
+      io.err(`usage: factory control ${sub} --actor <id> [--url <url>]`);
+      return 1;
+    }
+    const controls =
+      sub === 'pause'
+        ? await client.pause(actor)
+        : sub === 'resume'
+          ? await client.resume(actor)
+          : await client.emergencyStop(actor);
+    io.out(JSON.stringify(controls));
+    return 0;
+  }
+
+  io.err(`unknown control subcommand: ${sub ?? ''}`);
+  return 1;
+}
+
 async function cmdApprovals(args: ParsedArgs, io: CliIO): Promise<number> {
   const sub = args.positionals[1];
   const url = resolveUrl(args, io);
@@ -598,6 +663,8 @@ const HELP = [
   '  approvals list [--status <state>]      list policy approvals',
   '  approvals answer <approvalId> --decision APPROVAL|DENY --actor <id>  answer an approval',
   '  observatory [--url]                    read Observatory projections',
+  '  control status [--url]                 read pause/e-stop controls',
+  '  control <pause|resume|emergency-stop> --actor <id>  set a factory control',
 ].join('\n');
 
 export async function runCli(argv: string[], io: CliIO): Promise<number> {
@@ -627,6 +694,8 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         return await cmdApprovals(args, io);
       case 'observatory':
         return await cmdObservatory(args, io);
+      case 'control':
+        return await cmdControl(args, io);
       case 'help':
       case undefined:
         io.out(HELP);

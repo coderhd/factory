@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -38,12 +38,25 @@ import {
 } from '../../src/factory/verification/orchestrator';
 import { commitDAG, listDAGVersions } from '../../src/factory/planning/dag';
 import { createEvidenceReadPort, projectObservatory } from '../../src/factory/observatory/observatory';
-import { check } from '../../src/factory/policy/policy';
+import { check, emergencyStop } from '../../src/factory/policy/policy';
 import { CAPABILITY_POOL } from '../../src/factory/routing/rules';
 import type { BudgetState, RoutingDecisionRecord } from '../../src/factory/routing/decisionModel';
-import { RESOURCE_UNAVAILABLE } from '../../src/factory/recovery/recovery';
+import {
+  RECOVERY_ACTION_APPLIED,
+  RESOURCE_UNAVAILABLE,
+  recover,
+  type FailureContext,
+  type RecoveryBudgets,
+  type RecoveryDeps,
+} from '../../src/factory/recovery/recovery';
+import {
+  beforeDependencyRequest,
+  circuitSnapshot,
+  recordDependencyFailure,
+  recordDependencySuccess,
+} from '../../src/factory/recovery/circuitBreaker';
 import { createScheduler, type SchedulerRouting } from '../../src/factory/scheduler/scheduler';
-import { openStateStore } from '../../src/factory/state/store';
+import { createArtifactStore, openStateStore } from '../../src/factory/state/store';
 import type { ApprovalRecord } from '../../src/factory/policy/policy';
 import {
   type ExecutionEnvelope,
@@ -1877,6 +1890,351 @@ describe('E9.5 worker answer delivery — WAITING_INPUT resumes and converges', 
 
       const answered = await h.client.answerInteraction(pendingId, 'no actor given');
       expect(answered.interaction.answeredBy).toBe('human');
+    } finally {
+      h.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E9.6 (#32) — policy/recovery runtime hooks: e-stop/pause into the tick,
+// boot reconciliation, and the dependency circuit breaker.
+// ---------------------------------------------------------------------------
+
+describe('E9.6 e-stop/pause freeze the live scheduler', () => {
+  it('with e-stop set a live tick assigns and provisions nothing while preserving state; resume resumes', async () => {
+    const h = humanLoopHarness();
+    try {
+      const { task } = seedExecutingWorkOrder(h.store, h.events);
+      // Freeze through the real server route (the operator surface).
+      const controls = await h.client.emergencyStop('operator-1');
+      expect(controls).toEqual({ paused: false, emergencyStopped: true });
+
+      const before = {
+        workOrders: JSON.stringify(h.store.list('work_orders')),
+        tasks: JSON.stringify(h.store.list('tasks')),
+      };
+
+      h.scheduler.tick();
+      await h.poll();
+      h.scheduler.tick();
+      await h.poll();
+
+      // No new external work: no assignment, no Attempt, no provisioned worker.
+      expect(h.store.list<{ taskId: string }>('assignments')).toHaveLength(0);
+      expect(h.store.list<Attempt>('attempts')).toHaveLength(0);
+      expect(h.store.list('workers')).toHaveLength(0);
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('PLANNED');
+      // State/evidence preserved (byte-identical durable rows).
+      expect(JSON.stringify(h.store.list('work_orders'))).toBe(before.workOrders);
+      expect(JSON.stringify(h.store.list('tasks'))).toBe(before.tasks);
+
+      // The controls projection is readable and the live scheduler observes the flag.
+      expect(await h.client.factoryControls()).toEqual({ paused: false, emergencyStopped: true });
+
+      // Explicit human resume clears the gate and the same live scheduler proceeds.
+      expect(await h.client.resume('operator-1')).toEqual({ paused: false, emergencyStopped: false });
+      h.scheduler.tick();
+      await h.poll();
+
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('RUNNING');
+      expect(h.store.list<{ taskId: string }>('assignments')).toHaveLength(1);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('pause also freezes the tick (no assignment) and resume unblocks it', async () => {
+    const h = humanLoopHarness();
+    try {
+      const { task } = seedExecutingWorkOrder(h.store, h.events);
+      expect(await h.client.pause('operator-2')).toEqual({ paused: true, emergencyStopped: false });
+
+      h.scheduler.tick();
+      await h.poll();
+      expect(h.store.list<{ taskId: string }>('assignments')).toHaveLength(0);
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('PLANNED');
+
+      await h.client.resume('operator-2');
+      h.scheduler.tick();
+      await h.poll();
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('RUNNING');
+    } finally {
+      h.close();
+    }
+  });
+
+  it('drives emergency-stop and resume from the CLI (`factory control`)', async () => {
+    const h = humanLoopHarness();
+    try {
+      seedExecutingWorkOrder(h.store, h.events);
+
+      const stop = capture(workDir);
+      expect(
+        await runCli(['control', 'emergency-stop', '--actor', 'operator-7', '--url', h.url], stop.io),
+      ).toBe(0);
+      expect(JSON.parse(stop.out())).toEqual({ paused: false, emergencyStopped: true });
+
+      const status = capture(workDir);
+      expect(await runCli(['control', 'status', '--url', h.url], status.io)).toBe(0);
+      expect(JSON.parse(status.out())).toEqual({ paused: false, emergencyStopped: true });
+
+      const resume = capture(workDir);
+      expect(await runCli(['control', 'resume', '--actor', 'operator-7', '--url', h.url], resume.io)).toBe(0);
+      expect(JSON.parse(resume.out())).toEqual({ paused: false, emergencyStopped: false });
+
+      // An actor is required: the operator identity is the durable receipt.
+      const anonymous = capture(workDir);
+      expect(await runCli(['control', 'pause', '--url', h.url], anonymous.io)).toBe(1);
+      expect(anonymous.err()).toMatch(/actor/i);
+    } finally {
+      h.close();
+    }
+  });
+});
+
+/** Seed a crashed in-flight Attempt (open lease + open assignment) into a store. */
+function seedCrashedAttempt(
+  store: ReturnType<typeof openStateStore>,
+  events: ReturnType<typeof openEventLog>,
+  options: { diff: string },
+): { wo: WorkOrder; task: Task; attempt: Attempt; workerId: string } {
+  const deps = { store, events };
+  const wo = createWorkOrder(deps, { intent: 'E9.6 crash subject', acceptanceCriteria: ['accepted'] });
+  for (const to of ['READY', 'PLANNING'] as const) transitionWorkOrder(deps, wo.id, { to });
+  const dag = commitDAG(deps, wo.id, { nodes: [{ nodeId: 'a', title: 'A' }] });
+  transitionWorkOrder(deps, wo.id, { to: 'EXECUTING' });
+  transitionWorkOrder(deps, wo.id, { to: 'VERIFYING' });
+  const task = store.get<Task>('tasks', dag.nodes[0].taskId)!;
+  for (const to of ['READY', 'ASSIGNED', 'RUNNING', 'SUCCESS', 'VERIFYING'] as const) {
+    transitionTask(deps, task.id, { to });
+  }
+
+  const workerId = `worker_${crypto.randomUUID()}`;
+  // The Attempt carries no live worker id (the crash lost the adapter); the
+  // lease binding below is what makes it in-flight for reconciliation.
+  const attempt = createAttempt(deps, { taskId: task.id, model: 'writer-xl', environment: 'herdr/local' });
+  // The diff the crash left behind: the evidence to preserve. A crash leaves the
+  // Attempt open (no completion evidence) with its partial diff.
+  store.set('attempts', attempt.id, { ...attempt, diff: options.diff });
+
+  store.set('workers', workerId, {
+    id: workerId,
+    profile: 'herdr',
+    runtimeState: 'BUSY',
+    lease: {
+      attemptId: attempt.id,
+      taskId: task.id,
+      expiresAt: '2020-01-01T00:00:00.000Z',
+      renewedAt: '2020-01-01T00:00:00.000Z',
+    },
+    provisionedAt: '2020-01-01T00:00:00.000Z',
+    lastActiveAt: '2020-01-01T00:00:00.000Z',
+    reclaimedAt: null,
+  });
+  const assignmentId = `assignment_${crypto.randomUUID()}`;
+  store.set('assignments', assignmentId, {
+    id: assignmentId,
+    taskId: task.id,
+    workerId,
+    branch: `wo-${wo.id}/task-${task.id.slice(0, 8)}`,
+    worktreePath: join(workDir, 'crashed-wt'),
+    baseCommit: 'base',
+    closedAt: null,
+    model: 'writer-xl',
+    createdAt: '2020-01-01T00:00:00.000Z',
+    updatedAt: '2020-01-01T00:00:00.000Z',
+  });
+
+  return { wo, task, attempt, workerId };
+}
+
+describe('E9.6 boot reconciliation — a crash during VERIFYING reconciles on boot', () => {
+  it('interrupts the crashed Attempt, preserves its diff as evidence, and opens one clean-baseline Attempt', () => {
+    const runtime = runtimeFrom(configText());
+    // Seed a crash into the runtime database, then "restart" by building the
+    // server deps on the same db (the boot path `factory start` uses).
+    mkdirSync(runtime.paths.state, { recursive: true });
+    const seedStore = openStateStore(runtime.paths.db);
+    const seedEvents = openEventLog(seedStore.db);
+    const seeded = seedCrashedAttempt(seedStore, seedEvents, { diff: 'diff --git a/x b/x\n+crashed work' });
+    seedStore.close();
+
+    const adapters: FakeHerdr[] = [];
+    const deps = buildServerDeps(runtime, { spawn: makeSpawn(adapters) });
+    // A second boot over the same database: reconciliation must be idempotent.
+    const second = buildServerDeps(runtime, { spawn: () => new FakeHerdr() });
+    try {
+      // The crashed Attempt is interrupted — never claimed successful.
+      const crashed = deps.store.get<Attempt>('attempts', seeded.attempt.id)!;
+      expect(crashed.outcome).toBe('interrupted');
+      expect(crashed.outcome).not.toBe('success');
+      expect(crashed.failureHistory.some((entry) => entry.failure.startsWith('CRASH_RECOVERY'))).toBe(true);
+      // The old diff is preserved as immutable evidence (artifact + Attempt field).
+      expect(crashed.diff).toContain('crashed work');
+      const artifacts = createArtifactStore(runtime.paths.artifacts);
+      expect(Buffer.from(artifacts.get(`${seeded.attempt.id}/diff.patch`)).toString('utf8')).toContain(
+        'crashed work',
+      );
+
+      // A new Attempt from a clean baseline exists; the crashed one is not reused.
+      const attempts = deps.store.list<Attempt>('attempts').filter((a) => a.taskId === seeded.task.id);
+      expect(attempts).toHaveLength(2);
+      const fresh = attempts.find((a) => a.id !== seeded.attempt.id)!;
+      expect(fresh.outcome).toBeNull();
+      expect(fresh.environment).toBe('clean-worktree');
+      expect(fresh.context).toContain('reverification');
+
+      // Verification is not silently completed: the Work Order stays VERIFYING.
+      expect(deps.store.get<WorkOrder>('work_orders', seeded.wo.id)!.state).toBe('VERIFYING');
+
+      // Idempotent: the second boot does not manufacture a third Attempt or a
+      // duplicate recovery action.
+      expect(second.store.list<Attempt>('attempts').filter((a) => a.taskId === seeded.task.id)).toHaveLength(2);
+      const actions = second.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: seeded.wo.id })
+        .filter((event) => event.type === RECOVERY_ACTION_APPLIED);
+      expect(actions).toHaveLength(1);
+    } finally {
+      deps.store.close();
+      second.store.close();
+    }
+  });
+});
+
+describe('E9.6 dependency circuit breaker (spec §18.9)', () => {
+  const failure = (overrides: Partial<FailureContext> = {}): FailureContext => ({
+    attemptId: `attempt_${crypto.randomUUID()}`,
+    taskId: `task_${crypto.randomUUID()}`,
+    workOrderId: `wo_${crypto.randomUUID()}`,
+    failureClass: 'DEPENDENCY_UNAVAILABLE',
+    error: 'dependency registry unreachable',
+    attemptCount: 0,
+    sameClassCount: 0,
+    changedCondition: 'backoff',
+    ...overrides,
+  });
+
+  function circuitHarness(budgets: Partial<RecoveryBudgets> = {}) {
+    const store = openStateStore(join(workDir, `circuit-${crypto.randomUUID()}.db`));
+    const events = openEventLog(store.db);
+    let t = Date.parse('2026-09-30T00:00:00.000Z');
+    const clock = {
+      now: () => new Date(t).toISOString(),
+      advance: (ms: number) => {
+        t += ms;
+      },
+    };
+    const circuit = { failureThreshold: 2, resetTimeoutMs: 30_000 };
+    return {
+      store,
+      events,
+      clock,
+      circuit,
+      deps: {
+        store,
+        events,
+        now: clock.now,
+        budgets: { perClassRetries: 2, backoffBaseMs: 1, backoffMaxMs: 1, ...budgets },
+        circuit,
+      } as RecoveryDeps,
+      close: () => store.close(),
+    };
+  }
+
+  it('opens on persistent failures, sheds load before the generic budget, and probes on half-open', () => {
+    const h = circuitHarness();
+    try {
+      // Closed: a first dependency failure is retried within the bounded wheel.
+      expect(recover(h.deps, failure({ failureIndex: 1 }))).toMatchObject({ kind: 'RETRY_NEW_ATTEMPT' });
+      expect(circuitSnapshot(h.deps, 'dependency').state).toBe('CLOSED');
+      expect(circuitSnapshot(h.deps, 'dependency').consecutiveFailures).toBe(1);
+
+      // The second consecutive failure reaches the threshold: the circuit opens
+      // and that same failure is shed rather than retried.
+      const opened = recover(h.deps, failure({ failureIndex: 2, sameClassCount: 0 }));
+      expect(opened).toMatchObject({ kind: 'WAITING_RESOURCE', resource: 'dependency', retryAfterMs: 30_000 });
+      const open = circuitSnapshot(h.deps, 'dependency');
+      expect(open.state).toBe('OPEN');
+      expect(open.consecutiveFailures).toBe(2);
+      expect(open.openedAt).toBe(h.clock.now());
+
+      // The circuit — not the per-class budget — now owns the retry. The generic
+      // budget would still allow a retry (sameClassCount 0 < perClassRetries 2),
+      // yet the load is shed.
+      const shed = recover(h.deps, failure({ failureIndex: 3, sameClassCount: 0 }));
+      expect(shed.kind).toBe('WAITING_RESOURCE');
+      // Shedding is not an automatic remedy: only the one pre-open retry consumed
+      // any recovery autonomy.
+      const automatic = h.events
+        .readEvents()
+        .filter((event) => event.type === RECOVERY_ACTION_APPLIED)
+        .filter((event) => (event.payload as { kind?: string }).kind === 'RETRY_NEW_ATTEMPT');
+      expect(automatic).toHaveLength(1);
+
+      // After the reset window the next recovery half-opens the circuit and that
+      // retry is the probe.
+      h.clock.advance(30_000);
+      const probe = recover(h.deps, failure({ failureIndex: 4, sameClassCount: 0 }));
+      expect(probe).toMatchObject({ kind: 'RETRY_NEW_ATTEMPT' });
+      expect(circuitSnapshot(h.deps, 'dependency').state).toBe('HALF_OPEN');
+
+      // A failing probe re-opens the circuit with a fresh window and sheds again.
+      const reopenedAction = recover(h.deps, failure({ failureIndex: 5, sameClassCount: 0 }));
+      expect(reopenedAction).toMatchObject({ kind: 'WAITING_RESOURCE' });
+      const reopened = circuitSnapshot(h.deps, 'dependency');
+      expect(reopened.state).toBe('OPEN');
+      expect(reopened.openedAt).toBe(h.clock.now());
+
+      // A dependency success closes the circuit and resets the failure count.
+      recordDependencySuccess(h.deps, 'dependency');
+      expect(circuitSnapshot(h.deps, 'dependency')).toMatchObject({
+        state: 'CLOSED',
+        consecutiveFailures: 0,
+      });
+    } finally {
+      h.close();
+    }
+  });
+
+  it('the gate sheds while OPEN, half-opens after the reset window, and admits a probe', () => {
+    const h = circuitHarness();
+    try {
+      // Trip a separate dependency directly, two failures at the threshold.
+      recordDependencyFailure(h.deps, 'dep-gate', h.circuit);
+      recordDependencyFailure(h.deps, 'dep-gate', h.circuit);
+      const openSnapshot = circuitSnapshot(h.deps, 'dep-gate');
+      expect(openSnapshot.state).toBe('OPEN');
+
+      // Before the window: shed with the remaining backoff.
+      h.clock.advance(29_999);
+      expect(beforeDependencyRequest(h.deps, 'dep-gate')).toMatchObject({
+        allowed: false,
+        state: 'OPEN',
+        retryAfterMs: 1,
+      });
+
+      // At the window: half-open and the probe is admitted exactly once.
+      h.clock.advance(1);
+      expect(beforeDependencyRequest(h.deps, 'dep-gate')).toEqual({ allowed: true, state: 'HALF_OPEN' });
+      expect(circuitSnapshot(h.deps, 'dep-gate').state).toBe('HALF_OPEN');
+
+      // A success closes it.
+      recordDependencySuccess(h.deps, 'dep-gate');
+      expect(beforeDependencyRequest(h.deps, 'dep-gate')).toEqual({ allowed: true, state: 'CLOSED' });
+    } finally {
+      h.close();
+    }
+  });
+
+  it('e-stop/pause hold before the circuit (no recovery while frozen)', () => {
+    const h = circuitHarness();
+    try {
+      emergencyStop({ store: h.store, events: h.events }, { actor: 'operator-1' });
+      expect(recover(h.deps, failure({ failureIndex: 1 }))).toEqual({ kind: 'HOLD' });
+      // A held failure is not counted against the circuit.
+      expect(circuitSnapshot(h.deps, 'dependency').consecutiveFailures).toBe(0);
+      expect(circuitSnapshot(h.deps, 'dependency').state).toBe('CLOSED');
     } finally {
       h.close();
     }

@@ -9,6 +9,7 @@ import {
 import type { WorkVerifier, VerificationOutcome } from '../verification/orchestrator';
 import type { EventLog } from '../events/log';
 import { getActiveDAG, type DAGVersion } from '../planning/dag';
+import { isEmergencyStopped, isFactoryPaused } from '../policy/policy';
 import { RESOURCE_UNAVAILABLE } from '../recovery/recovery';
 import { routeAssignment } from '../routing/assignment';
 import type { BudgetState, ModelId } from '../routing/decisionModel';
@@ -863,6 +864,13 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
   }
 
   function tick(): void {
+    // E9.6 §10-2/§18.11: while an emergency stop or manual pause is active the
+    // tick takes no consequential action — no assignment, no provisioning, no
+    // verification dispatch and no new external side effect. State and evidence
+    // are preserved (nothing is destroyed or advanced); the flag is durable and
+    // event-derived, so a live scheduler observes a control set by any operator
+    // surface on the next tick, and an explicit resume releases it.
+    if (isEmergencyStopped(deps) || isFactoryPaused(deps)) return;
     routeVerificationQueued();
     routeQueued();
     collectStep();

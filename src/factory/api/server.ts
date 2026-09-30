@@ -11,7 +11,14 @@ import {
 import type { EventLog } from '../events/log';
 import { projectDrillDown, projectObservatory, type EvidenceReadPort } from '../observatory/observatory';
 import { commitDAG, getActiveDAG, proposeDAG, type DAGProposalPayload } from '../planning/dag';
-import { answerApproval, type ApprovalRecord } from '../policy/policy';
+import {
+  answerApproval,
+  emergencyStop,
+  factoryControlState,
+  pauseFactory,
+  resumeFactory,
+  type ApprovalRecord,
+} from '../policy/policy';
 import type { Scheduler } from '../scheduler/scheduler';
 import type { StateStore } from '../state/store';
 import {
@@ -21,6 +28,7 @@ import {
   type ApprovalAnswerRequest,
   type ApprovalsDto,
   type CommitDagResultDto,
+  type FactoryControlsDto,
   type GateDecision,
   type HandshakeDto,
   type HealthDto,
@@ -76,6 +84,7 @@ const STATUS_BY_CODE: Record<string, number> = {
   TASK_NOT_READY: 409,
   WORKER_NOT_IDLE: 409,
   APPROVAL_ACTOR_REQUIRED: 400,
+  OPERATOR_REQUIRED: 400,
   DAG_INVALID: 422,
 };
 
@@ -244,7 +253,14 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
     version,
     apiVersion: API_VERSION,
     schemaVersion,
-    capabilities: ['work_orders', 'interactions', 'approvals', 'observatory', 'scheduler'],
+    capabilities: [
+      'work_orders',
+      'interactions',
+      'approvals',
+      'observatory',
+      'scheduler',
+      'controls',
+    ],
   });
 
   return async function handle(request: Request): Promise<Response> {
@@ -285,6 +301,35 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
     if (resource === 'scheduler' && method === 'GET' && id === undefined) {
       if (!deps.scheduler) return apiError('NOT_FOUND', 'scheduler not configured', 404);
       return json({ scheduler: deps.scheduler.status() });
+    }
+
+    // E9.6 factory-level controls (spec §10/§18.11). The durable flag + event
+    // are E7's (`emergencyStop`/`pauseFactory`/`resumeFactory`); these routes
+    // are only the operator entry point, so the server stays the sole mutation
+    // authority. The live scheduler observes the durable flag on its next tick.
+    if (resource === 'factory') {
+      if (method === 'GET' && id === 'controls') {
+        const state = factoryControlState({ events: deps.events });
+        const dto: FactoryControlsDto = { paused: state.paused, emergencyStopped: state.emergencyStopped };
+        return json(dto);
+      }
+      if (method === 'POST' && id !== undefined && action === undefined) {
+        const body = await readJson<{ actor?: unknown }>(request);
+        const actor = typeof body?.actor === 'string' ? body.actor.trim() : '';
+        if (actor.length === 0) return apiError('OPERATOR_REQUIRED', 'actor is required', 400);
+        const controlDeps = { store: deps.store, events: deps.events, now };
+        const state =
+          id === 'emergency-stop'
+            ? emergencyStop(controlDeps, { actor })
+            : id === 'pause'
+              ? pauseFactory(controlDeps, { actor })
+              : id === 'resume'
+                ? resumeFactory(controlDeps, { actor })
+                : null;
+        if (!state) return apiError('NOT_FOUND', `no route for ${method} ${url.pathname}`, 404);
+        const dto: FactoryControlsDto = { paused: state.paused, emergencyStopped: state.emergencyStopped };
+        return json(dto);
+      }
     }
 
     if (resource === 'observatory') {

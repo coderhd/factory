@@ -6,6 +6,7 @@ import type {
   ApprovalAnswerRequest,
   CommitDagResultDto,
   DrillDownDto,
+  FactoryControlsDto,
   GateDecision,
   HandshakeDto,
   HealthDto,
@@ -55,6 +56,10 @@ export interface FactoryClient {
   schedulerStatus(): Promise<SchedulerStatusDto>;
   observatory(): Promise<ObservatoryDto>;
   drillDown(workOrderId: string): Promise<DrillDownDto>;
+  factoryControls(): Promise<FactoryControlsDto>;
+  emergencyStop(actor: string): Promise<FactoryControlsDto>;
+  pause(actor: string): Promise<FactoryControlsDto>;
+  resume(actor: string): Promise<FactoryControlsDto>;
 }
 
 export function createFactoryClient(options: FactoryClientOptions): FactoryClient {
@@ -149,5 +154,10 @@ export function createFactoryClient(options: FactoryClientOptions): FactoryClien
     observatory: () => request<ObservatoryDto>('GET', '/observatory'),
     drillDown: (workOrderId) =>
       request<DrillDownDto>('GET', `/observatory/work-orders/${workOrderId}/drill-down`),
+    factoryControls: () => request<FactoryControlsDto>('GET', '/factory/controls'),
+    emergencyStop: (actor) =>
+      request<FactoryControlsDto>('POST', '/factory/emergency-stop', { actor }),
+    pause: (actor) => request<FactoryControlsDto>('POST', '/factory/pause', { actor }),
+    resume: (actor) => request<FactoryControlsDto>('POST', '/factory/resume', { actor }),
   };
 }
