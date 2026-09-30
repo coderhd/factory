@@ -15,6 +15,7 @@ import { openStateStore, type StateStore } from '../../src/factory/state/store';
 import { createVerificationEngine } from '../../src/factory/verification/engine';
 import { createSemanticVerifier } from '../../src/factory/verification/semantic';
 import type { WorkOrder } from '../../src/factory/domain/workOrder';
+import { check as policyCheck, answerApproval, type ApprovalRecord } from '../../src/factory/policy/policy';
 import {
   acceptanceCriteriaFromIssue,
   buildPullRequestBody,
@@ -26,8 +27,12 @@ import {
   type CreateBranchInput,
   type CreatePullRequestInput,
   type GitHubIssue,
+  type GitHubPullRequest,
+  type GitHubPullRequestDetail,
   type GitHubTransport,
   type IssueRef,
+  type MergePullRequestInput,
+  type PullRequestRef,
 } from '../../src/factory/github/adapter';
 
 /**
@@ -59,6 +64,10 @@ class MockGitHubTransport implements GitHubTransport {
   issueCalls: IssueRef[] = [];
   branchCalls: CreateBranchInput[] = [];
   prCalls: CreatePullRequestInput[] = [];
+  /** PR detail the merge gate's hygiene checks read back (keyed by PR number). */
+  prDetails = new Map<number, GitHubPullRequestDetail>();
+  getPrCalls: PullRequestRef[] = [];
+  mergeCalls: MergePullRequestInput[] = [];
   failGetIssue = false;
   private prNumber = 100;
 
@@ -78,12 +87,41 @@ class MockGitHubTransport implements GitHubTransport {
   async createPullRequest(input: CreatePullRequestInput) {
     this.prCalls.push({ ...input });
     this.prNumber += 1;
-    return {
+    const pr: GitHubPullRequest = {
       repository: input.repository,
       number: this.prNumber,
       url: `https://github.com/${input.repository}/pull/${this.prNumber}`,
       head: input.head,
       base: input.base,
+    };
+    this.prDetails.set(pr.number, {
+      ...pr,
+      body: input.body,
+      state: 'open',
+      merged: false,
+    });
+    return pr;
+  }
+
+  async getPullRequest(ref: PullRequestRef): Promise<GitHubPullRequestDetail> {
+    this.getPrCalls.push({ ...ref });
+    const pr = this.prDetails.get(ref.number);
+    if (!pr || pr.repository !== ref.repository) {
+      throw new Error(`no such pull request: ${ref.repository}#${ref.number}`);
+    }
+    return { ...pr };
+  }
+
+  async mergePullRequest(input: MergePullRequestInput) {
+    this.mergeCalls.push({ ...input });
+    const pr = this.prDetails.get(input.number);
+    if (pr) this.prDetails.set(input.number, { ...pr, merged: true, state: 'closed' });
+    return {
+      repository: input.repository,
+      number: input.number,
+      merged: true,
+      sha: 'merge_sha',
+      message: 'Pull Request successfully merged',
     };
   }
 }
@@ -144,6 +182,9 @@ function harness(): Harness {
     transport,
     client,
     factoryBaseUrl: FACTORY_BASE_URL,
+    // E7 policy (deps-first `check`) wired as the merge gate's authorization
+    // port; the store/events are the same ones the loopback server owns.
+    checkPolicy: (subject, action) => policyCheck({ store, events }, subject, action),
   });
 
   return {
@@ -666,5 +707,370 @@ describe('E6.1 GitHub REST transport (injected fetch, never live GitHub)', () =>
     await expect(transport.getIssue({ repository: 'acme/widgets', number: 7 })).rejects.toBeInstanceOf(
       GitHubTransportError,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T6 — merge(gate): Factory-authorized merge (E6.2 #21; spec §4.2, §5.1, §28)
+// ---------------------------------------------------------------------------
+
+/**
+ * Merge is the production deployment (ADR 14 / policy §8-3): it may happen only
+ * when the Work Order is APPROVED, E7's `deploy.execute { env: production }`
+ * check consumes an operator APPROVAL into ALLOW, the PR is hygine-clean and
+ * links the Evidence Bundle, and the actor is not the change's writer. All
+ * transport I/O stays on the injected mock (no live GitHub).
+ */
+
+/** The single production binding the merge path authorizes (policy §8-3). */
+const MERGE_ACTION = { capability: 'deploy.execute', resource: { env: 'production' } } as const;
+
+const ON_THE_WAY_TO_GATE = [
+  'READY',
+  'PLANNING',
+  'EXECUTING',
+  'VERIFYING',
+  'EVIDENCE_READY',
+  'HUMAN_GATE',
+] as const;
+
+async function importWorkOrder(h: Harness): Promise<WorkOrder> {
+  const issue = issueFixture();
+  h.transport.issues.set(issueKey(issue), issue);
+  const { workOrder } = await h.adapter.importIssue({
+    repository: issue.repository,
+    number: issue.number,
+  });
+  return workOrder;
+}
+
+/** Drive a freshly imported Work Order up to HUMAN_GATE through the E2 API. */
+async function advanceToHumanGate(h: Harness, workOrder: WorkOrder): Promise<WorkOrder> {
+  let current = workOrder;
+  for (const to of ON_THE_WAY_TO_GATE) {
+    current = await h.client.transitionWorkOrder(workOrder.id, { to });
+  }
+  return current;
+}
+
+/** APPROVE the human gate (spec §5.1 HUMAN_GATE → APPROVED). */
+async function approve(h: Harness, workOrder: WorkOrder): Promise<WorkOrder> {
+  return h.client.applyGate(workOrder.id, 'APPROVE');
+}
+
+/** Import → … → APPROVED → a real E5 bundle → an opened PR. */
+async function approvedWorkOrderWithPr(
+  h: Harness,
+): Promise<{ workOrder: WorkOrder; bundle: EvidenceBundle; pr: GitHubPullRequest }> {
+  const workOrder = await approve(h, await advanceToHumanGate(h, await importWorkOrder(h)));
+  const bundle = await realBundle(workOrder);
+  const pr = await h.adapter.openPR(bundle);
+  return { workOrder, bundle, pr };
+}
+
+/** Park the E7 approval for the production merge and have an operator answer it. */
+function parkMergeApproval(h: Harness, workOrderId: string, actor: string): ApprovalRecord {
+  const deps = { store: h.store, events: h.events };
+  expect(policyCheck(deps, { taskId: null, workOrderId }, MERGE_ACTION)).toBe('REQUIRE_HUMAN');
+  const parked = h.store
+    .list<ApprovalRecord>('interactions')
+    .find((interaction) => interaction.type === 'APPROVAL')!;
+  answerApproval(deps, parked.id, { decision: 'APPROVAL', actor });
+  return h.store.get<ApprovalRecord>('interactions', parked.id)!;
+}
+
+function mergeGate(
+  workOrderId: string,
+  bundle: EvidenceBundle,
+  pr: GitHubPullRequest,
+  overrides: { actor?: string; pullRequest?: PullRequestRef } = {},
+) {
+  return {
+    workOrderId,
+    pullRequest: overrides.pullRequest ?? { repository: pr.repository, number: pr.number },
+    evidence: bundle,
+    actor: overrides.actor ?? 'operator-1',
+  };
+}
+
+describe('E6.2 merge(gate): blocked until APPROVED + ALLOW + hygiene + no self-merge', () => {
+  it('blocks a merge until the Work Order is APPROVED', async () => {
+    const h = harness();
+    try {
+      const workOrder = await advanceToHumanGate(h, await importWorkOrder(h));
+      const bundle = await realBundle(workOrder);
+      const pr = await h.adapter.openPR(bundle);
+
+      await expect(h.adapter.merge(mergeGate(workOrder.id, bundle, pr))).rejects.toMatchObject({
+        name: 'MergeBlockedError',
+        reason: 'WORK_ORDER_NOT_APPROVED',
+      });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+      expect(h.transport.getPrCalls).toHaveLength(0);
+      expect((await h.client.getWorkOrder(workOrder.id)).workOrder.state).toBe('HUMAN_GATE');
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('blocks a merge without the E7 policy ALLOW (parks the approval instead)', async () => {
+    const h = harness();
+    try {
+      const { workOrder, bundle, pr } = await approvedWorkOrderWithPr(h);
+
+      await expect(h.adapter.merge(mergeGate(workOrder.id, bundle, pr))).rejects.toMatchObject({
+        name: 'MergeBlockedError',
+        reason: 'POLICY_NOT_ALLOWED',
+      });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+      // The production merge parked a PENDING approval on E7's ledger instead of merging.
+      const approvals = h.store
+        .list<ApprovalRecord>('interactions')
+        .filter((interaction) => interaction.type === 'APPROVAL');
+      expect(approvals).toHaveLength(1);
+      expect(approvals[0]!.status).toBe('PENDING');
+      expect((await h.client.getWorkOrder(workOrder.id)).workOrder.state).toBe('APPROVED');
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('blocks a self-merge: the writer identity may not be the approver/merger', async () => {
+    const h = harness();
+    try {
+      const { workOrder, bundle, pr } = await approvedWorkOrderWithPr(h);
+      const writer = `${bundle.provenance.generator.provider}/${bundle.provenance.generator.model}`;
+
+      // No approval is parked: the no-self-merge guard fails closed before the
+      // policy check would consume anything.
+      await expect(
+        h.adapter.merge(mergeGate(workOrder.id, bundle, pr, { actor: writer })),
+      ).rejects.toMatchObject({ name: 'MergeBlockedError', reason: 'SELF_MERGE' });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+      expect(h.store.list<ApprovalRecord>('interactions')).toHaveLength(0);
+      expect((await h.client.getWorkOrder(workOrder.id)).workOrder.state).toBe('APPROVED');
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('blocks a merge whose PR body does not link the Evidence Bundle', async () => {
+    const h = harness();
+    try {
+      const { workOrder, bundle, pr } = await approvedWorkOrderWithPr(h);
+      // Tamper with the live PR: the change-set receipt link is gone.
+      h.transport.prDetails.set(pr.number, {
+        ...h.transport.prDetails.get(pr.number)!,
+        body: '## Factory change set\n\n(links removed)',
+      });
+
+      await expect(h.adapter.merge(mergeGate(workOrder.id, bundle, pr))).rejects.toMatchObject({
+        name: 'MergeBlockedError',
+        reason: 'EVIDENCE_LINK_MISSING',
+      });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('blocks a merge when the PR head is not the Work Order Factory branch (failing hygiene)', async () => {
+    const h = harness();
+    try {
+      const { workOrder, bundle, pr } = await approvedWorkOrderWithPr(h);
+      h.transport.prDetails.set(pr.number, {
+        ...h.transport.prDetails.get(pr.number)!,
+        head: 'someone-elses-branch',
+      });
+
+      await expect(h.adapter.merge(mergeGate(workOrder.id, bundle, pr))).rejects.toMatchObject({
+        name: 'MergeBlockedError',
+        reason: 'HYGIENE_FAILED',
+      });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('blocks a merge of an already-merged PR (no double merge)', async () => {
+    const h = harness();
+    try {
+      const { workOrder, bundle, pr } = await approvedWorkOrderWithPr(h);
+      h.transport.prDetails.set(pr.number, {
+        ...h.transport.prDetails.get(pr.number)!,
+        merged: true,
+        state: 'closed',
+      });
+
+      await expect(h.adapter.merge(mergeGate(workOrder.id, bundle, pr))).rejects.toMatchObject({
+        name: 'MergeBlockedError',
+        reason: 'HYGIENE_FAILED',
+      });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('blocks a merge whose PR targets a different base branch', async () => {
+    const h = harness();
+    try {
+      const { workOrder, bundle, pr } = await approvedWorkOrderWithPr(h);
+      h.transport.prDetails.set(pr.number, {
+        ...h.transport.prDetails.get(pr.number)!,
+        base: 'develop',
+      });
+
+      await expect(h.adapter.merge(mergeGate(workOrder.id, bundle, pr))).rejects.toMatchObject({
+        name: 'MergeBlockedError',
+        reason: 'HYGIENE_FAILED',
+      });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('blocks a merge when the Evidence Bundle is incomplete or for another Work Order', async () => {
+    const h = harness();
+    try {
+      const { workOrder, bundle, pr } = await approvedWorkOrderWithPr(h);
+
+      await expect(
+        h.adapter.merge(mergeGate(workOrder.id, { ...bundle, complete: false }, pr)),
+      ).rejects.toMatchObject({ name: 'MergeBlockedError', reason: 'EVIDENCE_INCOMPLETE' });
+      await expect(
+        h.adapter.merge(mergeGate(workOrder.id, { ...bundle, workOrderId: 'wo_other' }, pr)),
+      ).rejects.toMatchObject({ name: 'MergeBlockedError', reason: 'EVIDENCE_MISMATCH' });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('fails closed when no policy check is wired (no production merge without policy)', async () => {
+    const h = harness();
+    try {
+      const { workOrder, bundle, pr } = await approvedWorkOrderWithPr(h);
+      const unpolicied = createGitHubAdapter({
+        transport: h.transport,
+        client: h.client,
+        factoryBaseUrl: FACTORY_BASE_URL,
+      });
+
+      await expect(unpolicied.merge(mergeGate(workOrder.id, bundle, pr))).rejects.toMatchObject({
+        name: 'MergeBlockedError',
+        reason: 'POLICY_NOT_ALLOWED',
+      });
+      expect(h.transport.mergeCalls).toHaveLength(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('merges end-to-end (import → WO → PR → merge) on APPROVED + consumed ALLOW + hygiene', async () => {
+    const h = harness();
+    try {
+      const { workOrder, bundle, pr } = await approvedWorkOrderWithPr(h);
+      const approval = parkMergeApproval(h, workOrder.id, 'operator-1');
+
+      const outcome = await h.adapter.merge(mergeGate(workOrder.id, bundle, pr));
+
+      // GitHub was asked to merge exactly the PR, through the injected transport.
+      expect(h.transport.mergeCalls).toEqual([
+        { repository: 'acme/widgets', number: pr.number },
+      ]);
+      expect(h.transport.getPrCalls).toEqual([{ repository: 'acme/widgets', number: pr.number }]);
+      expect(outcome.merge.merged).toBe(true);
+      expect(outcome.merge.sha).toBe('merge_sha');
+
+      // The Factory-owned APPROVED → MERGED transition landed in durable state...
+      const stored = h.store.get<WorkOrder>('work_orders', workOrder.id)!;
+      expect(stored.state).toBe('MERGED');
+      expect(outcome.workOrder.state).toBe('MERGED');
+      // ...and the operator approval is spent exactly once, bound to the decision.
+      const spent = h.store.get<ApprovalRecord>('interactions', approval.id)!;
+      expect(spent.status).toBe('SPENT');
+      expect(spent.response?.actor).toBe('operator-1');
+      expect(spent.spentByDecisionId).toBeString();
+
+      // The whole path went over the Factory server — never GitHub.
+      expect(h.factoryRequests.length).toBeGreaterThan(0);
+      expect(h.factoryRequests.every((url) => url.startsWith('http://127.0.0.1:'))).toBe(true);
+      expect(h.factoryRequests.some((url) => url.includes('github.com'))).toBe(false);
+      // The PR the merge consumed linked the Work Order and the Evidence Bundle.
+      const body = h.transport.prCalls[0]!.body;
+      expect(body).toContain(`[${bundle.id}](${FACTORY_BASE_URL}/api/observatory/work-orders/${workOrder.id}/drill-down)`);
+    } finally {
+      h.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T7 — the REST transport's PR-read + merge calls (injected fetch, no network)
+// ---------------------------------------------------------------------------
+
+describe('E6.2 GitHub REST transport: read + merge a pull request', () => {
+  const token = 'secret-token';
+
+  it('reads a pull request, then merges it (PUT /pulls/{n}/merge)', async () => {
+    const { impl, calls } = recordingFetch((request) =>
+      new Response(
+        JSON.stringify(
+          request.method === 'GET'
+            ? {
+                number: 12,
+                html_url: 'https://github.com/acme/widgets/pull/12',
+                head: { ref: 'factory/wo_1' },
+                base: { ref: 'main' },
+                body: 'links the bundle',
+                state: 'open',
+                merged: false,
+              }
+            : { sha: 'deadbeef', merged: true, message: 'Pull Request successfully merged' },
+        ),
+        { status: 200 },
+      ),
+    );
+    const transport = createGitHubRestTransport({ token, fetch: impl });
+
+    const detail = await transport.getPullRequest({ repository: 'acme/widgets', number: 12 });
+    expect(detail).toEqual({
+      repository: 'acme/widgets',
+      number: 12,
+      url: 'https://github.com/acme/widgets/pull/12',
+      head: 'factory/wo_1',
+      base: 'main',
+      body: 'links the bundle',
+      state: 'open',
+      merged: false,
+    });
+
+    const result = await transport.mergePullRequest({ repository: 'acme/widgets', number: 12 });
+    expect(result).toEqual({
+      repository: 'acme/widgets',
+      number: 12,
+      merged: true,
+      sha: 'deadbeef',
+      message: 'Pull Request successfully merged',
+    });
+    expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
+      'GET https://api.github.com/repos/acme/widgets/pulls/12',
+      'PUT https://api.github.com/repos/acme/widgets/pulls/12/merge',
+    ]);
+    expect(calls[1]!.body).toBeUndefined();
+  });
+
+  it('fails loudly with the HTTP status when GitHub refuses the merge', async () => {
+    const { impl } = recordingFetch(
+      () => new Response(JSON.stringify({ message: 'Pull Request is not mergeable' }), { status: 405 }),
+    );
+    const transport = createGitHubRestTransport({ token, fetch: impl });
+
+    await expect(
+      transport.mergePullRequest({ repository: 'acme/widgets', number: 12 }),
+    ).rejects.toMatchObject({ status: 405 });
   });
 });
