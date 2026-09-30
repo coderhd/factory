@@ -39,6 +39,31 @@ worktrees:
 workers:
   profiles:
     - herdr
+# Production verification (E10.1, #39). Optional: when present, the server
+# composes the real E5 verifier (engine + independent semantic judge) from this
+# section, so a SUCCESS Task is verified and driven to HUMAN_GATE. Absent, the
+# server wires no verifier and fails closed (no promotion). Uncomment and set
+# the judge + command checks for a deployment that supplies a model-calling
+# judge implementation.
+# verification:
+#   judge:
+#     provider: judge-co
+#     model: judge-1
+#     family: judge-family
+#   prompt:
+#     id: factory-verify
+#     version: "1"
+#   rubric:
+#     - Does the change set satisfy the criterion as written?
+#   checks:
+#     - id: typecheck
+#       category: deterministic
+#       kind: typecheck
+#       command: bun run typecheck
+#     - id: e2e
+#       category: behavioral
+#       kind: e2e
+#       command: bun run e2e
 image:
   repository: ghcr.io/coderhd/factory
   tag: "0.1.0"

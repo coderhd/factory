@@ -25,6 +25,11 @@ import type { DAGProposalPayload } from '../factory/planning/dag';
 import { reconcileAfterRestart } from '../factory/recovery/recovery';
 import { createScheduler, type SchedulerPolicy } from '../factory/scheduler/scheduler';
 import { createArtifactStore, openStateStore, type StateStore } from '../factory/state/store';
+import {
+  createProductionVerifier,
+  type CommandRunner,
+} from '../factory/verification/production';
+import type { SemanticJudge } from '../factory/verification/semantic';
 import type { WorkVerifier } from '../factory/verification/orchestrator';
 import { createHerdrWorker } from '../factory/workers/herdr';
 import { createWorkerManager, type SpawnWorker, type WorkerProfile } from '../factory/workers/manager';
@@ -189,14 +194,24 @@ export interface ServerDepsOptions {
   spawn?: SpawnWorker;
   now?: () => string;
   /**
-   * E9.4 verification seam. Tests wire a verifier here; `cmdServe` calls
-   * {@link buildServerDeps} with no options, so production does **not** yet
-   * compose one (`createE5Verifier` currently has no non-test caller).
-   * Production verifier composition is tracked in GitHub issue #39. Absent the
-   * verifier, the scheduler fails closed — a SUCCESS Task is never promoted
-   * without a persisted Evidence Bundle.
+   * E9.4 verification seam. Tests wire a verifier here; production instead
+   * composes one from the resolved `verification:` config (E10.1, #39) via
+   * {@link createProductionVerifier}. Absent both, the scheduler fails closed —
+   * a SUCCESS Task is never promoted without a persisted Evidence Bundle.
    */
   verifier?: WorkVerifier;
+  /**
+   * E10.1 (#39) production verifier seams. These are the *deployment*
+   * implementations the composed verifier needs — the model-calling judge and
+   * the command executor — never a verifier itself, so the composition under
+   * test is the real `buildServerDeps` path. Tests inject hermetic fakes here
+   * (fake judge, no subprocess); production leaves them unset for the real
+   * implementations.
+   */
+  verification?: {
+    judge?: SemanticJudge;
+    runCommand?: CommandRunner;
+  };
   /**
    * E9.6 boot reconciliation. On a real server start this runs first (spec
    * §18.3), so a crash that left an in-flight Attempt behind is interrupted and
@@ -237,6 +252,39 @@ function resolveDefaultWorkerProfile(runtime: FactoryRuntimeConfig): WorkerProfi
   return configured as WorkerProfile;
 }
 
+/**
+ * Resolve the production `WorkVerifier` for this boot (E10.1, #39). An explicit
+ * `verifier` option wins (the injectable test seam). Otherwise, when the
+ * resolved config carries a `verification:` section, compose the real E5-backed
+ * verifier from it. Composition is fail-closed: a misconfiguration is logged
+ * loudly and **no** verifier is wired, so a SUCCESS Task parks rather than being
+ * promoted on a half-built verifier. When the section is absent, this returns
+ * `undefined` — exactly the pre-#39 behaviour.
+ */
+function resolveVerifier(
+  runtime: FactoryRuntimeConfig,
+  options: ServerDepsOptions,
+  store: StateStore,
+): WorkVerifier | undefined {
+  if (options.verifier) return options.verifier;
+  if (!runtime.verification) return undefined;
+  try {
+    return createProductionVerifier({
+      config: runtime.verification,
+      store,
+      workingDirectory: runtime.repository.path,
+      ...(options.verification?.judge ? { judge: options.verification.judge } : {}),
+      ...(options.verification?.runCommand ? { runCommand: options.verification.runCommand } : {}),
+      ...(options.now ? { now: options.now } : {}),
+    });
+  } catch (error) {
+    console.error(
+      `scheduler: verifier composition failed (${error instanceof Error ? error.message : String(error)}); no verifier wired — SUCCESS Tasks will not be verified or promoted`,
+    );
+    return undefined;
+  }
+}
+
 export function buildServerDeps(
   runtime: FactoryRuntimeConfig,
   options: ServerDepsOptions = {},
@@ -247,6 +295,7 @@ export function buildServerDeps(
   ensureStorageDirs(runtime);
   const store = openStateStore(runtime.paths.db);
   const events = openEventLog(store.db);
+  const verifier = resolveVerifier(runtime, options, store);
   const workers = createWorkerManager({
     store,
     events,
@@ -291,7 +340,7 @@ export function buildServerDeps(
       artifacts,
       policy: createSchedulerPolicy({ store, events }),
       telemetry: { evidence },
-      ...(options.verifier ? { verifier: options.verifier } : {}),
+      ...(verifier ? { verifier } : {}),
     },
     {
       maxConcurrentTasks: runtime.scheduler.maxConcurrentTasks,
