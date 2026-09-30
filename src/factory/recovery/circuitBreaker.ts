@@ -15,8 +15,9 @@ import type { EventLog } from '../events/log';
  * State is durable, derived from append-only events (mirroring
  * `factoryControlState`), so a circuit survives a Factory restart without a new
  * state collection. `CLOSED` trips `OPEN` on `failureThreshold` consecutive
- * failures; after `resetTimeoutMs` the circuit half-opens and admits a probe;
- * a failing probe re-opens, and an explicit success closes it.
+ * failures; after `resetTimeoutMs` the circuit half-opens and admits a single
+ * probe (further calls are shed while that probe is in flight); a failing probe
+ * re-opens, and an explicit success closes it.
  */
 
 export const CIRCUIT_STATE_CHANGED = 'dependency.circuit_state_changed';
@@ -30,6 +31,12 @@ export interface CircuitSnapshot {
   consecutiveFailures: number;
   /** When the circuit most recently tripped OPEN (null while never opened). */
   openedAt: string | null;
+  /**
+   * True while a HALF_OPEN probe has been admitted but has not yet settled
+   * (via {@link recordDependencySuccess} / {@link recordDependencyFailure}).
+   * The half-open window admits a single probe; further calls are shed.
+   */
+  probeInFlight: boolean;
   updatedAt: string;
 }
 
@@ -70,6 +77,7 @@ export function circuitSnapshot(deps: CircuitDeps, dependency: string): CircuitS
     state: 'CLOSED',
     consecutiveFailures: 0,
     openedAt: null,
+    probeInFlight: false,
     updatedAt: '',
   };
   for (const event of deps.events.readEvents({
@@ -83,6 +91,7 @@ export function circuitSnapshot(deps: CircuitDeps, dependency: string): CircuitS
       state: (payload.state as CircuitState) ?? snapshot.state,
       consecutiveFailures: payload.consecutiveFailures ?? snapshot.consecutiveFailures,
       openedAt: payload.openedAt ?? null,
+      probeInFlight: payload.probeInFlight ?? false,
       updatedAt: payload.updatedAt ?? snapshot.updatedAt,
     };
   }
@@ -101,9 +110,11 @@ function appendState(deps: CircuitDeps, snapshot: CircuitSnapshot): CircuitSnaps
 
 /**
  * The gate consulted before a dependency-bound operation. `CLOSED` admits;
- * `OPEN` sheds until `resetTimeoutMs` has elapsed, then transitions `HALF_OPEN`
- * and admits the probe; `HALF_OPEN` admits (a failed probe re-opens via
- * {@link recordDependencyFailure}).
+ * `OPEN` sheds until `resetTimeoutMs` has elapsed; at the window (or while
+ * already `HALF_OPEN`) exactly one probe is admitted — further calls are shed
+ * until the probe settles (a failed probe re-opens via
+ * {@link recordDependencyFailure}, a success closes via
+ * {@link recordDependencySuccess}).
  */
 export function beforeDependencyRequest(
   deps: CircuitDeps,
@@ -113,15 +124,24 @@ export function beforeDependencyRequest(
   const cfg = configOf(config);
   const now = deps.now ?? (() => new Date().toISOString());
   const snapshot = circuitSnapshot(deps, dependency);
-  if (snapshot.state !== 'OPEN') return { allowed: true, state: snapshot.state };
-
   const at = now();
+
+  if (snapshot.state === 'CLOSED') return { allowed: true, state: 'CLOSED' };
+
+  if (snapshot.state === 'HALF_OPEN') {
+    // A half-open window admits a single probe. While one is in flight, shed.
+    if (snapshot.probeInFlight) return { allowed: false, state: 'HALF_OPEN' };
+    appendState(deps, { ...snapshot, probeInFlight: true, updatedAt: at });
+    return { allowed: true, state: 'HALF_OPEN' };
+  }
+
+  // OPEN: shed until the reset window elapses, then half-open and admit the probe.
   const openedMs = snapshot.openedAt ? Date.parse(snapshot.openedAt) : Date.parse(at);
   const elapsed = Date.parse(at) - openedMs;
   if (elapsed < cfg.resetTimeoutMs) {
     return { allowed: false, state: 'OPEN', retryAfterMs: cfg.resetTimeoutMs - elapsed };
   }
-  appendState(deps, { ...snapshot, state: 'HALF_OPEN', updatedAt: at });
+  appendState(deps, { ...snapshot, state: 'HALF_OPEN', probeInFlight: true, updatedAt: at });
   return { allowed: true, state: 'HALF_OPEN' };
 }
 
@@ -151,6 +171,7 @@ export function recordDependencyFailure(
       state: 'OPEN',
       consecutiveFailures,
       openedAt: at,
+      probeInFlight: false,
       updatedAt: at,
     });
   }
@@ -159,6 +180,7 @@ export function recordDependencyFailure(
     state: 'CLOSED',
     consecutiveFailures,
     openedAt: null,
+    probeInFlight: false,
     updatedAt: at,
   });
 }
@@ -171,6 +193,7 @@ export function recordDependencySuccess(deps: CircuitDeps, dependency: string): 
     state: 'CLOSED',
     consecutiveFailures: 0,
     openedAt: null,
+    probeInFlight: false,
     updatedAt: now(),
   });
 }

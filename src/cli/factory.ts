@@ -217,16 +217,16 @@ export function buildServerDeps(
   const artifacts = createArtifactStore(runtime.paths.artifacts);
   // E9.6 boot reconciliation (spec §18.3): walk durable state → event history →
   // RUNNING Attempts → worker leases before the loop starts. Post-restart no
-  // adapter is live, so every lease is treated as stopped: an in-flight Attempt
-  // is interrupted (never claimed successful), its diff preserved as evidence,
-  // its Assignment closed, and recovery opens a new clean-baseline Attempt.
+  // adapter is live, so every lease is treated as stopped (via
+  // `ReconcileOptions.workerStatus`): an in-flight Attempt is interrupted (never
+  // claimed successful), its diff preserved as evidence, its Assignment closed,
+  // and recovery opens a new clean-baseline Attempt.
   if (options.reconcileOnBoot !== false) {
     reconcileAfterRestart(
       {
         store,
         events,
         artifacts,
-        workerStatus: () => 'stopped',
         ...(options.now ? { now: options.now } : {}),
       },
       { workerStatus: () => 'stopped' },

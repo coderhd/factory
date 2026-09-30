@@ -2173,17 +2173,21 @@ describe('E9.6 dependency circuit breaker (spec §18.9)', () => {
       expect(automatic).toHaveLength(1);
 
       // After the reset window the next recovery half-opens the circuit and that
-      // retry is the probe.
+      // retry is the single probe.
       h.clock.advance(30_000);
       const probe = recover(h.deps, failure({ failureIndex: 4, sameClassCount: 0 }));
       expect(probe).toMatchObject({ kind: 'RETRY_NEW_ATTEMPT' });
-      expect(circuitSnapshot(h.deps, 'dependency').state).toBe('HALF_OPEN');
+      expect(circuitSnapshot(h.deps, 'dependency')).toMatchObject({
+        state: 'HALF_OPEN',
+        probeInFlight: true,
+      });
 
       // A failing probe re-opens the circuit with a fresh window and sheds again.
       const reopenedAction = recover(h.deps, failure({ failureIndex: 5, sameClassCount: 0 }));
       expect(reopenedAction).toMatchObject({ kind: 'WAITING_RESOURCE' });
       const reopened = circuitSnapshot(h.deps, 'dependency');
       expect(reopened.state).toBe('OPEN');
+      expect(reopened.probeInFlight).toBe(false);
       expect(reopened.openedAt).toBe(h.clock.now());
 
       // A dependency success closes the circuit and resets the failure count.
@@ -2214,14 +2218,31 @@ describe('E9.6 dependency circuit breaker (spec §18.9)', () => {
         retryAfterMs: 1,
       });
 
-      // At the window: half-open and the probe is admitted exactly once.
+      // At the window: half-open and exactly one probe is admitted.
       h.clock.advance(1);
       expect(beforeDependencyRequest(h.deps, 'dep-gate')).toEqual({ allowed: true, state: 'HALF_OPEN' });
-      expect(circuitSnapshot(h.deps, 'dep-gate').state).toBe('HALF_OPEN');
+      const halfOpen = circuitSnapshot(h.deps, 'dep-gate');
+      expect(halfOpen.state).toBe('HALF_OPEN');
+      expect(halfOpen.probeInFlight).toBe(true);
 
-      // A success closes it.
+      // While that probe is in flight, further dependent calls are shed — the
+      // half-open window admits a single probe, not unbounded traffic.
+      expect(beforeDependencyRequest(h.deps, 'dep-gate')).toMatchObject({
+        allowed: false,
+        state: 'HALF_OPEN',
+      });
+
+      // The probe fails: the circuit re-opens with a fresh window.
+      const reopened = recordDependencyFailure(h.deps, 'dep-gate', h.circuit);
+      expect(reopened.state).toBe('OPEN');
+      expect(reopened.probeInFlight).toBe(false);
+
+      // A success (after the next window) closes it and clears the probe flag.
+      h.clock.advance(30_000);
+      expect(beforeDependencyRequest(h.deps, 'dep-gate')).toEqual({ allowed: true, state: 'HALF_OPEN' });
       recordDependencySuccess(h.deps, 'dep-gate');
       expect(beforeDependencyRequest(h.deps, 'dep-gate')).toEqual({ allowed: true, state: 'CLOSED' });
+      expect(circuitSnapshot(h.deps, 'dep-gate').probeInFlight).toBe(false);
     } finally {
       h.close();
     }

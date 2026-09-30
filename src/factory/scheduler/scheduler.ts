@@ -870,6 +870,10 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     // are preserved (nothing is destroyed or advanced); the flag is durable and
     // event-derived, so a live scheduler observes a control set by any operator
     // surface on the next tick, and an explicit resume releases it.
+    //
+    // The gate is read once at tick entry: a long tick that began before a stop
+    // completes all its passes. Accepted v0.1 per-tick model (passes are
+    // synchronous and short); a stop is observed from the following tick.
     if (isEmergencyStopped(deps) || isFactoryPaused(deps)) return;
     routeVerificationQueued();
     routeQueued();

@@ -420,7 +420,13 @@ const CIRCUIT_FAILURE_CLASSES: ReadonlySet<FailureClass> = new Set([
   'MODEL_UNAVAILABLE',
 ]);
 
-/** The circuit key for a failure: the named dependency, or the pinned model/provider. */
+/**
+ * The circuit key for a failure: the named dependency, or the pinned
+ * model/provider. v0.1 has no named dependency registry yet, so every
+ * `DEPENDENCY_UNAVAILABLE` without an explicit `dependency` shares the single
+ * global `'dependency'` bucket (a provider/model outage keys by the pinned
+ * model, falling back to `'provider'`).
+ */
 export function dependencyKeyFor(failure: FailureContext): string {
   if (failure.dependency) return failure.dependency;
   if (failure.failureClass === 'DEPENDENCY_UNAVAILABLE') return 'dependency';
