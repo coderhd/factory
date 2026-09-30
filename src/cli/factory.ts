@@ -522,10 +522,10 @@ async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
     const id = args.positionals[2];
     const response = args.positionals.slice(3).join(' ') || flag(args, 'response');
     if (!id || !response) {
-      io.err('usage: factory wo answer <interactionId> <response>');
+      io.err('usage: factory wo answer <interactionId> <response> [--actor <id>]');
       return 1;
     }
-    io.out(JSON.stringify(await client.answerInteraction(id, response)));
+    io.out(JSON.stringify(await client.answerInteraction(id, response, flag(args, 'actor'))));
     return 0;
   }
 
@@ -594,7 +594,7 @@ const HELP = [
   '  wo submit --intent <text> [--url]      create a Work Order (DRAFT)',
   '  wo status <workOrderId> [--url]        read Work Order status',
   '  wo plan <workOrderId> --dag <file>     commit a planner DAG proposal',
-  '  wo answer <interactionId> <response>   answer a QUESTION',
+  '  wo answer <interactionId> <response> [--actor <id>]  answer a QUESTION',
   '  approvals list [--status <state>]      list policy approvals',
   '  approvals answer <approvalId> --decision APPROVAL|DENY --actor <id>  answer an approval',
   '  observatory [--url]                    read Observatory projections',

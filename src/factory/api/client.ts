@@ -49,7 +49,7 @@ export interface FactoryClient {
   applyGate(id: string, decision: GateDecision): Promise<WorkOrder>;
   commitDag(id: string, payload: DAGProposalPayload): Promise<CommitDagResultDto>;
   listInteractions(status?: InteractionDto['status']): Promise<InteractionDto[]>;
-  answerInteraction(id: string, response: string): Promise<AnswerResultDto>;
+  answerInteraction(id: string, response: string, actor?: string): Promise<AnswerResultDto>;
   listApprovals(status?: ApprovalRecord['status']): Promise<ApprovalRecord[]>;
   answerApproval(id: string, answer: ApprovalAnswerRequest): Promise<ApprovalRecord>;
   schedulerStatus(): Promise<SchedulerStatusDto>;
@@ -124,8 +124,11 @@ export function createFactoryClient(options: FactoryClientOptions): FactoryClien
       );
       return interactions;
     },
-    answerInteraction: (id, response) =>
-      request<AnswerResultDto>('POST', `/interactions/${id}/answer`, { response }),
+    answerInteraction: (id, response, actor) =>
+      request<AnswerResultDto>('POST', `/interactions/${id}/answer`, {
+        response,
+        ...(actor ? { actor } : {}),
+      }),
     async listApprovals(status): Promise<ApprovalRecord[]> {
       const query = status === undefined ? '' : `?status=${encodeURIComponent(status)}`;
       const { approvals } = await request<{ approvals: ApprovalRecord[] }>(

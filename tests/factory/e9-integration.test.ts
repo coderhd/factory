@@ -1687,6 +1687,16 @@ describe('E9.5 approval answering — REQUIRE_HUMAN park answerable end-to-end',
       ).rejects.toMatchObject({ code: 'APPROVAL_ACTOR_REQUIRED', status: 400 });
 
       await h.client.answerApproval(parked.id, { decision: 'APPROVAL', actor: 'operator-1' });
+      // The answer is final: a second answer is refused even before the
+      // approval is spent by a consuming decision (no last-writer-wins).
+      await expect(
+        h.client.answerApproval(parked.id, { decision: 'DENY', actor: 'operator-9' }),
+      ).rejects.toMatchObject({ code: 'APPROVAL_SPENT', status: 409 });
+      const stillAnswered = h.store.get<ApprovalRecord>('interactions', parked.id)!;
+      expect(stillAnswered.status).toBe('ANSWERED');
+      expect(stillAnswered.response?.decision).toBe('APPROVAL');
+      expect(stillAnswered.response?.actor).toBe('operator-1');
+
       h.scheduler.tick();
       await h.poll();
       expect(h.store.get<ApprovalRecord>('interactions', parked.id)!.status).toBe('SPENT');
@@ -1695,6 +1705,26 @@ describe('E9.5 approval answering — REQUIRE_HUMAN park answerable end-to-end',
       await expect(
         h.client.answerApproval(parked.id, { decision: 'DENY', actor: 'operator-1' }),
       ).rejects.toMatchObject({ code: 'APPROVAL_SPENT', status: 409 });
+    } finally {
+      h.close();
+    }
+  });
+
+  it('does not list approval ledgers among interactions (`wo answer` discovery)', async () => {
+    const h = humanLoopHarness();
+    try {
+      seedExecutingWorkOrder(h.store, h.events, {
+        constraints: ['policy:repo.write=require_human'],
+      });
+      h.scheduler.tick();
+      await h.poll();
+      expect(approvalsIn(h.store)).toHaveLength(1);
+
+      // The parked approval is discoverable through /approvals only; the
+      // interaction feed stays question-only so a CLI `wo answer` cannot pick an
+      // approval id.
+      expect(await h.client.listApprovals()).toHaveLength(1);
+      expect(await h.client.listInteractions()).toEqual([]);
     } finally {
       h.close();
     }
@@ -1806,6 +1836,47 @@ describe('E9.5 worker answer delivery — WAITING_INPUT resumes and converges', 
         .filter((row) => row.type === 'QUESTION');
       expect(questions).toHaveLength(1);
       expect(h.store.get<Task>('tasks', task.id)!.state).toBe('WAITING_INPUT');
+    } finally {
+      h.close();
+    }
+  });
+
+  it('records the answering operator identity on a QUESTION (defaulting to human)', async () => {
+    const h = humanLoopHarness(waitingWorkerResult('who is this?'));
+    try {
+      const { task } = seedExecutingWorkOrder(h.store, h.events);
+      h.scheduler.tick();
+      await h.poll();
+      h.scheduler.tick();
+      await h.poll();
+      const pendingId = h.store
+        .list<{ id: string; type: string }>('interactions')
+        .find((row) => row.type === 'QUESTION')!.id;
+
+      // An explicit actor is recorded as the durable receipt.
+      const answered = await h.client.answerInteraction(pendingId, 'operator-3 here', 'operator-3');
+      expect(answered.interaction.answeredBy).toBe('operator-3');
+      expect(answered.interaction.response).toBe('operator-3 here');
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('RUNNING');
+    } finally {
+      h.close();
+    }
+  });
+
+  it('defaults a QUESTION answer identity to "human" when no actor is given', async () => {
+    const h = humanLoopHarness(waitingWorkerResult('anon?'));
+    try {
+      seedExecutingWorkOrder(h.store, h.events);
+      h.scheduler.tick();
+      await h.poll();
+      h.scheduler.tick();
+      await h.poll();
+      const pendingId = h.store
+        .list<{ id: string; type: string }>('interactions')
+        .find((row) => row.type === 'QUESTION')!.id;
+
+      const answered = await h.client.answerInteraction(pendingId, 'no actor given');
+      expect(answered.interaction.answeredBy).toBe('human');
     } finally {
       h.close();
     }

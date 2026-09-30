@@ -44,7 +44,8 @@ export interface InteractionDto {
   createdAt: string;
   updatedAt: string;
   answeredAt?: string;
-  answeredBy?: 'human';
+  /** The answering operator identity; `'human'` when none was supplied. */
+  answeredBy?: string;
 }
 
 export interface WorkOrderSnapshotDto {

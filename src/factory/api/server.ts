@@ -131,6 +131,7 @@ async function answerInteraction(
   deps: FactoryServerDeps,
   interactionId: string,
   response: string,
+  actor?: string,
 ): Promise<AnswerResultDto> {
   const now = deps.now?.() ?? new Date().toISOString();
   const record = deps.store.get<InteractionDto>('interactions', interactionId);
@@ -159,7 +160,8 @@ async function answerInteraction(
     status: 'ANSWERED',
     response,
     answeredAt: now,
-    answeredBy: 'human',
+    // The operator identity when supplied; `'human'` is the historical default.
+    answeredBy: actor ?? 'human',
     updatedAt: now,
   };
   let updatedTask = task;
@@ -199,12 +201,24 @@ async function answerInteraction(
  * receipt are E7's (`answerApproval`); this route is only the server-side entry
  * point that keeps the server the sole mutation authority. An `APPROVAL` is
  * consumed (spent) by the *next* matching policy decision, not here.
+ *
+ * An answer is final: once `ANSWERED` (or `SPENT`) it may not be re-answered —
+ * otherwise a second answer would silently overwrite the first (last-writer-
+ * wins), letting a later `DENY` supersede a recorded `APPROVAL` or vice versa.
+ * A correction therefore requires a new approval park.
  */
 function answerApprovalRoute(
   deps: FactoryServerDeps,
   approvalId: string,
   body: ApprovalAnswerRequest,
 ): ApprovalRecord {
+  const existing = deps.store.get<ApprovalRecord>('interactions', approvalId);
+  if (existing && existing.type === 'APPROVAL' && existing.status !== 'PENDING') {
+    throw new FactoryError(
+      'APPROVAL_SPENT',
+      `approval ${approvalId} is already ${existing.status}; a correction requires a new approval`,
+    );
+  }
   const now = deps.now ?? (() => new Date().toISOString());
   return answerApproval(
     { store: deps.store, events: deps.events, now },
@@ -374,16 +388,21 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
         const status = url.searchParams.get('status');
         const interactions = deps.store
           .list<InteractionDto>('interactions')
+          // Question-only: the `interactions` collection also holds E7 approval
+          // ledgers, which are answered through `/approvals`. Mixing them would
+          // let a CLI `wo answer` pick up an approval id.
+          .filter((interaction) => interaction.type === 'QUESTION')
           .filter((interaction) => status === null || interaction.status === status);
         return json({ interactions });
       }
       if (method === 'POST' && id !== undefined && action === 'answer') {
-        const body = await readJson<{ response?: unknown }>(request);
+        const body = await readJson<{ response?: unknown; actor?: unknown }>(request);
         const response = typeof body?.response === 'string' ? body.response : null;
         if (response === null || response.trim().length === 0) {
           return apiError('INVALID_REQUEST', 'response is required', 400);
         }
-        return json(await answerInteraction(deps, id, response));
+        const actor = typeof body?.actor === 'string' ? body.actor.trim() : undefined;
+        return json(await answerInteraction(deps, id, response, actor || undefined));
       }
     }
 
