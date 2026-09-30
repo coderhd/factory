@@ -34,6 +34,7 @@ import {
 import {
   createE5Verifier,
   type SemanticJudge,
+  type WorkVerifier,
 } from '../../src/factory/verification/orchestrator';
 import { commitDAG, listDAGVersions } from '../../src/factory/planning/dag';
 import { createEvidenceReadPort, projectObservatory } from '../../src/factory/observatory/observatory';
@@ -910,46 +911,72 @@ function verificationHarness(options: {
   }>;
   judgeModel: string;
   falsified?: string[];
+  /**
+   * Optional controlled mode: defer each Task's settlement until the test calls
+   * `settle(taskId)`, and route Tasks whose id is in `failTasks` through a
+   * failing check. The Set is read at verify time, so the test can populate it
+   * after seeding tasks. Used to observe multi-Task interleaving across ticks.
+   */
+  controlled?: { failTasks?: Set<string> };
 }) {
   const store = openStateStore(join(workDir, `verify-${crypto.randomUUID()}.db`));
   const events = openEventLog(store.db);
-  const engine = createVerificationEngine();
-  for (const provider of options.providers) {
-    engine.registerCheck({
-      id: provider.id,
-      category: provider.category,
-      kind: provider.kind as never,
-      run: () =>
-        provider.passed
-          ? { passed: true, evidence: { summary: `${provider.id} ok` } }
-          : {
-              passed: false,
-              evidence: { summary: `${provider.id} failed` },
-              diagnosis: provider.diagnosis ?? `${provider.id} failed`,
-              action: `fix ${provider.id}`,
-            },
+  const buildVerifier = (forceFail: boolean) => {
+    const engine = createVerificationEngine();
+    for (const provider of options.providers) {
+      engine.registerCheck({
+        id: provider.id,
+        category: provider.category,
+        kind: provider.kind as never,
+        run: () =>
+          provider.passed && !forceFail
+            ? { passed: true, evidence: { summary: `${provider.id} ok` } }
+            : {
+                passed: false,
+                evidence: { summary: `${provider.id} failed` },
+                diagnosis: provider.diagnosis ?? `${provider.id} failed`,
+                action: `fix ${provider.id}`,
+              },
+      });
+    }
+    const judge: SemanticJudge = {
+      identity: { provider: 'judge-co', model: options.judgeModel, family: 'judge-family' },
+      falsify: (context) =>
+        context.criteria.map((criterion) => ({
+          criterion,
+          falsified: (options.falsified ?? []).includes(criterion),
+          evidence: { summary: `judge reviewed "${criterion}"` },
+          diagnosis: `judge falsified "${criterion}"`,
+          action: `address "${criterion}"`,
+        })),
+    };
+    return createE5Verifier({
+      store,
+      engine,
+      judge,
+      prompt: { id: 'e9-verify', version: '1' },
+      rubric: ['Does the change set satisfy the criterion as written?'],
+      provider: 'factory',
+      now: () => '2026-09-30T12:00:00.000Z',
     });
-  }
-  const judge: SemanticJudge = {
-    identity: { provider: 'judge-co', model: options.judgeModel, family: 'judge-family' },
-    falsify: (context) =>
-      context.criteria.map((criterion) => ({
-        criterion,
-        falsified: (options.falsified ?? []).includes(criterion),
-        evidence: { summary: `judge reviewed "${criterion}"` },
-        diagnosis: `judge falsified "${criterion}"`,
-        action: `address "${criterion}"`,
-      })),
   };
-  const verifier = createE5Verifier({
-    store,
-    engine,
-    judge,
-    prompt: { id: 'e9-verify', version: '1' },
-    rubric: ['Does the change set satisfy the criterion as written?'],
-    provider: 'factory',
-    now: () => '2026-09-30T12:00:00.000Z',
-  });
+  const passing = buildVerifier(false);
+  const failing = buildVerifier(true);
+
+  const settleFns = new Map<string, () => void>();
+  const settle = (taskId: string): void => settleFns.get(taskId)?.();
+  const verifier: WorkVerifier = options.controlled
+    ? {
+        verify: (subject) =>
+          new Promise((resolve) => {
+            const real = options.controlled!.failTasks?.has(subject.task.id) ? failing : passing;
+            settleFns.set(subject.task.id, () => {
+              void real.verify(subject).then(resolve);
+            });
+          }),
+      }
+    : passing;
+
   const workers = createWorkerManager({ store, events, spawn: () => new FakeHerdr() });
   const worktrees = createWorktreeManager({ rootDir: join(workDir, 'wt'), baseBranch: 'main' });
   const scheduler = createScheduler({
@@ -961,7 +988,7 @@ function verificationHarness(options: {
     policy: { canAssign: () => 'ALLOW' },
     verifier,
   });
-  return { store, events, scheduler, close: () => store.close() };
+  return { store, events, scheduler, verifier, settle, close: () => store.close() };
 }
 
 /** Drive a seeded Task through the real §5.2 edges to SUCCESS, with an Attempt. */
@@ -989,6 +1016,30 @@ async function verifyTick(scheduler: ReturnType<typeof createScheduler>): Promis
   scheduler.tick();
   await new Promise((resolve) => setTimeout(resolve, 0));
   scheduler.tick();
+}
+
+/** Seed a two-node Work Order (a, b) in EXECUTING and return its Tasks. */
+function seedTwoTaskWorkOrder(
+  store: ReturnType<typeof openStateStore>,
+  events: ReturnType<typeof openEventLog>,
+): { wo: WorkOrder; tasks: Task[] } {
+  const deps = { store, events };
+  const wo = createWorkOrder(deps, {
+    intent: 'E9.4 two-task subject',
+    acceptanceCriteria: ['accepted'],
+  });
+  for (const to of ['READY', 'PLANNING'] as const) {
+    transitionWorkOrder(deps, wo.id, { to });
+  }
+  const dag = commitDAG(deps, wo.id, {
+    nodes: [
+      { nodeId: 'a', title: 'A' },
+      { nodeId: 'b', title: 'B' },
+    ],
+  });
+  transitionWorkOrder(deps, wo.id, { to: 'EXECUTING' });
+  const tasks = dag.nodes.map((node) => store.get<Task>('tasks', node.taskId)!);
+  return { wo, tasks };
 }
 
 describe('E9.4 verification + evidence orchestration', () => {
@@ -1026,6 +1077,20 @@ describe('E9.4 verification + evidence orchestration', () => {
       // the receipt the scheduler already persisted (idempotent re-read).
       const snapshot = structuredClone(bundle);
       expect(h.store.get<EvidenceBundle>('evidence_bundles', bundle.id)).toEqual(snapshot);
+
+      // The assembled receipt is deep-frozen: it cannot be rewritten after
+      // production, so a promotion gate can trust what it reads.
+      const produced = await h.verifier.verify({
+        workOrder: h.store.get<WorkOrder>('work_orders', wo.id)!,
+        task: h.store.get<Task>('tasks', task.id)!,
+        attempt: h.store
+          .list<Attempt>('attempts')
+          .find((candidate) => candidate.taskId === task.id)!,
+      });
+      expect(produced.bundle).not.toBeNull();
+      expect(() => {
+        (produced.bundle as unknown as { complete: boolean }).complete = false;
+      }).toThrow();
 
       // Verification drives the Work Order lifecycle to the human gate, and the
       // Task to VERIFIED.
@@ -1190,6 +1255,205 @@ describe('E9.4 verification + evidence orchestration', () => {
     } finally {
       console.error = originalError;
       store.close();
+    }
+  });
+
+  it('rejects a qualified provider/model writer that is the same model as the judge', async () => {
+    const h = verificationHarness({
+      providers: [{ id: 'typecheck', category: 'deterministic', kind: 'typecheck', passed: true }],
+      // Judge identity is {provider:'judge-co', model:'judge-1'}; the writing
+      // Attempt records the qualified form. A raw string comparison would miss
+      // the match and let the same model sign off its own work.
+      judgeModel: 'judge-1',
+    });
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events);
+      driveTaskToSuccess(h.store, h.events, task.id, 'judge-co/judge-1');
+
+      await verifyTick(h.scheduler);
+
+      expect(h.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      expect(h.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('REWORK');
+      const rejection = h.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .find((event) => event.type === 'verification.rejected');
+      expect((rejection!.payload as { diagnosis: string }).diagnosis).toMatch(
+        /same-model self-sign-off/i,
+      );
+    } finally {
+      h.close();
+    }
+  });
+
+  it('rejects a bare writer that is the same model as a qualified judge identity', async () => {
+    const h = verificationHarness({
+      providers: [{ id: 'typecheck', category: 'deterministic', kind: 'typecheck', passed: true }],
+      // Judge identity records the qualified form; the writer records the bare
+      // model. The same underlying model must still be refused.
+      judgeModel: 'judge-co/judge-1',
+    });
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events);
+      driveTaskToSuccess(h.store, h.events, task.id, 'judge-1');
+
+      await verifyTick(h.scheduler);
+
+      expect(h.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      expect(h.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      const rejection = h.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .find((event) => event.type === 'verification.rejected');
+      expect((rejection!.payload as { diagnosis: string }).diagnosis).toMatch(
+        /same-model self-sign-off/i,
+      );
+    } finally {
+      h.close();
+    }
+  });
+
+  it('diagnoses a gate shortfall (no checks executed) instead of REWORK with no failures', async () => {
+    const h = verificationHarness({ providers: [], judgeModel: 'judge-1' });
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events);
+      driveTaskToSuccess(h.store, h.events, task.id, 'writer-xl');
+
+      await verifyTick(h.scheduler);
+
+      // No providers → every criterion unmapped: fail closed, but the REWORK
+      // must carry a structured diagnosis, not an empty failure list.
+      expect(h.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      expect(h.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      const failure = h.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .find((event) => event.type === 'verification.failed');
+      const record = (failure!.payload as { failures: FailureRecord[] }).failures[0]!;
+      expect(record.verifier).toBe('verification-gate');
+      // The AC has semantic proof but no deterministic/behavioral proof: the gap
+      // is the unmet run gate, not a specific criterion.
+      expect(record.criterion).toBeNull();
+      expect(record.evidence.summary.length).toBeGreaterThan(0);
+      expect(record.diagnosis.length).toBeGreaterThan(0);
+      expect(record.action.length).toBeGreaterThan(0);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('turns a synchronous verifier throw into a rejection (REWORK), not a crash or a strand', () => {
+    const store = openStateStore(join(workDir, `sync-throw-${crypto.randomUUID()}.db`));
+    const events = openEventLog(store.db);
+    try {
+      const throwing: WorkVerifier = {
+        verify: (() => {
+          throw new Error('verifier exploded synchronously');
+        }) as WorkVerifier['verify'],
+      };
+      const workers = createWorkerManager({ store, events, spawn: () => new FakeHerdr() });
+      const worktrees = createWorktreeManager({ rootDir: join(workDir, 'wt'), baseBranch: 'main' });
+      const scheduler = createScheduler({
+        store,
+        events,
+        workers,
+        worktrees,
+        repoPath,
+        policy: { canAssign: () => 'ALLOW' },
+        verifier: throwing,
+      });
+      const { wo, task } = seedExecutingWorkOrder(store, events);
+      driveTaskToSuccess(store, events, task.id, 'writer-xl');
+
+      expect(() => scheduler.tick()).not.toThrow();
+      // The throw settled as a rejection routed on the next tick.
+      scheduler.tick();
+
+      expect(store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      expect(store.get<Task>('tasks', task.id)!.state).toBe('REWORK');
+      const rejection = events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .find((event) => event.type === 'verification.rejected');
+      expect((rejection!.payload as { diagnosis: string }).diagnosis).toBe(
+        'verifier exploded synchronously',
+      );
+    } finally {
+      store.close();
+    }
+  });
+
+  it('does not gate a multi-Task Work Order until every Task is VERIFIED', async () => {
+    const h = verificationHarness({
+      providers: [
+        { id: 'typecheck', category: 'deterministic', kind: 'typecheck', passed: true },
+        { id: 'playwright', category: 'behavioral', kind: 'playwright', passed: true },
+      ],
+      judgeModel: 'judge-1',
+      controlled: {},
+    });
+    try {
+      const { wo, tasks } = seedTwoTaskWorkOrder(h.store, h.events);
+      const [taskA, taskB] = tasks as [Task, Task];
+      driveTaskToSuccess(h.store, h.events, taskA.id, 'writer-a');
+      driveTaskToSuccess(h.store, h.events, taskB.id, 'writer-b');
+
+      // Tick 1 kicks both verifications into flight.
+      h.scheduler.tick();
+
+      // A settles first; B is still pending. The order must not gate with an
+      // unverified sibling Task outstanding.
+      h.settle(taskA.id);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      h.scheduler.tick();
+      expect(h.store.get<Task>('tasks', taskA.id)!.state).toBe('VERIFIED');
+      expect(h.store.get<Task>('tasks', taskB.id)!.state).toBe('SUCCESS');
+      expect(h.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('EXECUTING');
+
+      // B settles: now every active Task is VERIFIED and the order gates.
+      h.settle(taskB.id);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      h.scheduler.tick();
+      expect(h.store.get<Task>('tasks', taskB.id)!.state).toBe('VERIFIED');
+      expect(h.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('HUMAN_GATE');
+      expect(h.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(2);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('never gates a multi-Task Work Order when one Task fails verification', async () => {
+    const failTasks = new Set<string>();
+    const h = verificationHarness({
+      providers: [
+        { id: 'typecheck', category: 'deterministic', kind: 'typecheck', passed: true },
+        { id: 'playwright', category: 'behavioral', kind: 'playwright', passed: true },
+      ],
+      judgeModel: 'judge-1',
+      controlled: { failTasks },
+    });
+    try {
+      const { wo, tasks } = seedTwoTaskWorkOrder(h.store, h.events);
+      const [taskA, taskB] = tasks as [Task, Task];
+      driveTaskToSuccess(h.store, h.events, taskA.id, 'writer-a');
+      driveTaskToSuccess(h.store, h.events, taskB.id, 'writer-b');
+      failTasks.add(taskB.id);
+
+      h.scheduler.tick();
+      // One pass, one fail, settling in the same batch order (A then B).
+      h.settle(taskA.id);
+      h.settle(taskB.id);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      h.scheduler.tick();
+
+      // A verified but B failed: the Work Order must never have gated.
+      expect(h.store.get<Task>('tasks', taskA.id)!.state).toBe('VERIFIED');
+      expect(h.store.get<Task>('tasks', taskB.id)!.state).toBe('REWORK');
+      expect(h.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      const states = h.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .filter((event) => event.type === 'work_order.transitioned')
+        .map((event) => (event.payload as { workOrder: WorkOrder }).workOrder.state);
+      expect(states).not.toContain('HUMAN_GATE');
+    } finally {
+      h.close();
     }
   });
 });

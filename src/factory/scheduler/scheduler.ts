@@ -714,22 +714,29 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     for (const subject of subjects) {
       if (verifyPending.has(subject.task.id)) continue;
       verifyPending.add(subject.task.id);
-      const verifier = deps.verifier;
-      void verifier
-        .verify(subject)
-        .then(
+      const reject = (error: unknown): void => {
+        verificationCompletions.push({
+          subject: keyOf(subject),
+          outcome: {
+            bundle: null,
+            passed: false,
+            failures: [],
+            rejection: error instanceof Error ? error.message : String(error),
+          },
+        });
+      };
+      try {
+        // A custom verifier may be synchronous or throw before returning a
+        // promise. Both must settle as a rejection routed to REWORK — a raw
+        // throw here would escape `tick()` and strand the Task in `verifyPending`.
+        const verifier = deps.verifier;
+        Promise.resolve(verifier.verify(subject)).then(
           (outcome) => verificationCompletions.push({ subject: keyOf(subject), outcome }),
-          (error: unknown) =>
-            verificationCompletions.push({
-              subject: keyOf(subject),
-              outcome: {
-                bundle: null,
-                passed: false,
-                failures: [],
-                rejection: error instanceof Error ? error.message : String(error),
-              },
-            }),
+          reject,
         );
+      } catch (error) {
+        reject(error);
+      }
     }
   }
 

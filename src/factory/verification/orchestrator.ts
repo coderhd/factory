@@ -7,6 +7,7 @@ import {
   type CheckProvider,
   type FailureRecord,
   type VerificationEngine,
+  type VerificationRun,
 } from './engine';
 import {
   createSemanticVerifier,
@@ -107,6 +108,83 @@ function toFailure(record: SemanticFailure): FailureRecord {
 }
 
 /**
+ * Dress the raw `Attempt.model` as a {@link ModelIdentity}. A `ModelId` is
+ * opaque and may be recorded as either a bare model name (`judge-1`) or a full
+ * `provider/model` key (`judge-co/judge-1`). The semantic tier's Writer ≠
+ * Verifier check compares `model` strings, so a verbatim `provider/model` would
+ * slip a same-model sign-off through (the writer's model never equals the
+ * judge's bare model). Splitting the qualified form makes the comparison match
+ * the judge identity — and keeps the bundle's `modelKey` cross-check consistent.
+ */
+function generatorIdentity(attemptModel: string, fallbackProvider: string): ModelIdentity {
+  const slash = attemptModel.indexOf('/');
+  if (slash > 0 && slash < attemptModel.length - 1) {
+    return { provider: attemptModel.slice(0, slash), model: attemptModel.slice(slash + 1) };
+  }
+  return { provider: fallbackProvider, model: attemptModel };
+}
+
+/**
+ * A structured failure for a bundle that is not `complete` yet recorded no
+ * check failure — a zero-provider run (every criterion `unmapped`), a YELLOW/
+ * RED Work Order lacking behavioral proof, a RED Work Order without a security
+ * check, or an empty criterion set. Without this the REWORK would carry an
+ * empty failure list and no diagnosis. Fail closed, but explain why.
+ */
+function gateShortfall(
+  workOrder: WorkOrder,
+  bundle: EvidenceBundle,
+  run: VerificationRun,
+): FailureRecord | null {
+  const requiresBehavioral = workOrder.riskTier === 'YELLOW' || workOrder.riskTier === 'RED';
+  const hasSecurityCheck =
+    run.deterministic.checks.some((check) => check.kind === 'security') ||
+    run.behavioral.checks.some((check) => check.kind === 'security');
+  if (workOrder.riskTier === 'RED' && !hasSecurityCheck) {
+    return {
+      category: 'deterministic',
+      criterion: null,
+      verifier: 'verification-gate',
+      evidence: { summary: 'no security-kind check for a RED Work Order' },
+      diagnosis: 'RED Work Orders require at least one security-kind check',
+      action: 'register a security check (e.g. security) and re-run verification',
+    };
+  }
+  if (bundle.gates.run && bundle.gates.semantic) {
+    if (requiresBehavioral && !bundle.gates.behavioral) {
+      return {
+        category: 'behavioral',
+        criterion: null,
+        verifier: 'verification-gate',
+        evidence: { summary: `no behavioral proof for a ${workOrder.riskTier} Work Order` },
+        diagnosis: `${workOrder.riskTier} Work Orders require behavioral verification evidence`,
+        action: 'add a behavioral check (e.g. playwright, api, e2e) and re-run verification',
+      };
+    }
+    return null;
+  }
+  // No check failure but the run or semantic gate fell short (e.g. no providers,
+  // an empty criterion set, or a vacuous tier).
+  const uncovered = bundle.criteria.filter((criterion) => criterion.status !== 'pass');
+  return {
+    category: 'deterministic',
+    criterion: uncovered[0]?.criterion ?? null,
+    verifier: 'verification-gate',
+    evidence: {
+      summary:
+        uncovered.length > 0
+          ? `criteria not covered by passing proof: ${uncovered.map((c) => c.criterion).join(', ')}`
+          : 'no acceptance criterion was verified',
+    },
+    diagnosis:
+      uncovered.length > 0
+        ? 'every acceptance criterion must map to passing proof before the bundle is complete'
+        : 'the Work Order has no acceptance criterion verified by a check with usable evidence',
+    action: 'register checks, map each acceptance criterion to them, and re-run verification',
+  };
+}
+
+/**
  * Build the live E5-backed verifier. Each task execution gets a fresh semantic
  * verifier bound to that Attempt's model, so writer ≠ verifier is checked
  * against the identity that actually wrote the change.
@@ -130,6 +208,15 @@ export function createE5Verifier(options: E5VerifierOptions): WorkVerifier {
 
     const changeSet = changeSetFromAttempt(attempt);
     const criteria = [...workOrder.acceptanceCriteria];
+    const writer = generatorIdentity(attempt.model, provider);
+    // Normalize the judge's identity the same way, so a qualified judge model
+    // (`provider/model`) cannot collide with, or dodge, the writer comparison.
+    const judgeModel = generatorIdentity(judge.identity.model, judge.identity.provider);
+    const verifierIdentity: ModelIdentity = {
+      ...judge.identity,
+      provider: judgeModel.provider,
+      model: judgeModel.model,
+    };
 
     try {
       const run = await engine.verify(changeSet, {
@@ -137,8 +224,12 @@ export function createE5Verifier(options: E5VerifierOptions): WorkVerifier {
         criterionChecks: defaultCriterionChecks(engine, criteria),
       });
 
-      const generator: ModelIdentity = { provider, model: attempt.model };
-      const semanticVerifier = createSemanticVerifier({ judge, generator, prompt, rubric });
+      const semanticVerifier = createSemanticVerifier({
+        judge: { ...judge, identity: verifierIdentity },
+        generator: writer,
+        prompt,
+        rubric,
+      });
       const semantic = await semanticVerifier.verify({
         workOrder,
         changeSet,
@@ -160,12 +251,16 @@ export function createE5Verifier(options: E5VerifierOptions): WorkVerifier {
         now: now(),
       });
 
-      return {
-        bundle,
-        passed: bundle.complete,
-        failures: [...run.failures, ...semantic.failures.map(toFailure)],
-        rejection: null,
-      };
+      const failures: FailureRecord[] = [...run.failures, ...semantic.failures.map(toFailure)];
+      // A bundle can fall short of `complete` without any check failing (no
+      // providers, a YELLOW/RED Work Order lacking behavioral proof, an empty
+      // criterion set). REWORK must still carry a structured diagnosis.
+      if (!bundle.complete && failures.length === 0) {
+        const shortfall = gateShortfall(workOrder, bundle, run);
+        if (shortfall) failures.push(shortfall);
+      }
+
+      return { bundle, passed: bundle.complete, failures, rejection: null };
     } catch (error) {
       if (!(error instanceof VerificationConfigurationError)) throw error;
       // A same-model self-sign-off, an unmapped criterion or a mis-attributed
@@ -175,7 +270,7 @@ export function createE5Verifier(options: E5VerifierOptions): WorkVerifier {
         bundle: null,
         passed: false,
         failures: [],
-        rejection: `verification refused for "${task.id}": writer "${provider}/${attempt.model}" vs verifier "${modelKey(judge.identity)}" — ${error.message}`,
+        rejection: `verification refused for "${task.id}": writer "${modelKey(writer)}" vs verifier "${modelKey(verifierIdentity)}" — ${error.message}`,
       };
     }
   }
