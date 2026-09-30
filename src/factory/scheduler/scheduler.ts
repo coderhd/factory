@@ -1,6 +1,11 @@
 import { completeAttempt, transitionTask, type Task, type WorkOrder } from '../domain/workOrder';
 import type { EventLog } from '../events/log';
 import { getActiveDAG, type DAGVersion } from '../planning/dag';
+import { RESOURCE_UNAVAILABLE } from '../recovery/recovery';
+import { routeAssignment } from '../routing/assignment';
+import type { BudgetState, ModelId } from '../routing/decisionModel';
+import { persistRoutingDecision } from '../routing/persist';
+import { RoutingBlockedError, toRoutingDecisionRecord } from '../routing/rules';
 import type { ArtifactStore, StateStore } from '../state/store';
 import type { WorkerInteraction, WorkerResult } from '../workers/herdr';
 import {
@@ -52,6 +57,18 @@ export interface SchedulerDeps {
   artifacts?: ArtifactStore;
   /** Lease TTL for `startTask` heartbeats; defaults to `idleTimeoutMs`. */
   leaseTtlMs?: number;
+  /**
+   * E4 routing gates the assignment pass routes with (E9.3): the budget
+   * snapshot and the unavailable model set. Both default to "no signal"
+   * (`FULL_BUDGET`, none unavailable), which routes purely on capability.
+   */
+  routing?: SchedulerRouting;
+}
+
+/** E4 routing signals for the assignment pass (RE7(b)). */
+export interface SchedulerRouting {
+  budget?: BudgetState;
+  unavailable?: ModelId[];
 }
 
 export interface SchedulerStatus {
@@ -66,6 +83,8 @@ export interface SchedulerStatus {
     readyTaskIds: string[];
     blocked: Array<{ taskId: string; waitingOnTaskIds: string[] }>;
     blockedPolicy: Array<{ taskId: string; verdict: PolicyVerdict }>;
+    /** E9.3: READY tasks a blocked route refused to assign (no model available). */
+    blockedRouting: Array<{ taskId: string; candidates: ModelId[]; unavailable: ModelId[] }>;
   };
   activeDAGs: Array<{ workOrderId: string; version: number; nodes: number }>;
 }
@@ -171,6 +190,19 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
    * consume-once; a genuinely new run settles a fresh object and is routed.
    */
   const routedReports = new Map<string, WorkerResult>();
+  /**
+   * E9.3: READY tasks a blocked route refused this tick, rendered by `status()`.
+   * Recomputed each assign pass; a blocked Task stays READY and is retried next
+   * tick (a model may become available again).
+   */
+  let blockedRouting: Array<{ taskId: string; candidates: ModelId[]; unavailable: ModelId[] }> = [];
+  /**
+   * Per-Task signature of the last blocked route, so a Task parked on a blocked
+   * pool records its `resource.unavailable` event once rather than once per
+   * tick. A changed blocked set (a model returning, budget shifting) records a
+   * fresh event; the Task stays READY throughout and is retried every tick.
+   */
+  const blockedSignatures = new Map<string, string>();
   let timer: ReturnType<typeof setInterval> | null = null;
   /** One-time guard so a missing `repoPath` warns loudly but only once. */
   let warnedMissingRepoPath = false;
@@ -473,7 +505,57 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     })();
   }
 
+  /** Signature of a blocked route: the unavailable set that closed the pool. */
+  function blockedSignature(error: RoutingBlockedError): string {
+    return error.unavailable.join(',');
+  }
+
+  /**
+   * Route one candidate's assignment through E4 (E9.3, RE7(b)) and persist the
+   * decision's provenance. Returns the selected model, or `null` when the route
+   * is blocked — in which case no Attempt is created, the Task stays READY, and
+   * E4's `RoutingBlockedError` is mapped to E7's `resource.unavailable` park
+   * event bound to the Work Order (RE7(c)). Never substitutes a blocked model.
+   */
+  function routeForAssignment(candidate: { task: Task; workOrder: WorkOrder }): string | null {
+    try {
+      const { decision, derivedFrom } = routeAssignment({
+        workOrder: candidate.workOrder,
+        ...(deps.routing?.budget ? { budget: deps.routing.budget } : {}),
+        ...(deps.routing?.unavailable ? { unavailable: deps.routing.unavailable } : {}),
+      });
+      const record = toRoutingDecisionRecord(decision, {
+        workOrderId: candidate.workOrder.id,
+        taskId: candidate.task.id,
+        derivedFrom,
+      });
+      persistRoutingDecision({ store: deps.store, events: deps.events }, record);
+      return decision.selected;
+    } catch (error) {
+      if (!(error instanceof RoutingBlockedError)) throw error;
+      // Whole pool blocked: park on WAITING_RESOURCE semantics without a
+      // lifecycle change — Task stays READY, no Attempt, durable park event.
+      if (blockedSignatures.get(candidate.task.id) !== blockedSignature(error)) {
+        blockedSignatures.set(candidate.task.id, blockedSignature(error));
+        const at = now();
+        deps.events.appendEvent({
+          type: RESOURCE_UNAVAILABLE,
+          aggregateType: 'work_order',
+          aggregateId: candidate.workOrder.id,
+          payload: { resource: 'model', candidates: error.candidates, unavailable: error.unavailable, at },
+        });
+      }
+      blockedRouting.push({
+        taskId: candidate.task.id,
+        candidates: error.candidates,
+        unavailable: error.unavailable,
+      });
+      return null;
+    }
+  }
+
   function assignPass(): void {
+    blockedRouting = [];
     let slots = cfg.maxConcurrentTasks - countOccupied();
     const skipped = new Set<string>();
 
@@ -498,6 +580,14 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         continue;
       }
 
+      // Route before committing anything: a blocked route must not burn the
+      // worker, a concurrency slot, or a worktree (RE7(b)/(c)).
+      const model = routeForAssignment(candidate);
+      if (model === null) {
+        skipped.add(candidate.task.id);
+        continue;
+      }
+
       let assignment: AssignmentRecord | null = null;
       try {
         const worktree = deps.worktrees.createTaskWorktree(
@@ -507,7 +597,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         );
         assignment = assign(
           { store: deps.store, events: deps.events, now },
-          { taskId: candidate.task.id, workerId: idleWorker.id, worktree },
+          { taskId: candidate.task.id, workerId: idleWorker.id, worktree, model },
         );
         startTask({ ...deps, leaseTtlMs }, assignment);
         pollWorker(idleWorker.id);
@@ -586,7 +676,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         min: cfg.provisioning.min,
         max: cfg.provisioning.max,
       },
-      queue: { readyTaskIds, blocked, blockedPolicy },
+      queue: { readyTaskIds, blocked, blockedPolicy, blockedRouting },
       activeDAGs: scopeList.map((scope) => ({
         workOrderId: scope.workOrder.id,
         version: scope.dag.version,

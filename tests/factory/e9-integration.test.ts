@@ -17,6 +17,7 @@ import {
 import {
   createWorkOrder,
   transitionWorkOrder,
+  type Attempt,
   type Task,
   type TaskDependency,
   type WorkOrder,
@@ -25,7 +26,10 @@ import { openEventLog } from '../../src/factory/events/log';
 import { commitDAG, listDAGVersions } from '../../src/factory/planning/dag';
 import { createEvidenceReadPort, projectObservatory } from '../../src/factory/observatory/observatory';
 import { check } from '../../src/factory/policy/policy';
-import { createScheduler } from '../../src/factory/scheduler/scheduler';
+import { CAPABILITY_POOL } from '../../src/factory/routing/rules';
+import type { BudgetState, RoutingDecisionRecord } from '../../src/factory/routing/decisionModel';
+import { RESOURCE_UNAVAILABLE } from '../../src/factory/recovery/recovery';
+import { createScheduler, type SchedulerRouting } from '../../src/factory/scheduler/scheduler';
 import { openStateStore } from '../../src/factory/state/store';
 import {
   type ExecutionEnvelope,
@@ -626,6 +630,250 @@ describe('E9.2 DAG-commit CLI surface', () => {
       expect(h.store.list<Task>('tasks')).toHaveLength(2);
     } finally {
       h.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E9.3 (#29) — routing decision wired into assignment (Ruling RE7)
+// ---------------------------------------------------------------------------
+
+/**
+ * A scheduler harness on real deps (temp store, fake Herdr, real worktree
+ * manager) that lets a case inject the E4 routing gates (budget/unavailable)
+ * and an ALLOW policy, so the routing path is exercised without E7 in the way.
+ */
+function routingHarness(routing?: SchedulerRouting) {
+  const store = openStateStore(join(workDir, `routing-${crypto.randomUUID()}.db`));
+  const events = openEventLog(store.db);
+  const adapters: FakeHerdr[] = [];
+  const workers = createWorkerManager({ store, events, spawn: makeSpawn(adapters) });
+  const worktrees = createWorktreeManager({ rootDir: join(workDir, 'wt'), baseBranch: 'main' });
+  const scheduler = createScheduler({
+    store,
+    events,
+    workers,
+    worktrees,
+    repoPath,
+    policy: { canAssign: () => 'ALLOW' },
+    ...(routing ? { routing } : {}),
+  });
+  return { store, events, adapters, scheduler, close: () => store.close() };
+}
+
+describe('E9.3 routing → assignment', () => {
+  it('records the routed model on the Attempt and a routing_decisions provenance row', async () => {
+    const h = routingHarness();
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events);
+
+      h.scheduler.tick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('RUNNING');
+
+      const attempts = h.store.list<Attempt>('attempts').filter((a) => a.taskId === task.id);
+      expect(attempts).toHaveLength(1);
+      // Defaults (RE7(a)): task=implementation, complexity=normal, context=small,
+      // risk medium (YELLOW) -> implementer, the first candidate.
+      expect(attempts[0]!.model).toBe('implementer');
+
+      const decisions = h.store.list<RoutingDecisionRecord>('routing_decisions');
+      expect(decisions).toHaveLength(1);
+      const decision = decisions[0]!;
+      expect(decision.taskId).toBe(task.id);
+      expect(decision.workOrderId).toBe(wo.id);
+      expect(decision.source).toBe('rules');
+      expect(decision.selected).toBe('implementer');
+      expect(decision.task).toBe('implementation');
+      expect(decision.complexity).toBe('normal');
+      expect(decision.risk).toBe('medium');
+      expect(decision.context).toBe('small');
+      expect(decision.candidates).toContain('implementer');
+      // RE7(a): the derivation provenance records that these came from defaults.
+      expect(decision.derivedFrom).toEqual({
+        task: 'default',
+        complexity: 'default',
+        context: 'default',
+      });
+
+      // The durable event carries the same record (provenance, not just a row).
+      const recorded = h.events
+        .readEvents()
+        .filter((event) => event.type === 'routing.decision_recorded');
+      expect(recorded).toHaveLength(1);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('derives RouteInput from Work Order constraints and records the derivation in metadata', () => {
+    const h = routingHarness();
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events, {
+        constraints: ['route-task:code-review', 'route-complexity:complex', 'route-context:large'],
+      });
+      // A GREEN Work Order maps to low risk (RE7(a)); read the durable row so the
+      // EXECUTING state is preserved.
+      const executing = h.store.get<WorkOrder>('work_orders', wo.id)!;
+      h.store.set('work_orders', wo.id, { ...executing, riskTier: 'GREEN' });
+
+      h.scheduler.tick();
+
+      const decision = h.store.list<RoutingDecisionRecord>('routing_decisions')[0]!;
+      expect(decision.taskId).toBe(task.id);
+      expect(decision.task).toBe('code-review');
+      expect(decision.complexity).toBe('complex');
+      expect(decision.risk).toBe('low');
+      expect(decision.context).toBe('large');
+      // code-review at low risk -> reviewer.
+      expect(decision.selected).toBe('reviewer');
+      // RE7(a): all three classified dimensions came from constraints.
+      expect(decision.derivedFrom).toEqual({
+        task: 'constraint',
+        complexity: 'constraint',
+        context: 'constraint',
+      });
+      expect(h.store.get<Attempt>('attempts', h.store.list<Attempt>('attempts')[0]!.id)!.model).toBe(
+        'reviewer',
+      );
+    } finally {
+      h.close();
+    }
+  });
+
+  it('ignores an out-of-vocabulary constraint value and uses the documented default', () => {
+    const h = routingHarness();
+    try {
+      const { task } = seedExecutingWorkOrder(h.store, h.events, {
+        constraints: ['route-task:not-a-real-task', 'route-complexity:enormous', 'route-context:gigantic'],
+      });
+      // YELLOW (default tier) → medium risk.
+      h.scheduler.tick();
+
+      const decision = h.store.list<RoutingDecisionRecord>('routing_decisions')[0]!;
+      expect(decision.taskId).toBe(task.id);
+      expect(decision.task).toBe('implementation');
+      expect(decision.complexity).toBe('normal');
+      expect(decision.risk).toBe('medium');
+      expect(decision.context).toBe('small');
+      expect(decision.derivedFrom).toEqual({
+        task: 'default',
+        complexity: 'default',
+        context: 'default',
+      });
+    } finally {
+      h.close();
+    }
+  });
+
+  it('parks a blocked route: Task stays READY, no Attempt, resource.unavailable + status blockedRouting', () => {
+    // Every pool member unavailable => RoutingBlockedError (RE7(c)).
+    const h = routingHarness({ unavailable: [...CAPABILITY_POOL] });
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events);
+
+      h.scheduler.tick();
+      // A second tick retries the READY Task; the park event is not re-appended
+      // while the blocked set is unchanged (no event flood).
+      h.scheduler.tick();
+
+      // No substitution, no fabricated Attempt, no Task transition to ASSIGNED.
+      expect(h.store.get<Task>('tasks', task.id)!.state).toBe('READY');
+      expect(h.store.list<Attempt>('attempts')).toHaveLength(0);
+      expect(h.store.list<{ taskId: string }>('assignments')).toHaveLength(0);
+
+      // E7's resource-unavailable event is bound to the Work Order (durable park).
+      const unavailable = h.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .filter((event) => event.type === RESOURCE_UNAVAILABLE);
+      expect(unavailable).toHaveLength(1);
+
+      // The scheduler surfaces the blocked route rather than silently skipping.
+      const blocked = h.scheduler.status().queue.blockedRouting;
+      expect(blocked).toHaveLength(1);
+      expect(blocked[0]!.taskId).toBe(task.id);
+      expect(blocked[0]!.unavailable).toEqual([...CAPABILITY_POOL]);
+      expect(blocked[0]!.candidates.length).toBeGreaterThan(0);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('honours a Work Order model:<id> override with source "override"', () => {
+    const h = routingHarness();
+    try {
+      const { task } = seedExecutingWorkOrder(h.store, h.events, {
+        constraints: ['model:frontier'],
+      });
+
+      h.scheduler.tick();
+
+      const decision = h.store.list<RoutingDecisionRecord>('routing_decisions')[0]!;
+      expect(decision.taskId).toBe(task.id);
+      expect(decision.source).toBe('override');
+      expect(decision.selected).toBe('frontier');
+      const attempt = h.store.list<Attempt>('attempts')[0]!;
+      expect(attempt.model).toBe('frontier');
+    } finally {
+      h.close();
+    }
+  });
+
+  it('falls back to rules when the override names an unknown model (never invents a model)', () => {
+    const h = routingHarness();
+    try {
+      const { task } = seedExecutingWorkOrder(h.store, h.events, {
+        constraints: ['model:no-such-model'],
+      });
+
+      h.scheduler.tick();
+
+      const attempt = h.store.list<Attempt>('attempts').find((a) => a.taskId === task.id)!;
+      expect(attempt.model).toBe('implementer');
+      const decision = h.store.list<RoutingDecisionRecord>('routing_decisions')[0]!;
+      expect(decision.source).toBe('rules');
+      expect(decision.selected).toBe('implementer');
+    } finally {
+      h.close();
+    }
+  });
+
+  it('falls back to rules (source "rules") when the override model is unavailable', () => {
+    // Override names frontier, but frontier is unavailable: E4 falls back to
+    // the rules and the record is marked 'rules' — never mislabelled 'override'.
+    const h = routingHarness({ unavailable: ['frontier'] });
+    try {
+      const { task } = seedExecutingWorkOrder(h.store, h.events, {
+        constraints: ['model:frontier'],
+      });
+
+      h.scheduler.tick();
+
+      const decision = h.store.list<RoutingDecisionRecord>('routing_decisions')[0]!;
+      expect(decision.taskId).toBe(task.id);
+      expect(decision.source).toBe('rules');
+      expect(decision.selected).not.toBe('frontier');
+      expect(decision.unavailable).toContain('frontier');
+    } finally {
+      h.close();
+    }
+  });
+
+  it('does not budget-gate an override but still records the budget snapshot', () => {
+    const drained: BudgetState = { monthlyRemaining: 0, weeklyRemaining: 0, fiveHourRemaining: 0 };
+    const h = routingHarness({ budget: drained });
+    try {
+      seedExecutingWorkOrder(h.store, h.events, { constraints: ['route:frontier'] });
+
+      h.scheduler.tick();
+
+      const decision = h.store.list<RoutingDecisionRecord>('routing_decisions')[0]!;
+      expect(decision.source).toBe('override');
+      expect(decision.selected).toBe('frontier');
+      expect(decision.budget).toEqual(drained);
+    } finally {
+      h.close();
     }
   });
 });

@@ -4,6 +4,7 @@ import type {
   ModelId,
   RouteDecision,
   RouteInput,
+  RouteInputDerivation,
   RoutingDecisionRecord,
 } from './decisionModel';
 
@@ -272,6 +273,13 @@ export interface RoutingProvenance {
   taskId?: string | null;
   id?: string;
   createdAt?: string;
+  /**
+   * Where a Task's classified dimensions came from (E9.3): each is `constraint`
+   * when a Work Order constraint supplied it, else `default`. The runtime
+   * derivation is recorded alongside the decision so the "why" is faithful;
+   * optional so E4's own record builders stay unchanged.
+   */
+  derivedFrom?: RouteInputDerivation;
 }
 
 /**
@@ -294,6 +302,7 @@ export function toRoutingDecisionRecord(
     selected: decision.selected,
     candidates: decision.candidates,
     reason: decision.reason,
+    ...(provenance.derivedFrom ? { derivedFrom: provenance.derivedFrom } : {}),
     createdAt: provenance.createdAt ?? new Date().toISOString(),
   };
 }

@@ -255,6 +255,11 @@ export interface AssignmentIntent {
   taskId: string;
   workerId: string;
   worktree: { taskId: string; branch: string; worktreePath: string; baseCommit: string };
+  /**
+   * The routed model for this attempt (E9.3): selected by E4 at assignment and
+   * carried through to the Attempt. `null`/absent leaves `attempt.model` null.
+   */
+  model?: string | null;
 }
 
 /**
@@ -266,6 +271,8 @@ export interface AssignmentRecord extends Assignment {
   worktreePath: string;
   baseCommit: string;
   closedAt: string | null;
+  /** The routed model for this assignment's Attempt (E9.3); null when unrouted. */
+  model: string | null;
 }
 
 export interface AssignDeps {
@@ -312,6 +319,7 @@ export function assign(deps: AssignDeps, intent: AssignmentIntent): AssignmentRe
       worktreePath: intent.worktree.worktreePath,
       baseCommit: intent.worktree.baseCommit,
       closedAt: null,
+      model: intent.model ?? null,
       createdAt: t,
       updatedAt: t,
     };
@@ -358,7 +366,7 @@ export function startTask(deps: SchedulerDeps, assignment: AssignmentRecord): Ex
   const attempt = createAttempt(deps, {
     taskId: task.id,
     workerId: assignment.workerId,
-    model: null,
+    model: assignment.model,
     context: envelopeContext(workOrder, task),
     environment: 'herdr/local',
   });
