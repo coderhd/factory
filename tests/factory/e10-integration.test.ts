@@ -29,6 +29,7 @@ import {
   RECOVERY_ACTION_APPLIED,
   RESOURCE_UNAVAILABLE,
 } from '../../src/factory/recovery/recovery';
+import { RECOVERY_PARKED } from '../../src/factory/scheduler/scheduler';
 import { createArtifactStore, openStateStore } from '../../src/factory/state/store';
 import type { SemanticJudge } from '../../src/factory/verification/semantic';
 import {
@@ -838,6 +839,66 @@ describe('E10.2 worker-failure re-dispatch producer', () => {
       await h.tickAndSettle();
       expect(attemptsFor(h.deps.store, task.id)).toHaveLength(1);
     } finally {
+      h.deps.store.close();
+    }
+  });
+
+  it('park a second same-class failure (REASSIGN) loudly: durable event + status, no new Attempt, no silent stall', async () => {
+    const h = producerHarness();
+    // The escalation is expected to be loud (console.error); capture it so the
+    // run stays pristine and assert the operator-facing message is emitted.
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
+    try {
+      const { wo, task } = seedExecuting(h.deps);
+      await h.until('running', () => taskById(h.deps.store, task.id).state === 'RUNNING');
+      const attemptA = attemptsFor(h.deps.store, task.id)[0]!;
+
+      // First live failure → RETRY_NEW_ATTEMPT re-dispatch (the happy path).
+      h.adapterForAttempt(attemptA.id).release(failedResult('worker blew up'));
+      await h.until('re-dispatched', () => attemptsFor(h.deps.store, task.id).length === 2);
+      const attemptB = attemptsFor(h.deps.store, task.id).find((a) => a.id !== attemptA.id)!;
+
+      // Second same-class live failure: sameClassCount reaches the per-class
+      // budget, so E7's ladder walks to REASSIGN — which the live scheduler has
+      // no executor for (RF7). Without the park it would stall silently.
+      h.adapterForAttempt(attemptB.id).release(failedResult('worker blew up again'));
+      await h.until('parked', () =>
+        h.deps.events
+          .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+          .some((event) => event.type === RECOVERY_PARKED),
+      );
+
+      // Loud escalation: a durable recovery.parked event carrying the action…
+      const parked = h.deps.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .filter((event) => event.type === RECOVERY_PARKED);
+      expect(parked).toHaveLength(1);
+      expect(parked[0]!.payload).toMatchObject({ kind: 'REASSIGN', taskId: task.id });
+      // …and the same park surfaced by status().
+      expect(h.deps.scheduler!.status().queue.parkedRecovery).toContainEqual(
+        expect.objectContaining({ taskId: task.id, kind: 'REASSIGN' }),
+      );
+      // …and surfaced to the operator as a loud line naming the missing executor.
+      expect(errors.some((line) => /parked on recovery action REASSIGN/.test(line))).toBe(true);
+
+      // Bounded and non-minting: the REASSIGN mints no Attempt, and no further
+      // tick re-drives the parked failure (no silent loop, no third Attempt).
+      expect(attemptsFor(h.deps.store, task.id)).toHaveLength(2);
+      await h.tickAndSettle();
+      await h.tickAndSettle();
+      expect(attemptsFor(h.deps.store, task.id)).toHaveLength(2);
+      expect(
+        h.deps.events
+          .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+          .filter((event) => event.type === RECOVERY_PARKED),
+      ).toHaveLength(1);
+
+      // Invariant 9: RUNNING, parked loudly — neither FAILED nor silently stuck.
+      expect(taskById(h.deps.store, task.id).state).toBe('RUNNING');
+    } finally {
+      console.error = originalError;
       h.deps.store.close();
     }
   });

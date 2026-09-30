@@ -16,6 +16,7 @@ import {
   recover,
   RESOURCE_UNAVAILABLE,
   type FailureContext,
+  type RecoveryAction,
 } from '../recovery/recovery';
 import { routeAssignment } from '../routing/assignment';
 import type { BudgetState, ModelId } from '../routing/decisionModel';
@@ -131,6 +132,18 @@ export interface SchedulerStatus {
     blockedPolicy: Array<{ taskId: string; verdict: PolicyVerdict }>;
     /** E9.3: READY tasks a blocked route refused to assign (no model available). */
     blockedRouting: Array<{ taskId: string; candidates: ModelId[]; unavailable: ModelId[] }>;
+    /**
+     * E10.2 (#38, RF7): Tasks parked on a recovery action the live scheduler
+     * cannot execute (`REASSIGN`/`REPLAN`), or on a recovery error — surfaced
+     * loudly so a RUNNING Task is never a silent dead-end. Durable-derived.
+     */
+    parkedRecovery: Array<{
+      taskId: string;
+      workOrderId: string;
+      kind: string;
+      attemptId: string;
+      reason?: string;
+    }>;
   };
   activeDAGs: Array<{ workOrderId: string; version: number; nodes: number }>;
 }
@@ -147,6 +160,23 @@ export interface Scheduler {
    */
   deliverAnswer(workerId: string, answer: WorkerAnswer): Promise<void>;
 }
+
+/**
+ * E10.2 (#38, RF7): recovery actions the live scheduler can carry out.
+ * `RETRY_NEW_ATTEMPT` is re-dispatched by `redispatchPass`; `ESCALATE_HUMAN` and
+ * `WAITING_RESOURCE` are terminal/parked dispositions E7 already recorded;
+ * `HOLD` is an e-stop/pause (the tick gate owns it) and `NO_OP_DUPLICATE` is a
+ * replayed delivery. Any other action — the ladder rungs `REASSIGN`/`REPLAN` —
+ * has no live executor, so the scheduler must park the Task **loudly** rather
+ * than stall it silently.
+ */
+const LIVE_EXECUTABLE_RECOVERY_KINDS: ReadonlySet<RecoveryAction['kind']> = new Set([
+  'RETRY_NEW_ATTEMPT',
+  'ESCALATE_HUMAN',
+  'WAITING_RESOURCE',
+  'NO_OP_DUPLICATE',
+  'HOLD',
+]);
 
 /** Event vocabulary for persisted §12 interactions (E1 `<aggregate>.<verb>` style). */
 export const INTERACTION_CREATED = 'interaction.created';
@@ -168,6 +198,15 @@ export const ASSIGNMENT_START_FAILED = 'assignment.start_failed';
 export const EVIDENCE_BUNDLE_RECORDED = 'evidence.bundle_recorded';
 export const VERIFICATION_FAILED = 'verification.failed';
 export const VERIFICATION_REJECTED = 'verification.rejected';
+
+/**
+ * E10.2 (#38, RF7): appended when a live worker failure resolves to a recovery
+ * action the scheduler has **no live executor** for — the E7 ladder rungs
+ * `REASSIGN` / `REPLAN`, whose execution is deferred. It is the loud, durable
+ * escalation that replaces a silent invariant-9 stall; the Task stays `RUNNING`
+ * pending a human/operator path, and the park is surfaced by `status()`.
+ */
+export const RECOVERY_PARKED = 'recovery.parked';
 
 /**
  * A persisted §12 interaction: the durable question a `waiting_input` Attempt
@@ -271,6 +310,37 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
    * fresh event; the Task stays READY throughout and is retried every tick.
    */
   const blockedSignatures = new Map<string, string>();
+  /**
+   * E10.2 (#38, RF7): Tasks parked on a recovery action the live scheduler has
+   * no executor for (or a recovery error). Seeded from the durable log on
+   * construction so a restart surfaces an existing park, and appended when one
+   * occurs — the loud surface that keeps a RUNNING Task from being a silent
+   * dead-end. Rendered by `status()`.
+   */
+  const parkedRecoveries: Array<{
+    taskId: string;
+    workOrderId: string;
+    kind: string;
+    attemptId: string;
+    reason?: string;
+  }> = deps.events
+    .readEvents()
+    .filter((event) => event.type === RECOVERY_PARKED)
+    .map((event) => {
+      const payload = event.payload as {
+        taskId?: string;
+        attemptId?: string;
+        kind?: string;
+        reason?: string;
+      };
+      return {
+        taskId: payload.taskId ?? '',
+        workOrderId: event.aggregateId,
+        kind: payload.kind ?? 'UNKNOWN',
+        attemptId: payload.attemptId ?? '',
+        ...(payload.reason ? { reason: payload.reason } : {}),
+      };
+    });
   let timer: ReturnType<typeof setInterval> | null = null;
   /** One-time guard so a missing `repoPath` warns loudly but only once. */
   let warnedMissingRepoPath = false;
@@ -559,14 +629,10 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     // stays RUNNING (invariant 9), but the worker is still released. E10.2
     // (#38): the live failure is then handed to E7's bounded recovery, which
     // re-opens execution with a fresh Assignment (the dead-end was the missing
-    // re-dispatcher, not the RUNNING state). The diff is preserved as immutable
-    // evidence before the clean-baseline re-dispatch (§18.4).
+    // re-dispatcher, not the RUNNING state).
     const detail = result?.failure ?? item.error ?? 'worker reported failure without evidence';
     const failure = encodeFailure('WORKER_FAILURE', detail);
     const artifactIds = result ? storeArtifacts(attemptId, result) : [];
-    if (result?.diff && result.diff.trim().length > 0 && deps.artifacts) {
-      deps.artifacts.put(`${attemptId}/diff.patch`, result.diff);
-    }
     deps.store.db.transaction(() => {
       completeAttempt(deps, attemptId, {
         outcome: 'failed',
@@ -576,6 +642,12 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       });
       release(worker, assignment, t);
     })();
+    // The old diff is preserved as immutable evidence (§18.4). Written *after*
+    // the settle transaction commits: a rolled-back transaction (a failed
+    // `completeAttempt`/`release`) must not leave an orphaned artifact behind.
+    if (result?.diff && result.diff.trim().length > 0 && deps.artifacts) {
+      deps.artifacts.put(`${attemptId}/diff.patch`, result.diff);
+    }
     recordTelemetry(attemptId);
     recoverWorkerFailure(task, attemptId, detail);
   }
@@ -583,11 +655,15 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
   /**
    * Hand a live worker failure to E7's bounded recovery (E10.2, #38). E7
    * classifies it `WORKER_FAILURE`, applies its budgeted action, and — for
-   * `RETRY_NEW_ATTEMPT` — mints the single clean-baseline Attempt. The actual
-   * re-dispatch (a fresh Assignment against that open Attempt) is performed by
-   * {@link redispatchPass} on this or a following tick. A recovery error must
-   * never strand the tick: it is surfaced loudly and the Task stays RUNNING
-   * (invariant 9), retried next tick.
+   * `RETRY_NEW_ATTEMPT` — mints the single clean-baseline Attempt, which
+   * {@link redispatchPass} then re-opens with a fresh Assignment.
+   *
+   * An action the scheduler has no live executor for (`REASSIGN`/`REPLAN`, whose
+   * execution is deferred) is parked **loudly** (RF7): a durable
+   * `recovery.parked` event plus a `status()` entry, so the Task is never a
+   * silent dead-end. A recovery *error* is likewise parked loudly — it is not
+   * retried on the next tick (the Attempt is already settled, so nothing
+   * re-drives it); the Task stays RUNNING pending a human/operator path.
    */
   function recoverWorkerFailure(task: Task, attemptId: string, detail: string): void {
     const attempt = deps.store.get<Attempt>('attempts', attemptId);
@@ -603,8 +679,9 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       // the same §9.6 idempotency key.
       failureIndex: attempt?.failureHistory.length ?? 1,
     };
+    let action: RecoveryAction;
     try {
-      recover(
+      action = recover(
         {
           store: deps.store,
           events: deps.events,
@@ -614,12 +691,53 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         failure,
       );
     } catch (error) {
-      console.error(
-        `scheduler: worker-failure recovery failed for attempt ${attemptId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+      const message = error instanceof Error ? error.message : String(error);
+      parkRecovery(task, attemptId, 'RECOVERY_ERROR', message);
+      return;
+    }
+    if (!LIVE_EXECUTABLE_RECOVERY_KINDS.has(action.kind)) {
+      parkRecovery(
+        task,
+        attemptId,
+        action.kind,
+        'reason' in action ? action.reason : undefined,
       );
     }
+  }
+
+  /**
+   * Park a Task whose recovery action has no live executor (RF7): append the
+   * durable `recovery.parked` escalation and surface it via `status()`. The Task
+   * stays RUNNING (invariant 9) — this replaces the silent stall with a loud
+   * one. Idempotent per (Task, kind): a replayed delivery does not re-record.
+   */
+  function parkRecovery(
+    task: Task,
+    attemptId: string,
+    kind: string,
+    reason: string | undefined,
+  ): void {
+    if (parkedRecoveries.some((entry) => entry.taskId === task.id && entry.kind === kind)) return;
+    const at = now();
+    const entry = {
+      taskId: task.id,
+      workOrderId: task.workOrderId,
+      kind,
+      attemptId,
+      ...(reason ? { reason } : {}),
+    };
+    deps.store.db.transaction(() => {
+      deps.events.appendEvent({
+        type: RECOVERY_PARKED,
+        aggregateType: 'work_order',
+        aggregateId: task.workOrderId,
+        payload: { ...entry, at },
+      });
+    })();
+    parkedRecoveries.push(entry);
+    console.error(
+      `scheduler: task ${task.id} parked on recovery action ${kind}${reason ? ` (${reason})` : ''} with no live executor — a human/operator path is required; the Task stays RUNNING`,
+    );
   }
 
   // --- passes ----------------------------------------------------------------
@@ -869,6 +987,20 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
    * open Assignment and release the worker, leaving the Task `RUNNING` (unlike
    * {@link compensateFailedStart}, it does not revert the Task state — the Task
    * never left RUNNING, and the clean Attempt must remain open for retry).
+   *
+   * Reachability: on the production path this is defensive and currently
+   * unreachable, so no test exercises it — documenting why in lieu of a
+   * fault-injection seam. The only post-commit step is `dispatchReopenedAttempt`.
+   * Its sole fallible operation is `WorkerManager.execute`, an `async` function
+   * that never throws *synchronously* (it captures `adapter.execute` rejections
+   * into `dispatchFailures`); its sync guards cannot fire here either:
+   * `TASK_NOT_FOUND`/`WORK_ORDER_NOT_FOUND` because both rows were just read in
+   * `redispatchPass` before the commit, and `LEASE_NOT_FOUND` because
+   * `reopenAttempt` set the lease in the same synchronous tick. Worktree
+   * creation, the only other fallible step, runs *before* the commit. A
+   * post-commit throw therefore cannot be produced through the real composition
+   * without a contrived fault-injection seam; the compensation is kept for
+   * symmetry with {@link compensateFailedStart} and to avoid a theoretical wedge.
    */
   function compensateFailedReopen(assignment: AssignmentRecord): void {
     const at = now();
@@ -1178,6 +1310,11 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       0,
     );
 
+    // RF7: surface parks for Tasks still in an active scope (a parked Task is
+    // RUNNING, so it is in scope); a stale park for a terminal Work Order drops.
+    const activeTaskIds = new Set(scopeList.flatMap((scope) => scope.tasks.map((task) => task.id)));
+    const parkedRecovery = parkedRecoveries.filter((entry) => activeTaskIds.has(entry.taskId));
+
     return {
       running: timer !== null,
       tickIntervalMs: cfg.tickIntervalMs,
@@ -1192,7 +1329,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         min: cfg.provisioning.min,
         max: cfg.provisioning.max,
       },
-      queue: { readyTaskIds, blocked, blockedPolicy, blockedRouting },
+      queue: { readyTaskIds, blocked, blockedPolicy, blockedRouting, parkedRecovery },
       activeDAGs: scopeList.map((scope) => ({
         workOrderId: scope.workOrder.id,
         version: scope.dag.version,
