@@ -357,9 +357,13 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   const loaded = loadConfig(dir, io);
   if (!loaded) return 1;
   const port = flag(args, 'port') !== undefined ? Number(flag(args, 'port')) : loaded.runtime.server.port;
+  // The bind address is the resolved `server.hostname` (spec §20); `--hostname`
+  // overrides it for a container, where the loopback default is unreachable
+  // through a mapped port.
+  const hostname = flag(args, 'hostname') ?? loaded.runtime.server.hostname;
 
   const deps = buildServerDeps(loaded.runtime);
-  const handle = startFactoryServer(deps, { port });
+  const handle = startFactoryServer(deps, { port, hostname });
   // Actually run the E3 scheduler loop for the life of the server (spec §7.2).
   deps.scheduler?.start();
   writeRuntimeFile(dir, {
@@ -388,9 +392,12 @@ async function cmdStart(args: ParsedArgs, io: CliIO): Promise<number> {
   const loaded = loadConfig(dir, io);
   if (!loaded) return 1;
   const port = flag(args, 'port') ?? String(loaded.runtime.server.port);
+  const hostname = flag(args, 'hostname') ?? loaded.runtime.server.hostname;
 
   if (!hasFlag(args, 'detached')) {
-    return cmdServe({ ...args, flags: withFlag(args, 'port', port) }, io);
+    const withPort = { ...args, flags: withFlag(args, 'port', port) };
+    const withPortAndHostname = { ...withPort, flags: withFlag(withPort, 'hostname', hostname) };
+    return cmdServe(withPortAndHostname, io);
   }
 
   // Guard on an existing runtime.json: a live server must not be shadowed by a
@@ -408,10 +415,13 @@ async function cmdStart(args: ParsedArgs, io: CliIO): Promise<number> {
   }
 
   const cliFile = fileURLToPath(import.meta.url);
-  const child = Bun.spawn([process.execPath, cliFile, '__serve', '--dir', dir, '--port', port], {
-    stdio: ['ignore', 'ignore', 'ignore'],
-    env: process.env,
-  });
+  const child = Bun.spawn(
+    [process.execPath, cliFile, '__serve', '--dir', dir, '--port', port, '--hostname', hostname],
+    {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      env: process.env,
+    },
+  );
   child.unref();
 
   // The child writes runtime.json once it is listening; wait for it.

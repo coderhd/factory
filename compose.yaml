@@ -1,15 +1,23 @@
 # Factory Server MVP runtime (spec §20). Docker Compose is the MVP runtime;
 # persistent volumes hold Factory state, artifacts/evidence, and knowledge.
 # Images use explicit versions, never `latest`.
+#
+# The pinned image is built from `Dockerfile` (`docker compose build`), so the
+# `image:` ref has a real build path rather than an unbuilt registry tag.
 services:
   factory:
     image: ghcr.io/coderhd/factory:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8787:8787"
     volumes:
-      - factory-state:/var/lib/factory/state
-      - factory-artifacts:/var/lib/factory/artifacts
-      - factory-knowledge:/var/lib/factory/knowledge
+      # Mount onto the `.factory/*` storage paths `factory.yaml` declares, so the
+      # volumes are the persistence the spec requires (not empty host paths).
+      - factory-state:/app/.factory/state
+      - factory-artifacts:/app/.factory/artifacts
+      - factory-knowledge:/app/.factory/knowledge
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8787/api/health"]
       interval: 10s

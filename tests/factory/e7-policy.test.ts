@@ -1352,7 +1352,13 @@ describe('E7 recovery: bounded replanWorkOrder via E3 commitDAG', () => {
       expect(third.ok).toBe(false);
       if (!third.ok) {
         expect(third.action.kind).toBe('ESCALATE_HUMAN');
-        expect(third.action.reason).toContain('replan-budget-exhausted');
+        // Narrow on the discriminant so the escalation's reason is checked on
+        // the action that actually carries it.
+        const action = third.action;
+        if (action.kind === 'ESCALATE_HUMAN') {
+          expect(action.reason).toBeDefined();
+          expect(action.reason).toContain('replan-budget-exhausted');
+        }
       }
       expect(getActiveDAG(deps(h), wo.id)?.version).toBe(3);
     } finally {

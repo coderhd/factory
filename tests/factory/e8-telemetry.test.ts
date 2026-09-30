@@ -35,6 +35,7 @@ import {
   readAttemptTelemetry,
   recordAttemptTelemetry,
   type AttemptObservables,
+  type DrillDownStage,
   type TelemetryDeps,
 } from '../../src/factory/telemetry/telemetry';
 import {
@@ -456,7 +457,7 @@ describe('E8.1 telemetry layers (spec §24)', () => {
 // ---------------------------------------------------------------------------
 
 describe('E8.1 drill-down (spec §23)', () => {
-  const stages = [
+  const stages: Array<DrillDownStage['stage']> = [
     'work_order',
     'task',
     'attempt',

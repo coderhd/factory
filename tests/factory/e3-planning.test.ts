@@ -25,6 +25,7 @@ import {
   proposeDAG,
   validateDAG,
   type DAGProposalPayload,
+  type DagRuleCode,
   type ProposalNode,
 } from '../../src/factory/planning/dag';
 import { createScheduler, INTERACTION_CREATED, ASSIGNMENT_START_FAILED, type InteractionRecord } from '../../src/factory/scheduler/scheduler';
@@ -390,7 +391,7 @@ describe('E3 DAG propose / validate / commit', () => {
   });
 
   const invalidCases: Array<{
-    rule: string;
+    rule: DagRuleCode;
     state: WorkOrderState[];
     payload: DAGProposalPayload;
     reasons: number;
@@ -1034,7 +1035,8 @@ describe('E3 assignment + completion rules', () => {
       expect(interactions).toHaveLength(1);
       expect(interactions[0].type).toBe('QUESTION');
       expect(interactions[0].taskId).toBe(a);
-      expect(interactions[0].attemptId).toBe(worker.lease?.attemptId);
+      expect(worker.lease).toBeDefined();
+      expect(interactions[0].attemptId).toBe(worker.lease!.attemptId);
       expect(interactions[0].workerId).toBe(worker.id);
       expect(interactions[0].question).toBe('which base branch?');
       expect(interactions[0].status).toBe('PENDING');

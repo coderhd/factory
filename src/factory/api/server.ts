@@ -508,10 +508,17 @@ export function startFactoryServer(
     port: options.port ?? 0,
     fetch: createApiHandler(deps),
   });
+  // `Bun.serve` always assigns a concrete port (including for `port: 0`), but
+  // its type is optional. Fail loudly rather than advertise "undefined".
+  const port = server.port;
+  if (port === undefined) {
+    server.stop(true);
+    throw new FactoryError('SERVER_PORT_UNAVAILABLE', 'Bun.serve did not report a bound port');
+  }
   return {
     hostname,
-    port: server.port,
-    url: `http://${hostname}:${server.port}`,
+    port,
+    url: `http://${hostname}:${port}`,
     stop(): void {
       server.stop(true);
     },

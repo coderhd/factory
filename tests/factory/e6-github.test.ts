@@ -192,7 +192,7 @@ function harness(): Harness {
   // A recording wrapper where the client is constructed, so we can prove every
   // HTTP request the adapter causes goes to the Factory server — never GitHub.
   const factoryRequests: string[] = [];
-  const recordingFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const recordingFetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     factoryRequests.push(url);
@@ -734,7 +734,7 @@ function recordingFetch(respond: (request: RecordedRequest) => Response): {
   calls: RecordedRequest[];
 } {
   const calls: RecordedRequest[] = [];
-  const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const impl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const method = (init?.method ?? 'GET').toUpperCase();

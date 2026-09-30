@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -12,6 +12,7 @@ import {
   parseFactoryConfig,
   resolveFactoryConfig,
   serializeFactoryConfig,
+  validateCompose,
   type FactoryDesiredConfig,
 } from '../../src/factory/config/factoryConfig';
 import {
@@ -33,11 +34,10 @@ import {
 } from '../../src/factory/verification/engine';
 import {
   createE5Verifier,
-  type SemanticJudge,
   type WorkVerifier,
 } from '../../src/factory/verification/orchestrator';
 import { buildEvidenceBundle } from '../../src/factory/evidence/bundle';
-import { createSemanticVerifier } from '../../src/factory/verification/semantic';
+import { createSemanticVerifier, type SemanticJudge } from '../../src/factory/verification/semantic';
 import {
   createGitHubAdapter,
   type CreateBranchInput,
@@ -85,7 +85,7 @@ import {
   type WorkerResult,
   type WorkerStatus,
 } from '../../src/factory/workers/herdr';
-import { createWorkerManager } from '../../src/factory/workers/manager';
+import { createWorkerManager, type SpawnWorker } from '../../src/factory/workers/manager';
 import { createWorktreeManager, taskWorktreeBranch } from '../../src/factory/worktrees/worktree';
 
 /**
@@ -199,7 +199,7 @@ function seedExecutingWorkOrder(
   return { wo, task };
 }
 
-function makeSpawn(adapters: FakeHerdr[]): ServerDepsOptions['spawn'] {
+function makeSpawn(adapters: FakeHerdr[]): SpawnWorker {
   return () => {
     const adapter = new FakeHerdr();
     adapters.push(adapter);
@@ -3162,4 +3162,134 @@ describe('E9.8 circuit wiring — live dependency load + HALF_OPEN probe settlem
       h.close();
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// E9.9 (#35) — infra hygiene: the type gate, compose honesty, config surface.
+// These are structural, hermetic checks (no Docker daemon, no network, no
+// compiler invocation): the canonical `scripts/check-tsc.sh` run is documented
+// in the task report.
+// ---------------------------------------------------------------------------
+
+const REPO_ROOT = join(import.meta.dir, '..', '..');
+const readRepoFile = (relPath: string): string => readFileSync(join(REPO_ROOT, relPath), 'utf8');
+
+describe('E9.9 type gate', () => {
+  it('ships a tsconfig.json that type-checks the Factory surface without emitting', () => {
+    // tsconfig allows `//` comments (the repo's other config files do too, see
+    // `scripts/check-json.sh`); strip full-line comments before parsing.
+    const raw = readRepoFile('tsconfig.json');
+    const json = raw
+      .split('\n')
+      .filter((line) => !line.trim().startsWith('//'))
+      .join('\n');
+    const tsconfig = JSON.parse(json) as {
+      compilerOptions: { noEmit?: boolean; strict?: boolean; types?: string[] };
+      include: string[];
+    };
+    expect(tsconfig.compilerOptions.noEmit).toBe(true);
+    expect(tsconfig.compilerOptions.strict).toBe(true);
+    expect(tsconfig.compilerOptions.types).toContain('bun-types');
+    expect(tsconfig.include).toContain('src/**/*.ts');
+    expect(tsconfig.include).toContain('tests/**/*.ts');
+  });
+
+  it('ships an executable check-tsc.sh that pins the compiler (never latest)', () => {
+    const scriptPath = join(REPO_ROOT, 'scripts', 'check-tsc.sh');
+    expect(existsSync(scriptPath)).toBe(true);
+    // Executable, so CI can call it directly.
+    expect(statSync(scriptPath).mode & 0o111).not.toBe(0);
+
+    const script = readRepoFile('scripts/check-tsc.sh');
+    expect(script).toContain('tsc --noEmit');
+    expect(script).toMatch(/TSC_VERSION="\d+\.\d+\.\d+"/);
+    expect(script).not.toContain('typescript@latest');
+  });
+});
+
+describe('E9.9 compose honesty', () => {
+  it('pins an explicit image, keeps the healthcheck/volumes, and builds it locally', () => {
+    // The checked-in compose still validates structurally (no Docker needed).
+    expect(validateCompose(readRepoFile('compose.yaml')).ok).toBe(true);
+
+    const compose = readRepoFile('compose.yaml');
+    expect(compose).not.toMatch(/image:\s*\S+:latest/);
+    // The pinned ref has a real build path: `build:` + a checked-in Dockerfile.
+    expect(compose).toMatch(/^\s+build:\s*$/m);
+    expect(compose).toContain('dockerfile: Dockerfile');
+    expect(existsSync(join(REPO_ROOT, 'Dockerfile'))).toBe(true);
+  });
+
+  it('Dockerfile pins an explicit base image version, never `latest`', () => {
+    const dockerfile = readRepoFile('Dockerfile');
+    const from = dockerfile.match(/^FROM\s+(\S+)/m);
+    expect(from).not.toBeNull();
+    const baseImage = from![1]!;
+    expect(baseImage).not.toMatch(/:latest$/);
+    // An explicit version tag (e.g. oven/bun:1.4.2-slim).
+    expect(baseImage).toMatch(/:\d+\.\d+/);
+  });
+
+  it('keeps image state on declared volumes, not in the image layer', () => {
+    const compose = readRepoFile('compose.yaml');
+    // The mount targets are the `.factory/*` storage paths factory.yaml declares.
+    expect(compose).toContain('factory-state:/app/.factory/state');
+    expect(compose).toContain('factory-artifacts:/app/.factory/artifacts');
+    expect(compose).toContain('factory-knowledge:/app/.factory/knowledge');
+  });
+});
+
+describe('E9.9 factory.yaml config surface', () => {
+  it('the checked-in factory.yaml exposes provisioning + worktrees and validates', () => {
+    const parsed = parseFactoryConfig(readRepoFile('factory.yaml'));
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      const provisioning = parsed.config.scheduler.provisioning;
+      expect(provisioning.enabled).toBe(true);
+      expect(provisioning.max).toBeGreaterThanOrEqual(provisioning.min);
+      expect(provisioning.defaultProfile.length).toBeGreaterThan(0);
+      expect(parsed.config.worktrees.rootDir.length).toBeGreaterThan(0);
+      expect(parsed.config.worktrees.baseBranch.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('round-trips the provisioning/worktrees surface through serialize → parse', () => {
+    const serialized = serializeFactoryConfig(DEFAULT_FACTORY_CONFIG);
+    const parsed = parseFactoryConfig(serialized);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.config.scheduler.provisioning).toEqual(DEFAULT_FACTORY_CONFIG.scheduler.provisioning);
+      expect(parsed.config.worktrees).toEqual(DEFAULT_FACTORY_CONFIG.worktrees);
+    }
+  });
+
+  it('the serve path binds the resolved server.hostname (--hostname overrides it)', async () => {
+    // `factory.yaml` declares `server.hostname`; the compose runtime relies on
+    // it (a container bound to loopback is unreachable through the mapped port).
+    const dir = join(workDir, 'hostname-bind');
+    mkdirSync(dir, { recursive: true });
+    const init = capture(dir);
+    expect(await runCli(['init', '--dir', dir], init.io)).toBe(0);
+
+    const text = readFileSync(join(dir, 'factory.yaml'), 'utf8').replace(
+      'hostname: 127.0.0.1',
+      'hostname: 0.0.0.0',
+    );
+    writeFileSync(join(dir, 'factory.yaml'), text);
+
+    // No connection is made to the all-interfaces address; the runtime file the
+    // serve path writes carries the bound URL.
+    const startCap = capture(dir);
+    expect(await runCli(['start', '--dir', dir, '--detached', '--port', '0'], startCap.io)).toBe(0);
+    try {
+      const runtime = JSON.parse(
+        readFileSync(join(dir, '.factory', 'runtime.json'), 'utf8'),
+      ) as { url: string; port: number };
+      expect(startCap.out().trim()).toBe(runtime.url);
+      expect(runtime.url.startsWith('http://0.0.0.0:')).toBe(true);
+      expect(runtime.port).toBeGreaterThan(0);
+    } finally {
+      await runCli(['stop', '--dir', dir], capture(dir).io);
+    }
+  }, 15000);
 });

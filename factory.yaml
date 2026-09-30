@@ -1,17 +1,30 @@
+# Desired Factory deployment (spec §20). `factory.yaml` is *desired* config; the
+# deployment manager resolves it into runtime config (`resolveFactoryConfig`),
+# and `compose.yaml` is one rendering of that runtime. Not interchangeable.
+#
+# `#` comments are ignored by the parser; `factory init` rewrites this file
+# without them, so keep operator notes short.
 apiVersion: factory/v0.1
 factoryVersion: 0.1.0
 server:
+  # Bind address for the API. 127.0.0.1 is local dev; a container passes
+  # `--hostname 0.0.0.0` (or sets this) so the mapped port is reachable.
   hostname: 127.0.0.1
   port: 8787
 storage:
+  # Relative paths resolve against the deployment directory. compose mounts
+  # volumes onto these (`/app/.factory/*`).
   state: .factory/state
   artifacts: .factory/artifacts
   knowledge: .factory/knowledge
 repository:
+  # The local repository Task worktrees are created from.
   path: .
 scheduler:
   maxConcurrentTasks: 3
   tickIntervalMs: 1000
+  # Demand-driven worker population (spec §16). `max` is a capacity ceiling,
+  # not an initial worker count; idle workers past `idleTimeoutMs` are reclaimed.
   provisioning:
     enabled: true
     min: 0
@@ -19,6 +32,8 @@ scheduler:
     idleTimeoutMs: 600000
     defaultProfile: herdr
 worktrees:
+  # Per-Task isolation (spec §15): each Task gets an isolated branch + worktree
+  # under rootDir, branched from baseBranch.
   rootDir: .factory/worktrees
   baseBranch: main
 workers:

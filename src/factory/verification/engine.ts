@@ -116,9 +116,15 @@ export interface SuiteResult {
   passed: boolean;
 }
 
-/** The structured verification failure (spec §14.4). Never a bare throw. */
+/**
+ * The structured verification failure (spec §14.4). Never a bare throw.
+ *
+ * `category` covers all four tiers' failures: the run tiers are
+ * {@link CheckCategory}, and the semantic tier reports `'semantic'` (see
+ * `SemanticFailure`). One shape for every tier's failure.
+ */
 export interface FailureRecord {
-  category: CheckCategory;
+  category: CheckCategory | 'semantic';
   criterion: string | null;
   verifier: string;
   evidence: CheckEvidence;
