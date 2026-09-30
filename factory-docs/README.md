@@ -26,3 +26,7 @@ Final architecture capture for the Root / Factory ecosystem. The existing `2026-
 
 - `architecture/policy-and-risk-model.md` — E7.1: monotonic policy narrowing (Org→Project→WO→Task), capability list + ALLOW/DENY/REQUIRE_HUMAN semantics, risk tiers (Yellow start / earned Green / Red never auto-promotes), recovery + emergency-stop contract, threat model
 - `decisions/adr-14-monotonic-policy-and-risk.md` — the ADR record
+
+## Telemetry & self-improvement (Factory Server v0.1, E8)
+
+- `implementation/improvement-loop-runbook.md` — E8.2: operating the Improvement-as-Work loop (`Observe → Propose → Benchmark → Qualify → Promote`): per-stage entry/exit criteria and events, six telemetry layers + Observatory inputs (E8.1), benchmark corpus kept distinct from Lekhan dogfooding, Levels 1–2 only, human-gated promotion — never silent behavior change
