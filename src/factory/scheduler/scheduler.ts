@@ -9,6 +9,7 @@ import {
 import type { WorkVerifier, VerificationOutcome } from '../verification/orchestrator';
 import type { EventLog } from '../events/log';
 import { getActiveDAG, type DAGVersion } from '../planning/dag';
+import { createEvidenceReadPort, type EvidenceReadPort } from '../observatory/observatory';
 import { isEmergencyStopped, isFactoryPaused } from '../policy/policy';
 import { RESOURCE_UNAVAILABLE } from '../recovery/recovery';
 import { routeAssignment } from '../routing/assignment';
@@ -16,6 +17,7 @@ import type { BudgetState, ModelId } from '../routing/decisionModel';
 import { persistRoutingDecision } from '../routing/persist';
 import { RoutingBlockedError, toRoutingDecisionRecord } from '../routing/rules';
 import type { ArtifactStore, StateStore } from '../state/store';
+import { recordAttemptTelemetry, TELEMETRY_ATTEMPT_RECORDED } from '../telemetry/telemetry';
 import type { WorkerAnswer, WorkerInteraction, WorkerResult } from '../workers/herdr';
 import {
   assign,
@@ -79,6 +81,13 @@ export interface SchedulerDeps {
    * promoted (no silent pass).
    */
   verifier?: WorkVerifier;
+  /**
+   * E9.7 telemetry read port. When wired (production: the server's store-backed
+   * evidence reader), the per-Attempt receipt derives its human-leverage layer
+   * from the same reader the Observatory uses. Absent, a store-backed reader is
+   * built locally; either way the receipt is derived, never fabricated.
+   */
+  telemetry?: { evidence: EvidenceReadPort };
 }
 
 /** E4 routing signals for the assignment pass (RE7(b)). */
@@ -219,6 +228,10 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
   const now = deps.now ?? (() => new Date().toISOString());
   const policy = deps.policy ?? missingPolicy();
   const leaseTtlMs = deps.leaseTtlMs ?? cfg.provisioning.idleTimeoutMs;
+  // E9.7: one evidence reader shared by telemetry and, in production, the
+  // server's Observatory projection (wired via `SchedulerDeps.telemetry`).
+  const telemetryEvidence =
+    deps.telemetry?.evidence ?? createEvidenceReadPort(deps.store);
 
   const completions: Completion[] = [];
   const pending = new Set<string>();
@@ -259,6 +272,46 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     subject: { workOrderId: string; taskId: string; attemptId: string };
     outcome: VerificationOutcome;
   }> = [];
+
+  /**
+   * E9.7: Attempts whose six-layer telemetry receipt has already been appended.
+   * Seeded from the durable log on construction so a restart (or a replayed
+   * completion) never double-records — and therefore never double-counts cost.
+   */
+  const telemetryRecorded = new Set<string>(
+    deps.events
+      .readEvents()
+      .filter((event) => event.type === TELEMETRY_ATTEMPT_RECORDED)
+      .map((event) => event.aggregateId),
+  );
+
+  /**
+   * E9.7: append the six-layer telemetry receipt for a just-completed Attempt
+   * (the live path E8 had no caller for). One receipt per Attempt, idempotent,
+   * and read-only w.r.t. execution state: `recordAttemptTelemetry` derives the
+   * layers and appends a single `telemetry.attempt_recorded` event. It never
+   * fabricates data — an absent runtime observable is an honest `null`.
+   */
+  function recordTelemetry(attemptId: string): void {
+    if (telemetryRecorded.has(attemptId)) return;
+    telemetryRecorded.add(attemptId);
+    try {
+      recordAttemptTelemetry(
+        { store: deps.store, events: deps.events, evidence: telemetryEvidence },
+        attemptId,
+      );
+    } catch (error) {
+      // A telemetry receipt is derived state, not execution state: a projection
+      // failure must never strand a settled Attempt or abort the tick. Drop the
+      // guard so a later completion can retry, and surface it loudly.
+      telemetryRecorded.delete(attemptId);
+      console.error(
+        `scheduler: telemetry recording failed for attempt ${attemptId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
 
   // --- durable-state readers -------------------------------------------------
 
@@ -478,6 +531,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         transitionTask(deps, task.id, { to: 'SUCCESS' });
         release(worker, assignment, t);
       })();
+      recordTelemetry(attemptId);
       return;
     }
 
@@ -495,6 +549,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       });
       release(worker, assignment, t);
     })();
+    recordTelemetry(attemptId);
   }
 
   // --- passes ----------------------------------------------------------------

@@ -1,8 +1,9 @@
 import type { Attempt, Task, WorkOrder } from '../domain/workOrder';
-import type { DailyThroughput, HumanHourThroughput, DrillDownStage } from '../observatory/observatory';
+import type { DrillDownStage } from '../observatory/observatory';
 import type { ApprovalRecord } from '../policy/policy';
 import type { DAGVersion, RecordedProposal } from '../planning/dag';
 import type { SchedulerStatus } from '../scheduler/scheduler';
+import type { TelemetryMetrics } from '../telemetry/telemetry';
 
 /**
  * The E2 Factory API contract (spec §6, §22): the request/response DTOs shared
@@ -56,11 +57,13 @@ export interface WorkOrderSnapshotDto {
   dag: DAGVersion | null;
 }
 
-export interface ObservatoryDto {
-  generatedAt: string;
-  verifiedPerDay: DailyThroughput[];
-  throughputPerHumanHour: HumanHourThroughput;
-}
+/**
+ * The Observatory projection (E9.7; spec §23) — E8's `TelemetryMetrics`
+ * verbatim: verified changes/day, verified throughput per human hour, rework
+ * attempts, and recorded model/tool cost. All values derive from durable
+ * evidence/telemetry; an empty Factory is zero/[], never fabricated.
+ */
+export type ObservatoryDto = TelemetryMetrics;
 
 export interface DrillDownDto {
   workOrderId: string;

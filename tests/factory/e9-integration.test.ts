@@ -59,6 +59,12 @@ import { createScheduler, type SchedulerRouting } from '../../src/factory/schedu
 import { createArtifactStore, openStateStore } from '../../src/factory/state/store';
 import type { ApprovalRecord } from '../../src/factory/policy/policy';
 import {
+  TELEMETRY_ATTEMPT_RECORDED,
+  TELEMETRY_LAYERS,
+  readAttemptTelemetry,
+  recordAttemptTelemetry,
+} from '../../src/factory/telemetry/telemetry';
+import {
   type ExecutionEnvelope,
   type WorkerAdapter,
   type WorkerAnswer,
@@ -2258,6 +2264,196 @@ describe('E9.6 dependency circuit breaker (spec §18.9)', () => {
       expect(circuitSnapshot(h.deps, 'dependency').state).toBe('CLOSED');
     } finally {
       h.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E9.7 (#33) — telemetry wiring on the live path + Observatory through the API
+// ---------------------------------------------------------------------------
+
+describe('E9.7 telemetry recorded on the live path', () => {
+  it('records all six layers for a completed Attempt when the scheduler routes its completion', async () => {
+    const h = humanLoopHarness(completedWorkerResult());
+    try {
+      const { wo, task } = seedExecutingWorkOrder(h.store, h.events);
+
+      // Drive the fake runtime's completion through the real scheduler path.
+      h.scheduler.tick();
+      await h.poll();
+      h.scheduler.tick();
+      await h.poll();
+
+      const attempts = h.store.list<Attempt>('attempts').filter((a) => a.taskId === task.id);
+      expect(attempts).toHaveLength(1);
+      const attemptId = attempts[0]!.id;
+      expect(attempts[0]!.outcome).toBe('success');
+
+      // The live path recorded exactly one per-Attempt telemetry receipt.
+      const receipts = h.events
+        .readEvents({ aggregateType: 'attempt', aggregateId: attemptId })
+        .filter((event) => event.type === TELEMETRY_ATTEMPT_RECORDED);
+      expect(receipts).toHaveLength(1);
+
+      const record = readAttemptTelemetry(h.events, attemptId)!;
+      expect(record).not.toBeNull();
+      expect(Object.keys(record.layers).sort()).toEqual([...TELEMETRY_LAYERS].sort());
+
+      // Real sources, not fabricated data: the outcome/decision layers resolve
+      // from the durable Attempt + Task + Work Order (E9.3 routing decision).
+      expect(record.taskId).toBe(task.id);
+      expect(record.workOrderId).toBe(wo.id);
+      expect(record.layers.outcome.outcome).toBe('success');
+      expect(record.layers.outcome.taskState).toBe('SUCCESS');
+      // No verification has run yet (E9.4 is off this tick): honest not-verified.
+      expect(record.layers.outcome.verified).toBe(false);
+      expect(record.layers.quality.reworkCount).toBe(0);
+      expect(record.layers.decision.model.length).toBeGreaterThan(0);
+
+      // Cost is a runtime observable E1 does not persist: honest `null`, never 0.
+      expect(record.layers.economics.totalCost).toBeNull();
+
+      // A later tick must not record a second receipt (idempotent, no double count).
+      h.scheduler.tick();
+      await h.poll();
+      expect(
+        h.events
+          .readEvents({ aggregateType: 'attempt', aggregateId: attemptId })
+          .filter((event) => event.type === TELEMETRY_ATTEMPT_RECORDED),
+      ).toHaveLength(1);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('records a failed Attempt on the live path with honest unknowns, never fabricated data', async () => {
+    const h = humanLoopHarness(failedWorkerResult('worker blew up'));
+    try {
+      const { task } = seedExecutingWorkOrder(h.store, h.events);
+      h.scheduler.tick();
+      await h.poll();
+      h.scheduler.tick();
+      await h.poll();
+
+      const attempt = h.store.list<Attempt>('attempts').find((a) => a.taskId === task.id)!;
+      expect(attempt.outcome).toBe('failed');
+
+      const record = readAttemptTelemetry(h.events, attempt.id);
+      expect(record).not.toBeNull();
+      expect(record!.layers.outcome.outcome).toBe('failed');
+      expect(record!.layers.outcome.verified).toBe(false);
+      expect(record!.layers.quality.firstPass).toBe(true); // first Attempt, no rework yet
+      expect(record!.layers.quality.failures).toContain('worker blew up');
+      expect(record!.layers.decision.replan).toEqual([
+        { at: expect.any(String), failure: 'worker blew up', recovery: null },
+      ]);
+      // Unknown runtime cost is `null`, not a fabricated 0.
+      expect(record!.layers.economics.totalCost).toBeNull();
+    } finally {
+      h.close();
+    }
+  });
+
+  it('exposes E8 Observatory metrics and the 7-stage drill-down through the real API', async () => {
+    const runtime = runtimeFrom(configText());
+    const deps = buildServerDeps(runtime, { spawn: () => new FakeHerdr() });
+    const server = startFactoryServer(deps);
+    const client = createFactoryClient({ baseUrl: server.url });
+    try {
+      const { wo, task } = seedExecutingWorkOrder(deps.store, deps.events);
+      driveTaskToSuccess(deps.store, deps.events, task.id, 'writer-xl');
+      const attempt = deps.store.list<Attempt>('attempts').find((a) => a.taskId === task.id)!;
+
+      // Record telemetry through the real E8 module (the live path's writer).
+      recordAttemptTelemetry(
+        { store: deps.store, events: deps.events, evidence: createEvidenceReadPort(deps.store) },
+        attempt.id,
+      );
+
+      // Persist a real Evidence Bundle (E9.4's durable output) via E5's verifier.
+      const engine = createVerificationEngine();
+      engine.registerCheck({
+        id: 'typecheck',
+        category: 'deterministic',
+        kind: 'typecheck',
+        run: () => ({ passed: true, evidence: { summary: 'typecheck ok' } }),
+      });
+      engine.registerCheck({
+        id: 'playwright',
+        category: 'behavioral',
+        kind: 'playwright',
+        run: () => ({ passed: true, evidence: { summary: 'playwright ok' } }),
+      });
+      const verifier = createE5Verifier({
+        store: deps.store,
+        engine,
+        judge: {
+          identity: { provider: 'judge-co', model: 'judge-1', family: 'judge-family' },
+          falsify: (context) =>
+            context.criteria.map((criterion) => ({
+              criterion,
+              falsified: false,
+              evidence: { summary: 'judge reviewed' },
+              diagnosis: 'judge falsified',
+              action: 'address',
+            })),
+        },
+        prompt: { id: 'e9.7-verify', version: '1' },
+        rubric: ['satisfies the criterion'],
+        provider: 'factory',
+        now: () => '2026-09-30T12:00:00.000Z',
+      });
+      const outcome = await verifier.verify({
+        workOrder: deps.store.get<WorkOrder>('work_orders', wo.id)!,
+        task: deps.store.get<Task>('tasks', task.id)!,
+        attempt,
+      });
+      expect(outcome.bundle).not.toBeNull();
+      const bundle = outcome.bundle!;
+      deps.store.set('evidence_bundles', bundle.id, bundle);
+
+      // The Observatory route reports real verified/day + throughput from the
+      // persisted bundle (E5's durable verified-change view).
+      const observatory = await client.observatory();
+      expect(observatory.verifiedPerDay.length).toBeGreaterThan(0);
+      expect(observatory.verifiedPerDay[0]!.verifiedChanges).toBeGreaterThanOrEqual(1);
+      expect(observatory.throughputPerHumanHour.verifiedChanges).toBeGreaterThanOrEqual(1);
+      expect(observatory.rework).toBe(0);
+      expect(observatory.cost).toEqual({ total: 0, currency: 'USD' });
+
+      // The drill-down resolves the full 7-stage §23 chain.
+      const drill = await client.drillDown(wo.id);
+      expect(drill.chain.map((step) => step.stage)).toEqual([
+        'work_order',
+        'task',
+        'attempt',
+        'trace',
+        'verification',
+        'evidence',
+        'human_decision',
+      ]);
+      const byStage = new Map(drill.chain.map((step) => [step.stage, step]));
+      expect(byStage.get('work_order')?.refs).toEqual([wo.id]);
+      expect(byStage.get('task')?.refs).toEqual([task.id]);
+      expect(byStage.get('attempt')?.refs).toEqual([attempt.id]);
+      // Trace resolves from the recorded telemetry receipt, evidence from E5.
+      expect(byStage.get('trace')?.status).toBe('available');
+      expect(byStage.get('trace')?.refs).toEqual([attempt.id]);
+      expect(byStage.get('verification')?.status).toBe('available');
+      expect(byStage.get('evidence')?.status).toBe('available');
+      expect(byStage.get('evidence')?.refs).toEqual([bundle.id]);
+      // No human interaction yet: honest stub, never fabricated.
+      expect(byStage.get('human_decision')?.status).toBe('stub');
+      expect(byStage.get('human_decision')?.refs).toEqual([]);
+
+      // An unknown Work Order is a 404, not fabricated data.
+      await expect(client.drillDown('wo_missing')).rejects.toMatchObject({
+        code: 'WORK_ORDER_NOT_FOUND',
+        status: 404,
+      });
+    } finally {
+      server.stop();
+      deps.store.close();
     }
   });
 });

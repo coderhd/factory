@@ -215,6 +215,9 @@ export function buildServerDeps(
     baseBranch: runtime.worktrees.baseBranch,
   });
   const artifacts = createArtifactStore(runtime.paths.artifacts);
+  // One store-backed evidence reader serves both the Observatory projection and
+  // E9.7's per-Attempt telemetry (human-leverage layer) — a single read seam.
+  const evidence = createEvidenceReadPort(store);
   // E9.6 boot reconciliation (spec §18.3): walk durable state → event history →
   // RUNNING Attempts → worker leases before the loop starts. Post-restart no
   // adapter is live, so every lease is treated as stopped (via
@@ -244,6 +247,7 @@ export function buildServerDeps(
       repoPath: runtime.repository.path,
       artifacts,
       policy: createSchedulerPolicy({ store, events }),
+      telemetry: { evidence },
       ...(options.verifier ? { verifier: options.verifier } : {}),
     },
     {
@@ -258,7 +262,7 @@ export function buildServerDeps(
   return {
     store,
     events,
-    evidence: createEvidenceReadPort(store),
+    evidence,
     scheduler,
     version: runtime.factoryVersion,
     schemaVersion: runtime.schemaVersion,

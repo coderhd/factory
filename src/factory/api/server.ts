@@ -9,7 +9,7 @@ import {
   type WorkOrderState,
 } from '../domain/workOrder';
 import type { EventLog } from '../events/log';
-import { projectDrillDown, projectObservatory, type EvidenceReadPort } from '../observatory/observatory';
+import type { EvidenceReadPort } from '../observatory/observatory';
 import { commitDAG, getActiveDAG, proposeDAG, type DAGProposalPayload } from '../planning/dag';
 import {
   answerApproval,
@@ -21,6 +21,10 @@ import {
 } from '../policy/policy';
 import type { Scheduler } from '../scheduler/scheduler';
 import type { StateStore } from '../state/store';
+import {
+  projectDrillDown as projectTelemetryDrillDown,
+  projectTelemetryMetrics,
+} from '../telemetry/telemetry';
 import {
   API_VERSION,
   type AnswerResultDto,
@@ -334,17 +338,27 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
 
     if (resource === 'observatory') {
       if (method === 'GET' && id === undefined) {
-        const dto: ObservatoryDto = {
-          generatedAt: now(),
-          ...projectObservatory(deps.evidence),
-        };
+        // E9.7: the Observatory projection is E8's, over the same store/evidence
+        // seam — verified/day + throughput/human-hour from real evidence bundles,
+        // plus rework and recorded cost. Never fabricates: an empty Factory is
+        // zero/[], not invented data.
+        const dto: ObservatoryDto = projectTelemetryMetrics({
+          store: deps.store,
+          events: deps.events,
+          evidence: deps.evidence,
+        });
         return json(dto);
       }
       if (method === 'GET' && id === 'work-orders' && action !== undefined) {
         const workOrderId = segments[3];
         const tail = segments[4];
         if (tail === 'drill-down') {
-          const drillDown = projectDrillDown(deps.evidence, deps.store, workOrderId);
+          // E9.7: the full §23 chain from E8's projection (trace resolves from
+          // recorded telemetry; verification/evidence from E5's durable rows).
+          const drillDown = projectTelemetryDrillDown(
+            { store: deps.store, events: deps.events, evidence: deps.evidence },
+            workOrderId,
+          );
           if (!drillDown) {
             return apiError('WORK_ORDER_NOT_FOUND', `work order not found: ${workOrderId}`, 404);
           }
