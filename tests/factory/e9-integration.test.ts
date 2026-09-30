@@ -2480,7 +2480,11 @@ describe('E9.7 telemetry recorded on the live path', () => {
       h.scheduler.tick();
       await h.poll();
 
-      const attempt = h.store.list<Attempt>('attempts').find((a) => a.taskId === task.id)!;
+      // #38 re-dispatches a clean-baseline Attempt after the failure, so select
+      // the failed Attempt explicitly (the store's row order is not a contract).
+      const attempt = h.store
+        .list<Attempt>('attempts')
+        .find((a) => a.taskId === task.id && a.outcome === 'failed')!;
       expect(attempt.outcome).toBe('failed');
 
       const record = readAttemptTelemetry(h.events, attempt.id);
@@ -2488,9 +2492,9 @@ describe('E9.7 telemetry recorded on the live path', () => {
       expect(record!.layers.outcome.outcome).toBe('failed');
       expect(record!.layers.outcome.verified).toBe(false);
       expect(record!.layers.quality.firstPass).toBe(true); // first Attempt, no rework yet
-      expect(record!.layers.quality.failures).toContain('worker blew up');
+      expect(record!.layers.quality.failures).toContain('WORKER_FAILURE: worker blew up');
       expect(record!.layers.decision.replan).toEqual([
-        { at: expect.any(String), failure: 'worker blew up', recovery: null },
+        { at: expect.any(String), failure: 'WORKER_FAILURE: worker blew up', recovery: null },
       ]);
       // Unknown runtime cost is `null`, not a fabricated 0.
       expect(record!.layers.economics.totalCost).toBeNull();

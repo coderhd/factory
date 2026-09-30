@@ -23,7 +23,7 @@ import { TELEMETRY_ATTEMPT_RECORDED, readAttemptTelemetry } from '../../src/fact
 import { createVerificationEngine } from '../../src/factory/verification/engine';
 import { createE5Verifier, type WorkVerifier } from '../../src/factory/verification/orchestrator';
 import type { SemanticJudge } from '../../src/factory/verification/semantic';
-import { openStateStore, type StateStore } from '../../src/factory/state/store';
+import { createArtifactStore, openStateStore, type StateStore } from '../../src/factory/state/store';
 import {
   type ExecutionEnvelope,
   type WorkerAdapter,
@@ -69,25 +69,27 @@ import {
  *
  * ## Two seams are exercised deliberately
  *
- * The live scheduler has no caller that re-dispatches a failed/reworked Task
- * (E7's bounded recovery is wired into boot reconciliation and the circuit;
- * the live producer is tracked in #37, and the worker-failure re-dispatch
- * producer in #38). So:
+ * E7's bounded recovery is wired into boot reconciliation and, since #38, the
+ * live worker-failure path (the scheduler classifies a failed `WorkerResult`,
+ * calls `recover()` and re-opens execution with a fresh Assignment against the
+ * clean-baseline Attempt — the "failure+recovery" step exercises this). The
+ * remaining un-wired producer is the circuit live producer (#37). So:
  *
  * - the trace's `failure+recovery` step drives a **real worker failure** through
  *   the scheduler's worker-failure branch on a dedicated probe Work Order and
- *   asserts its exact durable effects (failed Attempt, closed Assignment,
- *   released worker, Task stays RUNNING per invariant 9), then calls the real
- *   E7 `recover()` entry point exactly as a runtime caller would — the same
- *   module-level seam the E9.6 suite exercises — to open a new clean-baseline
- *   Attempt, and the Factory's documented rework/replan path (`commitDAG` v2 in
- *   REWORK; §5.1 `REWORK → EXECUTING`) is driven to re-execute.
+ *   asserts the #38 fix: the failed Attempt, closed Assignment and released
+ *   worker, the old diff preserved as evidence, a new clean-baseline Attempt, a
+ *   fresh Assignment re-dispatching it, and the Task staying RUNNING
+ *   (invariant 9) — no dead-end. The main Work Order's `VERIFICATION_FAILURE`
+ *   rework still calls the real E7 `recover()` entry point exactly as a runtime
+ *   caller would — the same module-level seam the E9.6 suite exercises — and the
+ *   Factory's documented rework/replan path (`commitDAG` v2 in REWORK; §5.1
+ *   `REWORK → EXECUTING`) is driven to re-execute.
  *
- * The probe Work Order is separate on purpose: a worker-failed Task stays
- * RUNNING and would make the main Work Order's rework replan fail
- * `DAG_IN_FLIGHT`, so a dead-end would otherwise be hidden. Nothing is faked:
- * the store, policy, recovery, verification and evidence modules are the
- * production ones.
+ * The probe Work Order is separate on purpose: the worker-failed Task stays
+ * RUNNING (invariant 9) and would make the main Work Order's rework replan fail
+ * `DAG_IN_FLIGHT`. Nothing is faked: the store, policy, recovery, verification
+ * and evidence modules are the production ones.
  */
 
 let workDir: string;
@@ -633,12 +635,11 @@ describe('E9.10 end-to-end acceptance — the roadmap #1 trace', () => {
       expect(failure.some((record) => record.diagnosis.includes('does not compile'))).toBe(true);
 
       // A real **worker failure** driven through the scheduler's worker-failure
-      // branch (a failed/missing-evidence `WorkerResult` settles as a failed
-      // Attempt and releases the worker, leaving the Task RUNNING) on a
-      // dedicated probe Work Order: the
-      // failed Task stays RUNNING (invariant 9) with no re-dispatch caller (the
-      // producer is tracked in #38), so it is kept off the main Work Order —
-      // an in-flight Task would make the rework replan fail DAG_IN_FLIGHT.
+      // branch on a dedicated probe Work Order. E10.2 (#38): the live producer
+      // classifies it, calls E7 recovery, and re-opens execution with a fresh
+      // Assignment against the clean-baseline Attempt — the Task stays RUNNING
+      // (invariant 9) but is no longer dead-ended. Kept off the main Work Order
+      // because an in-flight Task would make the rework replan fail DAG_IN_FLIGHT.
       const probe = await h.client.submitWorkOrder({
         intent: 'worker-failure probe',
         acceptanceCriteria: ['probe'],
@@ -652,27 +653,60 @@ describe('E9.10 end-to-end acceptance — the roadmap #1 trace', () => {
       const probeAssignmentBefore = h.store
         .list<{ id: string; taskId: string; workerId: string; closedAt: string | null }>('assignments')
         .find((row) => row.taskId === probeTaskId)!;
-      h.adapterFor(probeTaskId).release(failedResult('worker blew up'));
+      const probeFailedId = h.store.list<Attempt>('attempts').find((a) => a.taskId === probeTaskId)!.id;
+      h.adapterFor(probeTaskId).release({
+        ...failedResult('worker blew up'),
+        diff: 'diff --git a/src/probe.ts b/src/probe.ts\n+partial probe work',
+      });
       await h.until(
-        'probe-worker-failed',
-        () => attemptFor(h.store, probeTaskId)?.outcome === 'failed',
+        'probe-redispatched',
+        () => h.store.list<Attempt>('attempts').filter((a) => a.taskId === probeTaskId).length === 2,
       );
 
-      // The worker-failure branch's durable effects, exactly:
-      const probeAttempt = attemptFor(h.store, probeTaskId)!;
+      // The failed Attempt: settled (never a success), §9.1 class-prefixed.
+      const probeAttempt = h.store.get<Attempt>('attempts', probeFailedId)!;
       expect(probeAttempt.outcome).toBe('failed');
-      expect(probeAttempt.failureHistory.map((entry) => entry.failure)).toContain('worker blew up');
+      expect(probeAttempt.failureHistory.map((entry) => entry.failure)).toContain(
+        'WORKER_FAILURE: worker blew up',
+      );
+
+      // The old diff is preserved as an immutable evidence artifact (§18.4).
+      const probeArtifacts = createArtifactStore(h.runtime.paths.artifacts);
+      expect(
+        Buffer.from(probeArtifacts.get(`${probeFailedId}/diff.patch`)).toString('utf8'),
+      ).toContain('partial probe work');
+
+      // The old Assignment is closed (the release rule ran).
       const probeAssignmentAfter = h.store
         .list<{ id: string; taskId: string; workerId: string; closedAt: string | null }>('assignments')
         .find((row) => row.id === probeAssignmentBefore.id)!;
       expect(probeAssignmentAfter.closedAt).not.toBeNull();
-      const probeWorker = h.store.get<{ runtimeState: string; lease: unknown }>(
+
+      // E7 opened exactly one clean-baseline Attempt from the live failure, and
+      // the producer re-opened it under a fresh Assignment (a live lease).
+      const probeAttempts = h.store.list<Attempt>('attempts').filter((a) => a.taskId === probeTaskId);
+      expect(probeAttempts).toHaveLength(2);
+      const probeClean = probeAttempts.find((a) => a.id !== probeFailedId)!;
+      expect(probeClean.outcome).toBeNull();
+      expect(probeClean.environment).toBe('clean-worktree');
+      const probeOpenAssignment = h.store
+        .list<{ id: string; taskId: string; workerId: string; closedAt: string | null }>('assignments')
+        .find((row) => row.taskId === probeTaskId && row.closedAt === null);
+      expect(probeOpenAssignment).toBeDefined();
+      const probeLeaseWorker = h.store.get<{ lease: { attemptId: string } | null }>(
         'workers',
-        probeAssignmentBefore.workerId,
+        probeOpenAssignment!.workerId,
       )!;
-      expect(probeWorker.runtimeState).toBe('IDLE');
-      expect(probeWorker.lease).toBeNull();
-      // Invariant 9: the Task stays RUNNING — no dead-end assertion hidden.
+      expect(probeLeaseWorker.lease?.attemptId).toBe(probeClean.id);
+      expect(
+        h.events
+          .readEvents({ aggregateType: 'work_order', aggregateId: probe.id })
+          .filter((event) => event.type === RECOVERY_ACTION_APPLIED)
+          .map((event) => (event.payload as { kind: string }).kind),
+      ).toContain('RETRY_NEW_ATTEMPT');
+
+      // Invariant 9: the Task stays RUNNING — not dead-ended: a fresh Assignment
+      // is live and the clean-baseline Attempt is re-executing.
       expect(taskById(h.store, probeTaskId).state).toBe('RUNNING');
 
       // E7 bounded recovery: a VERIFICATION_FAILURE opens a new clean-baseline

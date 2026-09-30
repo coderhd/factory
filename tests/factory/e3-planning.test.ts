@@ -944,20 +944,23 @@ describe('E3 assignment + completion rules', () => {
       const attempts = h.store.list<{
         taskId: string;
         outcome: string | null;
-        failureHistory: unknown[];
+        failureHistory: Array<{ failure: string }>;
       }>('attempts');
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0].outcome).toBe('failed');
-      expect(attempts[0].failureHistory).toHaveLength(1);
+      // #38: the failed Attempt plus E7's one clean-baseline re-dispatch Attempt.
+      expect(attempts).toHaveLength(2);
+      const failed = attempts.find((attempt) => attempt.outcome === 'failed')!;
+      expect(failed.failureHistory).toHaveLength(1);
+      // §9.1: the durable failure carries the class prefix the classifier reads.
+      expect(failed.failureHistory[0]!.failure).toBe('WORKER_FAILURE: typecheck failed');
 
       // Invariant 9: a failed Attempt does not fail durable Work by itself.
       expect(stateOf(h, a)).toBe('RUNNING');
 
-      // Release rule still frees the worker and closes the assignment.
-      const worker = h.workers.listWorkers()[0];
-      expect(worker.runtimeState).toBe('IDLE');
-      expect(worker.lease).toBeNull();
-      expect(openAssignments(h)).toHaveLength(0);
+      // The release rule closed the failed Assignment; #38 re-opened execution
+      // with a fresh Assignment on a live worker bound to the clean Attempt.
+      const open = openAssignments(h);
+      expect(open).toHaveLength(1);
+      expect(workerOf(h, open[0]!.workerId).runtimeState).toBe('BUSY');
     } finally {
       h.store.close();
     }
@@ -976,7 +979,11 @@ describe('E3 assignment + completion rules', () => {
       await settle();
 
       expect(stateOf(h, a)).toBe('RUNNING');
-      expect(h.store.list<{ outcome: string | null }>('attempts')[0].outcome).toBe('failed');
+      // The evidence-less report settles as a failed Attempt; #38 then opens a
+      // clean-baseline re-dispatch Attempt, so both coexist.
+      const attempts = h.store.list<{ outcome: string | null }>('attempts');
+      expect(attempts.some((attempt) => attempt.outcome === 'failed')).toBe(true);
+      expect(attempts.some((attempt) => attempt.outcome === null)).toBe(true);
     } finally {
       h.store.close();
     }

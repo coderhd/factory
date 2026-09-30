@@ -24,7 +24,12 @@ import {
 } from '../../src/factory/domain/workOrder';
 import type { EvidenceBundle } from '../../src/factory/evidence/bundle';
 import { commitDAG } from '../../src/factory/planning/dag';
-import { openStateStore } from '../../src/factory/state/store';
+import {
+  DEFAULT_RECOVERY_BUDGETS,
+  RECOVERY_ACTION_APPLIED,
+  RESOURCE_UNAVAILABLE,
+} from '../../src/factory/recovery/recovery';
+import { createArtifactStore, openStateStore } from '../../src/factory/state/store';
 import type { SemanticJudge } from '../../src/factory/verification/semantic';
 import {
   createProductionVerifier,
@@ -551,5 +556,289 @@ describe('E10.1 verification config surface', () => {
     const parsed = parseFactoryConfig(serialized);
     expect(parsed.ok).toBe(true);
     if (parsed.ok) expect(parsed.config.verification).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E10.2 (#38) — the live worker-failure re-dispatch producer
+// ---------------------------------------------------------------------------
+
+/**
+ * A Herdr adapter whose report per assignment is released by the test. `execute`
+ * records the envelope, `collectArtifacts` parks until `release(report)` supplies
+ * the runtime's next report — so a task executes exactly once per released
+ * report and the scheduler's collect can be sequenced deterministically.
+ */
+class ScriptedHerdr implements WorkerAdapter {
+  envelope: ExecutionEnvelope | null = null;
+  taskId: string | null = null;
+  private waiter: ((result: WorkerResult) => void) | null = null;
+  private readonly queued: WorkerResult[] = [];
+
+  async provision(): Promise<void> {}
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  async pause(): Promise<void> {}
+  async resume(): Promise<void> {}
+  async status(): Promise<WorkerStatus> {
+    return { state: 'running', lastHeartbeatAt: new Date().toISOString() };
+  }
+  async execute(envelope: ExecutionEnvelope): Promise<void> {
+    this.envelope = envelope;
+    this.taskId = envelope.taskId;
+  }
+  async collectArtifacts(): Promise<WorkerResult> {
+    if (this.queued.length > 0) return structuredClone(this.queued.shift()!);
+    return new Promise<WorkerResult>((resolve) => {
+      this.waiter = resolve;
+    });
+  }
+  async deliverAnswer(_answer: WorkerAnswer): Promise<void> {}
+  async destroy(): Promise<void> {}
+
+  release(result: WorkerResult): void {
+    if (this.waiter) {
+      const waiter = this.waiter;
+      this.waiter = null;
+      waiter(structuredClone(result));
+      return;
+    }
+    this.queued.push(structuredClone(result));
+  }
+}
+
+function failedResult(failure: string, diff: string | null = null): WorkerResult {
+  return {
+    status: 'failed',
+    commits: [],
+    artifacts: [],
+    interactions: [],
+    observations: [],
+    verificationRequests: [],
+    diff,
+    failure,
+  };
+}
+
+interface ProducerHarness {
+  runtime: ReturnType<typeof resolveFactoryConfig>;
+  deps: ReturnType<typeof buildServerDeps>;
+  adapters: ScriptedHerdr[];
+  tickAndSettle(): Promise<void>;
+  until(label: string, predicate: () => boolean, maxTicks?: number): Promise<void>;
+  adapterForAttempt(attemptId: string): ScriptedHerdr;
+}
+
+function producerHarness(): ProducerHarness {
+  const runtime = runtimeFrom(configText(VERIFICATION));
+  const adapters: ScriptedHerdr[] = [];
+  const deps = buildServerDeps(runtime, {
+    spawn: () => {
+      const adapter = new ScriptedHerdr();
+      adapters.push(adapter);
+      return adapter;
+    },
+    // A hermetic E5 verifier (fake judge, no subprocess) so a re-dispatched
+    // Attempt that completes is verified for real without warning noise.
+    verification: { judge: passingJudge(), runCommand: passingRunner() },
+  });
+  const tickAndSettle = async (): Promise<void> => {
+    deps.scheduler!.tick();
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  };
+  return {
+    runtime,
+    deps,
+    adapters,
+    tickAndSettle,
+    async until(label, predicate, maxTicks = 30): Promise<void> {
+      for (let i = 0; i < maxTicks; i += 1) {
+        await tickAndSettle();
+        if (predicate()) return;
+        await tickAndSettle();
+        if (predicate()) return;
+      }
+      throw new Error(`E10.2: "${label}" was not reached within the tick budget`);
+    },
+    adapterForAttempt(attemptId): ScriptedHerdr {
+      const adapter = adapters.find((candidate) => candidate.envelope?.attemptId === attemptId);
+      if (!adapter) throw new Error(`no adapter dispatched for attempt ${attemptId}`);
+      return adapter;
+    },
+  };
+}
+
+const taskById = (store: ReturnType<typeof buildServerDeps>['store'], id: string): Task =>
+  store.get<Task>('tasks', id)!;
+
+const attemptsFor = (store: ReturnType<typeof buildServerDeps>['store'], taskId: string): Attempt[] =>
+  store
+    .list<Attempt>('attempts')
+    .filter((attempt) => attempt.taskId === taskId)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+
+const openAssignmentForTask = (
+  store: ReturnType<typeof buildServerDeps>['store'],
+  taskId: string,
+): { id: string; workerId: string; closedAt: string | null } | undefined =>
+  store
+    .list<{ id: string; taskId: string; workerId: string; closedAt: string | null }>('assignments')
+    .find((row) => row.taskId === taskId && row.closedAt === null);
+
+const recoveryActions = (
+  deps: ReturnType<typeof buildServerDeps>,
+  workOrderId: string,
+): Array<{ kind: string }> =>
+  deps.events
+    .readEvents({ aggregateType: 'work_order', aggregateId: workOrderId })
+    .filter((event) => event.type === RECOVERY_ACTION_APPLIED)
+    .map((event) => event.payload as { kind: string });
+
+describe('E10.2 worker-failure re-dispatch producer', () => {
+  it('re-dispatches a live worker failure as a fresh Assignment against E7’s clean-baseline Attempt (Task stays RUNNING), preserving the old diff as evidence', async () => {
+    const h = producerHarness();
+    try {
+      const { wo, task } = seedExecuting(h.deps);
+      // Kick execution: the Task is assigned and RUNNING on a live Attempt.
+      await h.until('running', () => taskById(h.deps.store, task.id).state === 'RUNNING');
+      const first = attemptsFor(h.deps.store, task.id);
+      expect(first).toHaveLength(1);
+      const attemptA = first[0]!;
+      const adapterA = h.adapterForAttempt(attemptA.id);
+
+      // The live worker fails with a partial diff left behind — the evidence to keep.
+      const oldDiff = 'diff --git a/src/orders.ts b/src/orders.ts\n+partial work';
+      adapterA.release(failedResult('worker blew up', oldDiff));
+
+      await h.until('re-dispatched', () => attemptsFor(h.deps.store, task.id).length === 2);
+
+      // The failed Attempt is settled, never a success, and keeps its diff.
+      const failed = h.deps.store.get<Attempt>('attempts', attemptA.id)!;
+      expect(failed.outcome).toBe('failed');
+      expect(failed.outcome).not.toBe('success');
+      expect(failed.diff).toContain('partial work');
+
+      // The old diff is preserved as an immutable evidence artifact (§18.4).
+      const artifacts = createArtifactStore(h.runtime.paths.artifacts);
+      expect(Buffer.from(artifacts.get(`${attemptA.id}/diff.patch`)).toString('utf8')).toContain(
+        'partial work',
+      );
+
+      // Exactly one NEW Attempt, opened by E7 from a clean baseline.
+      const second = attemptsFor(h.deps.store, task.id);
+      expect(second).toHaveLength(2);
+      const attemptB = second.find((attempt) => attempt.id !== attemptA.id)!;
+      expect(attemptB.outcome).toBeNull();
+      expect(attemptB.environment).toBe('clean-worktree');
+      expect(attemptB.context).toContain('clean-worktree');
+
+      // E7's bounded recovery recorded the RETRY_NEW_ATTEMPT action.
+      const actions = recoveryActions(h.deps, wo.id);
+      expect(actions.map((action) => action.kind)).toContain('RETRY_NEW_ATTEMPT');
+
+      // The producer re-opens execution: a fresh Assignment binds the new Attempt
+      // to a live worker (lease.attemptId), and that worker is dispatched the
+      // envelope for the clean-baseline Attempt.
+      await h.until('fresh-assignment-dispatched', () => {
+        const open = openAssignmentForTask(h.deps.store, task.id);
+        if (!open) return false;
+        const worker = h.deps.store.get<{ lease: { attemptId: string } | null }>(
+          'workers',
+          open.workerId,
+        );
+        return worker?.lease?.attemptId === attemptB.id;
+      });
+      const dispatched = h.adapterForAttempt(attemptB.id);
+      expect(dispatched.envelope!.attemptId).toBe(attemptB.id);
+
+      // Invariant 9 (controller ruling RF6): the Task stays RUNNING and now has a
+      // live re-dispatch, so it does not dead-end.
+      expect(taskById(h.deps.store, task.id).state).toBe('RUNNING');
+
+      // No duplicate side effects: a replayed/continued poll mints no third Attempt.
+      await h.tickAndSettle();
+      await h.tickAndSettle();
+      expect(attemptsFor(h.deps.store, task.id)).toHaveLength(2);
+      expect(recoveryActions(h.deps, wo.id).filter((a) => a.kind === 'RETRY_NEW_ATTEMPT')).toHaveLength(1);
+    } finally {
+      h.deps.store.close();
+    }
+  });
+
+  it('re-executes the re-dispatched Attempt under the fresh Assignment (the clean baseline runs, not the failed one)', async () => {
+    const h = producerHarness();
+    try {
+      const { task } = seedExecuting(h.deps);
+      await h.until('running', () => taskById(h.deps.store, task.id).state === 'RUNNING');
+      const attemptA = attemptsFor(h.deps.store, task.id)[0]!;
+      h.adapterForAttempt(attemptA.id).release(failedResult('worker blew up', 'diff --git a/x b/x\n+old'));
+
+      await h.until('re-dispatched', () => attemptsFor(h.deps.store, task.id).length === 2);
+      const attemptB = attemptsFor(h.deps.store, task.id).find((a) => a.id !== attemptA.id)!;
+      await h.until('clean-dispatched', () => {
+        const open = openAssignmentForTask(h.deps.store, task.id);
+        return Boolean(open) && h.deps.store.get<{ lease: { attemptId: string } | null }>('workers', open!.workerId)?.lease?.attemptId === attemptB.id;
+      });
+
+      // The fresh worker reports completion with evidence: the re-dispatch really
+      // re-runs the Task on the new Attempt (SUCCESS is governed by E3's gate).
+      h.adapterForAttempt(attemptB.id).release({
+        status: 'completed',
+        commits: [],
+        artifacts: [],
+        interactions: [],
+        observations: [],
+        verificationRequests: [],
+        diff: 'diff --git a/src/orders.ts b/src/orders.ts\n+fixed work',
+        failure: null,
+      });
+      await h.until('success', () => taskById(h.deps.store, task.id).state === 'SUCCESS');
+      // The re-dispatched Attempt completed with evidence on the fresh Assignment.
+      expect(h.deps.store.get<Attempt>('attempts', attemptB.id)!.outcome).toBe('success');
+      expect(h.deps.store.get<Attempt>('attempts', attemptA.id)!.outcome).toBe('failed');
+      // The failed Attempt's diff is not overwritten: both are durable evidence.
+      expect(h.deps.store.get<Attempt>('attempts', attemptA.id)!.diff).toContain('old');
+    } finally {
+      h.deps.store.close();
+    }
+  });
+
+  it('is bounded: with the Work-Order recovery ceiling exhausted, a live worker failure escalates and mints no new Attempt', async () => {
+    const h = producerHarness();
+    try {
+      const { wo, task } = seedExecuting(h.deps);
+      await h.until('running', () => taskById(h.deps.store, task.id).state === 'RUNNING');
+      const attemptA = attemptsFor(h.deps.store, task.id)[0]!;
+
+      // Spend the Work-Order automatic-recovery ceiling before the failure lands.
+      for (let i = 0; i < DEFAULT_RECOVERY_BUDGETS.workOrderCeiling; i += 1) {
+        h.deps.events.appendEvent({
+          type: RECOVERY_ACTION_APPLIED,
+          aggregateType: 'work_order',
+          aggregateId: wo.id,
+          payload: { kind: 'RETRY_NEW_ATTEMPT' },
+        });
+      }
+
+      h.adapterForAttempt(attemptA.id).release(failedResult('worker blew up'));
+
+      await h.until('escalated', () =>
+        recoveryActions(h.deps, wo.id).some((action) => action.kind === 'ESCALATE_HUMAN'),
+      );
+
+      // Bounded: no unbounded retry — the failed Attempt is the only one, and no
+      // fresh Assignment re-opens execution.
+      expect(attemptsFor(h.deps.store, task.id)).toHaveLength(1);
+      expect(openAssignmentForTask(h.deps.store, task.id)).toBeUndefined();
+      expect(recoveryActions(h.deps, wo.id).filter((a) => a.kind === 'ESCALATE_HUMAN')).toHaveLength(1);
+      // Invariant 9: the Task is parked RUNNING (never silently failed), awaiting
+      // the human escalation path — not looping.
+      expect(taskById(h.deps.store, task.id).state).toBe('RUNNING');
+      await h.tickAndSettle();
+      await h.tickAndSettle();
+      expect(attemptsFor(h.deps.store, task.id)).toHaveLength(1);
+    } finally {
+      h.deps.store.close();
+    }
   });
 });

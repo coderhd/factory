@@ -11,7 +11,12 @@ import type { EventLog } from '../events/log';
 import { getActiveDAG, type DAGVersion } from '../planning/dag';
 import { createEvidenceReadPort, type EvidenceReadPort } from '../observatory/observatory';
 import { changedPathsFromDiff, isEmergencyStopped, isFactoryPaused } from '../policy/policy';
-import { RESOURCE_UNAVAILABLE } from '../recovery/recovery';
+import {
+  encodeFailure,
+  recover,
+  RESOURCE_UNAVAILABLE,
+  type FailureContext,
+} from '../recovery/recovery';
 import { routeAssignment } from '../routing/assignment';
 import type { BudgetState, ModelId } from '../routing/decisionModel';
 import { persistRoutingDecision } from '../routing/persist';
@@ -21,7 +26,9 @@ import { recordAttemptTelemetry, TELEMETRY_ATTEMPT_RECORDED } from '../telemetry
 import type { WorkerAnswer, WorkerInteraction, WorkerResult } from '../workers/herdr';
 import {
   assign,
+  dispatchReopenedAttempt,
   openAssignmentFor,
+  reopenAttempt,
   startTask,
   type AssignmentRecord,
   type WorkerManager,
@@ -549,10 +556,17 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     }
 
     // Failure, missing evidence or a dispatch rejection: failed Attempt, Task
-    // stays RUNNING (invariant 9), but the worker is still released.
-    const failure =
-      result?.failure ?? item.error ?? 'worker reported failure without evidence';
+    // stays RUNNING (invariant 9), but the worker is still released. E10.2
+    // (#38): the live failure is then handed to E7's bounded recovery, which
+    // re-opens execution with a fresh Assignment (the dead-end was the missing
+    // re-dispatcher, not the RUNNING state). The diff is preserved as immutable
+    // evidence before the clean-baseline re-dispatch (§18.4).
+    const detail = result?.failure ?? item.error ?? 'worker reported failure without evidence';
+    const failure = encodeFailure('WORKER_FAILURE', detail);
     const artifactIds = result ? storeArtifacts(attemptId, result) : [];
+    if (result?.diff && result.diff.trim().length > 0 && deps.artifacts) {
+      deps.artifacts.put(`${attemptId}/diff.patch`, result.diff);
+    }
     deps.store.db.transaction(() => {
       completeAttempt(deps, attemptId, {
         outcome: 'failed',
@@ -563,6 +577,49 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       release(worker, assignment, t);
     })();
     recordTelemetry(attemptId);
+    recoverWorkerFailure(task, attemptId, detail);
+  }
+
+  /**
+   * Hand a live worker failure to E7's bounded recovery (E10.2, #38). E7
+   * classifies it `WORKER_FAILURE`, applies its budgeted action, and — for
+   * `RETRY_NEW_ATTEMPT` — mints the single clean-baseline Attempt. The actual
+   * re-dispatch (a fresh Assignment against that open Attempt) is performed by
+   * {@link redispatchPass} on this or a following tick. A recovery error must
+   * never strand the tick: it is surfaced loudly and the Task stays RUNNING
+   * (invariant 9), retried next tick.
+   */
+  function recoverWorkerFailure(task: Task, attemptId: string, detail: string): void {
+    const attempt = deps.store.get<Attempt>('attempts', attemptId);
+    const failure: FailureContext = {
+      attemptId,
+      taskId: task.id,
+      workOrderId: task.workOrderId,
+      failureClass: 'WORKER_FAILURE',
+      error: detail,
+      // §18.4 default: a new Attempt from a clean worktree is the changed condition.
+      changedCondition: 'clean-worktree',
+      // Post-completion failureHistory length, so a replayed delivery computes
+      // the same §9.6 idempotency key.
+      failureIndex: attempt?.failureHistory.length ?? 1,
+    };
+    try {
+      recover(
+        {
+          store: deps.store,
+          events: deps.events,
+          now,
+          ...(deps.artifacts ? { artifacts: deps.artifacts } : {}),
+        },
+        failure,
+      );
+    } catch (error) {
+      console.error(
+        `scheduler: worker-failure recovery failed for attempt ${attemptId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   // --- passes ----------------------------------------------------------------
@@ -753,6 +810,81 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         skipped.add(candidate.task.id);
       }
     }
+  }
+
+  /**
+   * E10.2 (#38): re-open execution for a Task whose E7 recovery minted a
+   * clean-baseline Attempt but which has no live dispatch. A RUNNING Task with
+   * an open Attempt and no open Assignment is an un-dispatched recovery Attempt;
+   * bind it to a fresh idle worker on a clean worktree and dispatch it. The
+   * Attempt is E7's (never re-minted here), so `assignPass` — which only picks
+   * `READY` Tasks — can never mint a second Attempt for a recovery re-dispatch.
+   * Idempotent: once assigned, the open Assignment excludes the Task next tick.
+   */
+  function redispatchPass(): void {
+    if (!deps.repoPath) return;
+    for (const scope of scopes()) {
+      for (const task of scope.tasks) {
+        if (task.state !== 'RUNNING') continue;
+        const hasOpenAssignment = deps.store
+          .list<AssignmentRecord>('assignments')
+          .some((assignment) => assignment.taskId === task.id && assignment.closedAt === null);
+        if (hasOpenAssignment) continue;
+        const attempt = deps.store
+          .list<Attempt>('attempts')
+          .filter((candidate) => candidate.taskId === task.id && candidate.outcome === null)
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+          .at(-1);
+        if (!attempt) continue;
+        const idleWorker = deps.workers.listWorkers().find((worker) => worker.runtimeState === 'IDLE');
+        if (!idleWorker) continue;
+        let assignment: AssignmentRecord | null = null;
+        try {
+          const worktree = deps.worktrees.createTaskWorktree(task.id, scope.workOrder.id, deps.repoPath);
+          assignment = reopenAttempt(
+            { ...deps, leaseTtlMs },
+            { attemptId: attempt.id, workerId: idleWorker.id, worktree },
+          );
+          dispatchReopenedAttempt({ ...deps, leaseTtlMs }, assignment);
+          pollWorker(idleWorker.id);
+        } catch (error) {
+          // A reopen that committed but whose dispatch then failed is
+          // compensated (close the Assignment, release the worker) so the
+          // worker and the clean Attempt are not wedged — the Task stays
+          // RUNNING and the re-dispatch is retried next tick. A pre-commit
+          // failure has nothing to compensate.
+          if (assignment) compensateFailedReopen(assignment);
+          console.error(
+            `scheduler: re-dispatch of attempt ${attempt.id} failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * Compensate a committed `reopenAttempt` whose dispatch failed: close the
+   * open Assignment and release the worker, leaving the Task `RUNNING` (unlike
+   * {@link compensateFailedStart}, it does not revert the Task state — the Task
+   * never left RUNNING, and the clean Attempt must remain open for retry).
+   */
+  function compensateFailedReopen(assignment: AssignmentRecord): void {
+    const at = now();
+    const worker = deps.store.get<WorkerRecord>('workers', assignment.workerId);
+    deps.store.db.transaction(() => {
+      const open = deps.store.get<AssignmentRecord>('assignments', assignment.id);
+      if (open) deps.store.set('assignments', open.id, { ...open, closedAt: at, updatedAt: at });
+      if (worker) {
+        deps.store.set('workers', worker.id, {
+          ...worker,
+          runtimeState: 'IDLE',
+          lease: null,
+          lastActiveAt: at,
+        });
+      }
+    })();
   }
 
   function countOccupied(): number {
@@ -1012,6 +1144,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     reclaimPass();
     provisionPass();
     assignPass();
+    redispatchPass();
   }
 
   function status(): SchedulerStatus {
