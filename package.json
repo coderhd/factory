@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "factory": "./src/cli/factory.ts"
+  },
   "//": "Root manifest for the Factory type gate. This repo has no runtime dependencies: `src/` imports only Bun/Node builtins. These devDependencies exist so `scripts/check-tsc.sh` is self-contained and reproducible on a clean checkout (no reliance on a home-directory or global node_modules).",
   "devDependencies": {
     "@types/bun": "1.4.2",
