@@ -384,6 +384,7 @@ export function buildServerDeps(
       artifacts,
       policy: createSchedulerPolicy({ store, events }),
       telemetry: { evidence },
+      ...(options.now ? { now: options.now } : {}),
       ...(verifier ? { verifier } : {}),
       ...(options.circuit ? { circuit: options.circuit } : {}),
     },

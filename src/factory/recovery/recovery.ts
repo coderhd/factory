@@ -98,12 +98,28 @@ export interface FailureContext {
    */
   dependency?: string;
   /**
+   * E10.3 (#37, RF8(c)): the scheduler already admitted this delivery through the
+   * circuit gate (`beforeDependencyRequest`) when it dispatched the Attempt — so
+   * this delivery is the admitted operation's *outcome*, not a new request. Set
+   * this to settle a HALF_OPEN probe the scheduler admitted at dispatch (a
+   * failure is, by construction, a failed probe): `recover()` then records the
+   * failure directly instead of re-gating and shedding its own probe.
+   */
+  circuitAdmitted?: boolean;
+  /**
    * The durable failure index (`failureHistory.length` at delivery time). The
    * §9.6 idempotency key is `recover:{attemptId}:{failureIndex}`; callers
    * delivering a failure pass it so a replay computes the same key even after
    * the action appended to `failureHistory`.
    */
   failureIndex?: number;
+  /**
+   * An explicit §9.6 idempotency key, overriding the derived
+   * `recover:{attemptId}:{failureIndex}`. The dependency reopener
+   * (`reopenAfterDependencyRecovery`) uses it so its action is de-duplicated
+   * under its own key rather than colliding with the original outage delivery.
+   */
+  idempotencyKey?: string;
   retryAfterMs?: number;
 }
 
@@ -216,6 +232,7 @@ function actionKey(deps: RecoveryDeps, failure: FailureContext): string | null {
   // Idempotency keys are bound to a durable Attempt (§9.6). With no durable
   // Attempt there is nothing to protect against a duplicate side effect.
   if (!attempt) return null;
+  if (failure.idempotencyKey) return failure.idempotencyKey;
   const index = failure.failureIndex ?? attempt.failureHistory.length;
   return `recover:${failure.attemptId}:${index}`;
 }
@@ -459,15 +476,23 @@ export function recover(deps: RecoveryDeps, failure: FailureContext): RecoveryAc
     // Gate first: an OPEN circuit sheds (and, past the probe window, admits the
     // single HALF_OPEN probe). A shed is not evidence about the dependency, so it
     // is not recorded as a failure — an OPEN circuit keeps its existing window.
-    const gate = beforeDependencyRequest(deps, dependency, deps.circuit);
-    if (!gate.allowed) {
-      const shed: RecoveryAction = {
-        kind: 'WAITING_RESOURCE',
-        resource: dependency,
-        ...(gate.retryAfterMs !== undefined ? { retryAfterMs: gate.retryAfterMs } : {}),
-      };
-      applyAction(deps, failure, shed, key);
-      return shed;
+    //
+    // E10.3 (#37, RF8(c)): when the *scheduler* already admitted this delivery
+    // through the gate at dispatch time (`circuitAdmitted`), the delivery is that
+    // admitted operation's outcome — re-gating here would see the scheduler's own
+    // in-flight probe and shed it, dropping the failure evidence. Skip the gate
+    // and settle the probe directly.
+    if (!failure.circuitAdmitted) {
+      const gate = beforeDependencyRequest(deps, dependency, deps.circuit);
+      if (!gate.allowed) {
+        const shed: RecoveryAction = {
+          kind: 'WAITING_RESOURCE',
+          resource: dependency,
+          ...(gate.retryAfterMs !== undefined ? { retryAfterMs: gate.retryAfterMs } : {}),
+        };
+        applyAction(deps, failure, shed, key);
+        return shed;
+      }
     }
     // The operation was admitted: this delivery is live evidence about the
     // dependency. Count the failure — which trips OPEN at the threshold, or
@@ -502,6 +527,63 @@ export function recover(deps: RecoveryDeps, failure: FailureContext): RecoveryAc
   const action = decide(deps, failure, counts);
   if (action.kind === 'NO_OP_DUPLICATE' || action.kind === 'HOLD') return action;
 
+  applyAction(deps, failure, action, key);
+  return action;
+}
+
+/**
+ * E10.3 (#37, RF8(a)): the **bounded reopener** for a Task parked on a
+ * dependency outage that has since recovered. The scheduler calls this when the
+ * dependency's circuit **closes** (a live success), so a Task stranded on
+ * `WAITING_RESOURCE` is not left silently RUNNING forever.
+ *
+ * It runs the ordinary §9.4 bounded wheel for a `DEPENDENCY_UNAVAILABLE` retry
+ * with the changed condition `dependency-recovered` — bounded by per-Task
+ * attempts, per-class retries and the Work-Order ceiling — and mints a single
+ * clean-baseline Attempt on `RETRY_NEW_ATTEMPT`. It deliberately does **not**
+ * feed the circuit breaker (the outage is over; this is not a failure delivery)
+ * and never applies a `WAITING_RESOURCE` side effect (a refused reopen leaves the
+ * Task parked exactly as it was — no per-tick churn).
+ */
+export function reopenAfterDependencyRecovery(
+  deps: RecoveryDeps,
+  input: {
+    attemptId: string;
+    taskId: string;
+    workOrderId: string;
+    dependency: string;
+    requiredModel?: string;
+  },
+): RecoveryAction {
+  const attempt = deps.store.get<Attempt>('attempts', input.attemptId);
+  const failure: FailureContext = {
+    attemptId: input.attemptId,
+    taskId: input.taskId,
+    workOrderId: input.workOrderId,
+    failureClass: 'DEPENDENCY_UNAVAILABLE',
+    error: `dependency ${input.dependency} recovered`,
+    dependency: input.dependency,
+    changedCondition: 'dependency-recovered',
+    failureIndex: attempt?.failureHistory.length ?? 1,
+    // A distinct key from the original outage delivery, so the reopen is
+    // de-duplicated on its own rather than being read as the earlier failure's
+    // replay (`recover:{attemptId}:{failureIndex}`).
+    idempotencyKey: `reopen:${input.attemptId}:${input.dependency}`,
+    ...(input.requiredModel ? { requiredModel: input.requiredModel } : {}),
+  };
+  const key = actionKey(deps, failure);
+  if (key && alreadyApplied(deps, key)) return { kind: 'NO_OP_DUPLICATE' };
+
+  const derived = deriveCounts(deps, failure);
+  const counts = {
+    attemptCount: failure.attemptCount ?? derived.attemptCount,
+    sameClassCount: failure.sameClassCount ?? derived.sameClassCount,
+    woAutomatic: countAutomaticRecovery(deps, failure.workOrderId),
+  };
+  const action = decide(deps, failure, counts);
+  // A refused reopen (bounds exhausted) is returned unapplied: the Task stays
+  // parked and no side effect is re-recorded every tick.
+  if (action.kind !== 'RETRY_NEW_ATTEMPT') return action;
   applyAction(deps, failure, action, key);
   return action;
 }

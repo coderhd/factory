@@ -15,6 +15,7 @@ import {
   encodeFailure,
   parseFailureClass,
   recover,
+  reopenAfterDependencyRecovery,
   RESOURCE_UNAVAILABLE,
   type FailureClass,
   type FailureContext,
@@ -25,6 +26,7 @@ import {
   circuitSnapshot,
   recordDependencySuccess,
   type CircuitConfig,
+  type CircuitDecision,
 } from '../recovery/circuitBreaker';
 import { routeAssignment } from '../routing/assignment';
 import type { BudgetState, ModelId } from '../routing/decisionModel';
@@ -159,6 +161,11 @@ export interface SchedulerStatus {
       kind: string;
       attemptId: string;
       reason?: string;
+      /**
+       * E10.3 (#37, RF8(a)): the dependency a `WAITING_RESOURCE` park is waiting
+       * on. The reopener re-dispatches the Task once its circuit closes.
+       */
+      dependency?: string;
     }>;
   };
   activeDAGs: Array<{ workOrderId: string; version: number; nodes: number }>;
@@ -252,10 +259,14 @@ export function classifyWorkerFailure(
     return { failureClass: 'WORKER_FAILURE', message: detail };
   }
   const colon = detail.indexOf(':');
-  const message = colon >= 0 ? detail.slice(colon + 1).trim() : detail;
+  const tail = colon >= 0 ? detail.slice(colon + 1).trim() : '';
+  // A bare class token (`DEPENDENCY_UNAVAILABLE`) or an empty tail must not be
+  // re-encoded as `CLASS: CLASS`; fall back to a generic human message.
+  const message = tail.length > 0 ? tail : parsed.toLowerCase().replace(/_/g, ' ');
   // Key the circuit on the concrete dependency the run needed (its model), so a
   // failure, its dispatch gate and its closing success all agree on one bucket.
-  return { failureClass: parsed, message, ...(model ? { dependency: model } : {}) };
+  // The fallback matches the dispatch gate/success key exactly (`provider`).
+  return { failureClass: parsed, message, dependency: model ?? 'provider' };
 }
 
 /** E10.3 (#37): the `beforeDependencyRequest` key for a worker-bound dispatch. */
@@ -373,6 +384,13 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
    */
   const shedSignatures = new Set<string>();
   /**
+   * E10.3 (#37, RF8(c)): `taskId:dependency` markers for HALF_OPEN probes the
+   * **scheduler** admitted at dispatch. A failure delivery for one of these is
+   * that probe's outcome, so it is passed to `recover()` as already-admitted and
+   * settles the probe instead of being re-gated and shed.
+   */
+  const probeDispatches = new Set<string>();
+  /**
    * E10.2 (#38, RF7): Tasks parked on a recovery action the live scheduler has
    * no executor for (or a recovery error). Seeded from the durable log on
    * construction so a restart surfaces an existing park, and appended when one
@@ -385,6 +403,12 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     kind: string;
     attemptId: string;
     reason?: string;
+    /**
+     * E10.3 (#37, RF8(a)): the dependency whose outage parked this Task on
+     * `WAITING_RESOURCE`. The reopener re-dispatches the Task (bounded) once that
+     * dependency's circuit closes.
+     */
+    dependency?: string;
   }> = deps.events
     .readEvents()
     .filter((event) => event.type === RECOVERY_PARKED)
@@ -394,6 +418,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         attemptId?: string;
         kind?: string;
         reason?: string;
+        dependency?: string;
       };
       return {
         taskId: payload.taskId ?? '',
@@ -401,6 +426,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         kind: payload.kind ?? 'UNKNOWN',
         attemptId: payload.attemptId ?? '',
         ...(payload.reason ? { reason: payload.reason } : {}),
+        ...(payload.dependency ? { dependency: payload.dependency } : {}),
       };
     });
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -644,14 +670,19 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
    * past the reset window a single HALF_OPEN probe is admitted. A shed records a
    * durable, idempotent `resource.unavailable` park so it is observable.
    */
-  function admitDependency(model: string | null | undefined, taskId: string): boolean {
+  function admitDependency(model: string | null | undefined, taskId: string): CircuitDecision {
     const dependency = dependencyKeyForModel(model);
     const decision = beforeDependencyRequest(
       { events: deps.events, now },
       dependency,
       deps.circuit,
     );
-    if (decision.allowed) return true;
+    if (decision.allowed) {
+      // Admitted: a *later* outage is a distinct event and must be able to
+      // record a fresh park, so drop the previous shed signature.
+      shedSignatures.delete(`${taskId}:${dependency}`);
+      return decision;
+    }
     const signature = `${taskId}:${dependency}`;
     if (!shedSignatures.has(signature)) {
       shedSignatures.add(signature);
@@ -662,7 +693,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         payload: { resource: dependency, dependency, taskId, at: now() },
       });
     }
-    return false;
+    return decision;
   }
 
   /**
@@ -674,10 +705,24 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
   function settleDependencySuccess(model: string | null | undefined): void {
     const dependency = dependencyKeyForModel(model);
     const circuitDeps = { events: deps.events, now };
+    // The dispatch that completed was the admitted operation: clear its probe
+    // marker and any shed signatures for this dependency so a future outage is a
+    // fresh park, whether or not the circuit needed an explicit close.
+    clearDependencyMarkers(dependency);
     if (circuitSnapshot(circuitDeps, dependency).state === 'CLOSED') {
       return;
     }
     recordDependencySuccess(circuitDeps, dependency);
+  }
+
+  /** Drop every `task:dependency` shed + probe marker for one dependency. */
+  function clearDependencyMarkers(dependency: string): void {
+    for (const signature of shedSignatures) {
+      if (signature.endsWith(`:${dependency}`)) shedSignatures.delete(signature);
+    }
+    for (const signature of probeDispatches) {
+      if (signature.endsWith(`:${dependency}`)) probeDispatches.delete(signature);
+    }
   }
 
   function routeCompletion(item: Completion): void {
@@ -789,6 +834,11 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     classified: ReturnType<typeof classifyWorkerFailure>,
   ): void {
     const attempt = deps.store.get<Attempt>('attempts', attemptId);
+    const dependency = classified.dependency;
+    // E10.3 (#37, RF8(c)): if the scheduler admitted this dependency's HALF_OPEN
+    // probe for this Task at dispatch, this delivery is that probe's outcome.
+    const circuitAdmitted =
+      dependency !== undefined && probeDispatches.delete(`${task.id}:${dependency}`);
     const failure: FailureContext = {
       attemptId,
       taskId: task.id,
@@ -802,7 +852,8 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       failureIndex: attempt?.failureHistory.length ?? 1,
       // E10.3 (#37): a dependency outage keys the circuit on the concrete
       // dependency (the failed run's model), matching its dispatch gate.
-      ...(classified.dependency ? { dependency: classified.dependency } : {}),
+      ...(dependency ? { dependency } : {}),
+      ...(circuitAdmitted ? { circuitAdmitted: true } : {}),
     };
     let action: RecoveryAction;
     try {
@@ -819,6 +870,15 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       parkRecovery(task, attemptId, 'RECOVERY_ERROR', message);
+      return;
+    }
+    if (action.kind === 'WAITING_RESOURCE' && dependency) {
+      // E10.3 (#37, RF8(a)): a Task parked on a dependency outage has no open
+      // Attempt (`WAITING_RESOURCE` mints none) and would otherwise sit RUNNING
+      // and silent forever. Park it **visibly** — a durable `recovery.parked`
+      // event plus a `status()` entry — and record the dependency so the reopener
+      // re-dispatches it (bounded) once the circuit closes.
+      parkRecovery(task, attemptId, 'WAITING_RESOURCE', action.resource, dependency);
       return;
     }
     if (!LIVE_EXECUTABLE_RECOVERY_KINDS.has(action.kind)) {
@@ -842,6 +902,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     attemptId: string,
     kind: string,
     reason: string | undefined,
+    dependency?: string,
   ): void {
     if (parkedRecoveries.some((entry) => entry.taskId === task.id && entry.kind === kind)) return;
     const at = now();
@@ -851,6 +912,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       kind,
       attemptId,
       ...(reason ? { reason } : {}),
+      ...(dependency ? { dependency } : {}),
     };
     deps.store.db.transaction(() => {
       deps.events.appendEvent({
@@ -862,8 +924,60 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     })();
     parkedRecoveries.push(entry);
     console.error(
-      `scheduler: task ${task.id} parked on recovery action ${kind}${reason ? ` (${reason})` : ''} with no live executor — a human/operator path is required; the Task stays RUNNING`,
+      `scheduler: task ${task.id} parked on recovery action ${kind}${reason ? ` (${reason})` : ''}${
+        dependency
+          ? ` waiting on dependency ${dependency} (a reopener re-dispatches it when the circuit closes)`
+          : ' with no live executor'
+      } — the Task stays RUNNING`,
     );
+  }
+
+  /**
+   * E10.3 (#37, RF8(a)): the dependency reopener. For every Task visibly parked on
+   * a dependency outage (`WAITING_RESOURCE` with a recorded dependency) whose
+   * circuit has since **closed**, ask E7's bounded reopen path for a
+   * clean-baseline Attempt; {@link redispatchPass} then dispatches it. If E7's
+   * §9.4 bounds refuse the reopen, the action is `WAITING_RESOURCE` again and the
+   * Task stays visibly parked (bounded — never an unbounded retry loop). Clears
+   * the park entry for a Task it reopens so `status()` does not show a stale park.
+   */
+  function reopenDependencyPass(): void {
+    for (const entry of [...parkedRecoveries]) {
+      if (entry.kind !== 'WAITING_RESOURCE' || !entry.dependency) continue;
+      const task = deps.store.get<Task>('tasks', entry.taskId);
+      // Only a RUNNING Task with no open Attempt is a stranded park; a Task that
+      // already has one is handled by `redispatchPass`.
+      if (!task || task.state !== 'RUNNING') continue;
+      const openAttempt = deps.store
+        .list<Attempt>('attempts')
+        .some((attempt) => attempt.taskId === task.id && attempt.outcome === null);
+      if (openAttempt) continue;
+      // The reopener acts only once the dependency has actually recovered.
+      if (circuitSnapshot({ events: deps.events, now }, entry.dependency).state !== 'CLOSED') continue;
+      const attempt = deps.store.get<Attempt>('attempts', entry.attemptId);
+      const action = reopenAfterDependencyRecovery(
+        {
+          store: deps.store,
+          events: deps.events,
+          now,
+          ...(deps.circuit ? { circuit: deps.circuit } : {}),
+        },
+        {
+          attemptId: entry.attemptId,
+          taskId: task.id,
+          workOrderId: task.workOrderId,
+          dependency: entry.dependency,
+          ...(attempt?.model ? { requiredModel: attempt.model } : {}),
+        },
+      );
+      if (action.kind !== 'RETRY_NEW_ATTEMPT') continue;
+      // Reopened: the Task is no longer parked — drop the visible park entry so
+      // status() reflects the live re-dispatch, and clear this dependency's
+      // dispatch markers so a future outage is fresh.
+      const index = parkedRecoveries.indexOf(entry);
+      if (index >= 0) parkedRecoveries.splice(index, 1);
+      clearDependencyMarkers(entry.dependency);
+    }
   }
 
   // --- passes ----------------------------------------------------------------
@@ -960,7 +1074,9 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
    * E4's `RoutingBlockedError` is mapped to E7's `resource.unavailable` park
    * event bound to the Work Order (RE7(c)). Never substitutes a blocked model.
    */
-  function routeForAssignment(candidate: { task: Task; workOrder: WorkOrder }): string | null {
+  function routeForAssignment(
+    candidate: { task: Task; workOrder: WorkOrder },
+  ): { model: string; record: ReturnType<typeof toRoutingDecisionRecord> } | null {
     try {
       const { decision, derivedFrom } = routeAssignment({
         workOrder: candidate.workOrder,
@@ -972,8 +1088,10 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         taskId: candidate.task.id,
         derivedFrom,
       });
-      persistRoutingDecision({ store: deps.store, events: deps.events }, record);
-      return decision.selected;
+      // E10.3 (#37, RF8(b)): the route decision is *persisted* by the caller only
+      // once the dependency gate admits the dispatch — otherwise an OPEN circuit
+      // would append a fresh `routing_decisions` row + event every tick.
+      return { model: decision.selected, record };
     } catch (error) {
       if (!(error instanceof RoutingBlockedError)) throw error;
       // Whole pool blocked: park on WAITING_RESOURCE semantics without a
@@ -1024,18 +1142,20 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       }
 
       // Route before committing anything: a blocked route must not burn the
-      // worker, a concurrency slot, or a worktree (RE7(b)/(c)).
-      const model = routeForAssignment(candidate);
-      if (model === null) {
+      // worker, a concurrency slot, or a worktree (RE7(b)/(c)). E10.3 (#37): the
+      // dependency gate is consulted *before* the route decision is persisted, so
+      // an OPEN circuit sheds without any per-tick durable churn.
+      const routed = routeForAssignment(candidate);
+      if (routed === null) {
         skipped.add(candidate.task.id);
         continue;
       }
-      // E10.3 (#37): an OPEN dependency circuit sheds the dispatch before any
-      // work starts — the Task stays READY, no Attempt, no budget spent.
-      if (!admitDependency(model, candidate.task.id)) {
+      const decision = admitDependency(routed.model, candidate.task.id);
+      if (!decision.allowed) {
         skipped.add(candidate.task.id);
         continue;
       }
+      persistRoutingDecision({ store: deps.store, events: deps.events }, routed.record);
 
       let assignment: AssignmentRecord | null = null;
       try {
@@ -1046,10 +1166,15 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         );
         assignment = assign(
           { store: deps.store, events: deps.events, now },
-          { taskId: candidate.task.id, workerId: idleWorker.id, worktree, model },
+          { taskId: candidate.task.id, workerId: idleWorker.id, worktree, model: routed.model },
         );
         startTask({ ...deps, leaseTtlMs }, assignment);
         pollWorker(idleWorker.id);
+        // E10.3 (#37, RF8(c)): remember that this dependency's HALF_OPEN probe is
+        // now in flight under our dispatch, so its outcome settles the probe.
+        if (decision.state === 'HALF_OPEN') {
+          probeDispatches.add(`${candidate.task.id}:${dependencyKeyForModel(routed.model)}`);
+        }
         slots -= 1;
       } catch (error) {
         // A committed assign whose start failed is compensated so the worker and
@@ -1091,7 +1216,8 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         // E10.3 (#37): the re-dispatch is the dependency-bound operation too — an
         // OPEN circuit sheds it, a HALF_OPEN window admits it as the probe. The
         // Attempt is E7's and stays open; it is retried when the circuit closes.
-        if (!admitDependency(attempt.model, task.id)) continue;
+        const decision = admitDependency(attempt.model, task.id);
+        if (!decision.allowed) continue;
         let assignment: AssignmentRecord | null = null;
         try {
           const worktree = deps.worktrees.createTaskWorktree(task.id, scope.workOrder.id, deps.repoPath);
@@ -1101,6 +1227,11 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
           );
           dispatchReopenedAttempt({ ...deps, leaseTtlMs }, assignment);
           pollWorker(idleWorker.id);
+          // E10.3 (#37, RF8(c)): our dispatch now owns the dependency's HALF_OPEN
+          // probe, so its outcome settles it (instead of being shed).
+          if (decision.state === 'HALF_OPEN') {
+            probeDispatches.add(`${task.id}:${dependencyKeyForModel(attempt.model)}`);
+          }
         } catch (error) {
           // A reopen that committed but whose dispatch then failed is
           // compensated (close the Assignment, release the worker) so the
@@ -1412,6 +1543,10 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     reclaimPass();
     provisionPass();
     assignPass();
+    // E10.3 (#37, RF8(a)): a Task parked on a dependency outage is re-dispatched
+    // (bounded) once the dependency's circuit closes, before the generic
+    // re-dispatch hands it the freshly-minted Attempt.
+    reopenDependencyPass();
     redispatchPass();
   }
 

@@ -523,10 +523,14 @@ export interface GitHubAdapterOptions {
    * This is **namespace-consistent** with the E3 worktree branch and the E7
    * embedded `branch.create`/`repo.write` scope (`wo-*&#47;**`): all three share
    * the `wo-<workOrderId>/task-<…>` prefix the Factory is authorized to write.
-   * The **leaf differs**, by design: this PR branch is keyed on the Work Order
-   * (one PR per Work Order, aggregating its Tasks), whereas
+   * The **leaf differs**, intentionally: this PR branch is keyed on the Work Order
+   * (one PR per Work Order, **aggregating** its Tasks), whereas
    * `taskWorktreeBranch(taskId, workOrderId)` keys the E3 worktree leaf on the
-   * Task (`task-<taskId8>`). Per-task alignment is tracked in #37.
+   * Task (`task-<taskId8>`). #37 resolved this as the aggregation model (not
+   * per-task alignment): a multi-Task Work Order's PR cannot equal any single
+   * Task's leaf, so the two are kept namespace-consistent while the PR leaf keys
+   * the aggregate. `tests/factory/e10-integration.test.ts` asserts the namespace
+   * consistency and that the live policy authorizes both shapes.
    */
   branchName?: (workOrder: WorkOrder) => string;
   /**

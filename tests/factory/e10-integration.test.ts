@@ -16,7 +16,7 @@ import {
 } from '../../src/factory/config/factoryConfig';
 import { createEmptyEvidenceReadPort } from '../../src/factory/observatory/observatory';
 import { openEventLog } from '../../src/factory/events/log';
-import { circuitSnapshot } from '../../src/factory/recovery/circuitBreaker';
+import { beforeDependencyRequest, circuitSnapshot } from '../../src/factory/recovery/circuitBreaker';
 import { taskWorktreeBranch } from '../../src/factory/worktrees/worktree';
 import { check as policyCheck } from '../../src/factory/policy/policy';
 import type {
@@ -45,10 +45,12 @@ import type { EvidenceBundle } from '../../src/factory/evidence/bundle';
 import { commitDAG } from '../../src/factory/planning/dag';
 import {
   DEFAULT_RECOVERY_BUDGETS,
+  recover,
   RECOVERY_ACTION_APPLIED,
   RESOURCE_UNAVAILABLE,
+  type FailureContext,
 } from '../../src/factory/recovery/recovery';
-import { RECOVERY_PARKED } from '../../src/factory/scheduler/scheduler';
+import { classifyWorkerFailure, RECOVERY_PARKED } from '../../src/factory/scheduler/scheduler';
 import { createArtifactStore, openStateStore } from '../../src/factory/state/store';
 import type { SemanticJudge } from '../../src/factory/verification/semantic';
 import {
@@ -647,6 +649,7 @@ interface ProducerHarness {
   tickAndSettle(): Promise<void>;
   until(label: string, predicate: () => boolean, maxTicks?: number): Promise<void>;
   adapterForAttempt(attemptId: string): ScriptedHerdr;
+  dispatched(attemptId: string): boolean;
 }
 
 function producerHarness(): ProducerHarness {
@@ -684,6 +687,9 @@ function producerHarness(): ProducerHarness {
       const adapter = adapters.find((candidate) => candidate.envelope?.attemptId === attemptId);
       if (!adapter) throw new Error(`no adapter dispatched for attempt ${attemptId}`);
       return adapter;
+    },
+    dispatched(attemptId): boolean {
+      return adapters.some((candidate) => candidate.envelope?.attemptId === attemptId);
     },
   };
 }
@@ -936,14 +942,19 @@ describe('E10.2 worker-failure re-dispatch producer', () => {
  * that closes a recovered circuit. A controllable clock crosses the reset window
  * deterministically.
  */
-function circuitHarness(): ProducerHarness & {
+function circuitHarness(
+  options: { maxConcurrentTasks?: number } = {},
+): ProducerHarness & {
   clock: { advance(ms: number): void };
 } {
   const text = serializeFactoryConfig({
     ...DEFAULT_FACTORY_CONFIG,
     repository: { path: repoPath },
     verification: VERIFICATION,
-    scheduler: { ...DEFAULT_FACTORY_CONFIG.scheduler, maxConcurrentTasks: 2 },
+    scheduler: {
+      ...DEFAULT_FACTORY_CONFIG.scheduler,
+      maxConcurrentTasks: options.maxConcurrentTasks ?? 2,
+    },
   });
   const runtime = runtimeFrom(text);
   const adapters: ScriptedHerdr[] = [];
@@ -990,6 +1001,9 @@ function circuitHarness(): ProducerHarness & {
       if (!adapter) throw new Error(`no adapter dispatched for attempt ${attemptId}`);
       return adapter;
     },
+    dispatched(attemptId): boolean {
+      return adapters.some((candidate) => candidate.envelope?.attemptId === attemptId);
+    },
   };
 }
 
@@ -1010,6 +1024,31 @@ function seedTwoExecuting(deps: {
   return { wo, tasks: dag.nodes.map((node) => deps.store.get<Task>('tasks', node.taskId)!) };
 }
 
+/**
+ * Seed an EXECUTING Work Order where Node B depends on Node A. B stays `PLANNED`
+ * (never a ready candidate) until A verifies — so a test can hold B out of the
+ * assignment race and ready it manually at the exact tick it wants.
+ */
+function seedDependentExecuting(deps: {
+  store: ReturnType<typeof buildServerDeps>['store'];
+  events: ReturnType<typeof buildServerDeps>['events'];
+}): { wo: WorkOrder; taskA: Task; taskB: Task } {
+  const wo = createWorkOrder(deps, { intent: 'E10.3 circuit subject', acceptanceCriteria: ['accepted'] });
+  for (const to of ['READY', 'PLANNING'] as const) transitionWorkOrder(deps, wo.id, { to });
+  const dag = commitDAG(deps, wo.id, {
+    nodes: [
+      { nodeId: 'a', title: 'A' },
+      { nodeId: 'b', title: 'B', dependsOn: ['a'] },
+    ],
+  });
+  transitionWorkOrder(deps, wo.id, { to: 'EXECUTING' });
+  return {
+    wo,
+    taskA: deps.store.get<Task>('tasks', dag.nodes[0].taskId)!,
+    taskB: deps.store.get<Task>('tasks', dag.nodes[1].taskId)!,
+  };
+}
+
 const resourceUnavailableEvents = (
   deps: ReturnType<typeof buildServerDeps>,
   workOrderId: string,
@@ -1024,9 +1063,27 @@ const runningTasks = (
   tasks: Task[],
 ): Task[] => tasks.filter((task) => taskById(store, task.id).state === 'RUNNING');
 
+/**
+ * Capture `console.error` so an expected loud escalation (a `recovery.parked`
+ * line) does not pollute the run's output. Returns the captured lines for
+ * assertions plus a `restore`.
+ */
+function captureErrors(): { errors: string[]; restore(): void } {
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
+  return {
+    errors,
+    restore(): void {
+      console.error = original;
+    },
+  };
+}
+
 describe('E10.3 circuit live producer (spec §18.9)', () => {
   it('a live dependency failure opens the circuit and sheds (WAITING_RESOURCE, no budget spent); a circuit-admitted success closes it', async () => {
     const h = circuitHarness();
+    const cap = captureErrors();
     try {
       const { wo, tasks } = seedTwoExecuting(h.deps);
       await h.until('two running', () => runningTasks(h.deps.store, tasks).length === 2);
@@ -1046,7 +1103,7 @@ describe('E10.3 circuit live producer (spec §18.9)', () => {
       );
       await h.until('A2 redispatched', () => attemptsFor(h.deps.store, runnerA.id).length === 2);
       const attemptA2 = attemptsFor(h.deps.store, runnerA.id)[1]!;
-      await h.until('A2 live', () => Boolean(h.adapterForAttempt(attemptA2.id)));
+      await h.until('A2 live', () => h.dispatched(attemptA2.id));
       expect(circuitSnapshot(h.deps, model).consecutiveFailures).toBe(1);
       // The durable failure record names the real class (evidence-preserving).
       expect(
@@ -1091,12 +1148,14 @@ describe('E10.3 circuit live producer (spec §18.9)', () => {
         probeInFlight: false,
       });
     } finally {
+      cap.restore();
       h.deps.store.close();
     }
   });
 
   it('settles a live HALF_OPEN probe: after the window a dependency failure is admitted as the probe and re-opens it', async () => {
     const h = circuitHarness();
+    const cap = captureErrors();
     try {
       const { tasks } = seedTwoExecuting(h.deps);
       await h.until('two running', () => runningTasks(h.deps.store, tasks).length === 2);
@@ -1109,7 +1168,7 @@ describe('E10.3 circuit live producer (spec §18.9)', () => {
       h.adapterForAttempt(attemptA1.id).release(failedResult('DEPENDENCY_UNAVAILABLE: provider timed out'));
       await h.until('A2 redispatched', () => attemptsFor(h.deps.store, runnerA.id).length === 2);
       const attemptA2 = attemptsFor(h.deps.store, runnerA.id)[1]!;
-      await h.until('A2 live', () => Boolean(h.adapterForAttempt(attemptA2.id)));
+      await h.until('A2 live', () => h.dispatched(attemptA2.id));
       const attemptB1 = attemptsFor(h.deps.store, runnerB.id)[0]!;
       h.adapterForAttempt(attemptB1.id).release(failedResult('MODEL_UNAVAILABLE: model-x down'));
       await h.until('circuit open', () => circuitSnapshot(h.deps, model).state === 'OPEN');
@@ -1131,8 +1190,256 @@ describe('E10.3 circuit live producer (spec §18.9)', () => {
       // is spent.
       expect(attemptsFor(h.deps.store, runnerA.id)).toHaveLength(2);
     } finally {
+      cap.restore();
       h.deps.store.close();
     }
+  });
+
+  it('strands no Task on a provider outage: visibly parked, then re-dispatched (bounded) once the circuit closes (RF8(a))', async () => {
+    const h = circuitHarness();
+    const cap = captureErrors();
+    try {
+      const { wo, tasks } = seedTwoExecuting(h.deps);
+      await h.until('two running', () => runningTasks(h.deps.store, tasks).length === 2);
+      const runners = runningTasks(h.deps.store, tasks);
+      const [runnerA, runnerB] = runners as [Task, Task];
+      const attemptA1 = attemptsFor(h.deps.store, runnerA.id)[0]!;
+      const model = attemptA1.model!;
+
+      // Keep A live (a retry that survives the outage), then park B on a provider
+      // outage that opens the circuit. B has no open Attempt and would otherwise
+      // be a silent RUNNING dead-end.
+      h.adapterForAttempt(attemptA1.id).release(
+        failedResult('DEPENDENCY_UNAVAILABLE: provider timed out'),
+      );
+      await h.until('A2 redispatched', () => attemptsFor(h.deps.store, runnerA.id).length === 2);
+      const attemptA2 = attemptsFor(h.deps.store, runnerA.id)[1]!;
+      await h.until('A2 live', () => h.dispatched(attemptA2.id));
+      const attemptB1 = attemptsFor(h.deps.store, runnerB.id)[0]!;
+      h.adapterForAttempt(attemptB1.id).release(failedResult('PROVIDER_OUTAGE: provider down'));
+      await h.until('circuit open', () => circuitSnapshot(h.deps, model).state === 'OPEN');
+
+      // B is parked LOUDLY: a durable recovery.parked event, a status() entry
+      // naming the dependency, and an operator-facing console line — never a
+      // silent RUNNING Task with no Attempt.
+      const parkedB = h.deps.scheduler!.status().queue.parkedRecovery.filter((e) => e.taskId === runnerB.id);
+      expect(parkedB).toHaveLength(1);
+      expect(parkedB[0]).toMatchObject({ kind: 'WAITING_RESOURCE', dependency: model });
+      expect(
+        h.deps.events
+          .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+          .filter((event) => event.type === RECOVERY_PARKED)
+          .some((event) => (event.payload as { taskId?: string }).taskId === runnerB.id),
+      ).toBe(true);
+      expect(cap.errors.some((line) => /parked on recovery action WAITING_RESOURCE/.test(line) && line.includes(runnerB.id))).toBe(true);
+      expect(attemptsFor(h.deps.store, runnerB.id)).toHaveLength(1);
+      expect(taskById(h.deps.store, runnerB.id).state).toBe('RUNNING');
+
+      // A2 succeeds → the circuit closes → the reopener re-dispatches B (bounded
+      // by E7's §9.4 wheel) with a fresh clean-baseline Attempt.
+      h.adapterForAttempt(attemptA2.id).release({
+        status: 'completed',
+        commits: [],
+        artifacts: [],
+        interactions: [],
+        observations: [],
+        verificationRequests: [],
+        diff: 'diff --git a/a b/a\n+recovered',
+        failure: null,
+      });
+      await h.until('B reopened', () => attemptsFor(h.deps.store, runnerB.id).length === 2);
+      await h.until('B dispatched', () => h.dispatched(attemptsFor(h.deps.store, runnerB.id)[1]!.id));
+      const reopenedB = attemptsFor(h.deps.store, runnerB.id)[1]!;
+      expect(reopenedB.outcome).toBeNull();
+      expect(reopenedB.environment).toBe('clean-worktree');
+      // The park is cleared: B is a live re-dispatch, not a stale parked entry.
+      expect(h.deps.scheduler!.status().queue.parkedRecovery.some((e) => e.taskId === runnerB.id)).toBe(false);
+
+      // Bounded: further ticks do not mint an unbounded third Attempt.
+      await h.tickAndSettle();
+      await h.tickAndSettle();
+      expect(attemptsFor(h.deps.store, runnerB.id)).toHaveLength(2);
+    } finally {
+      cap.restore();
+      h.deps.store.close();
+    }
+  });
+
+  it('persists no per-tick routing decision for a Task shed by an OPEN circuit (RF8(b))', async () => {
+    const h = circuitHarness();
+    const cap = captureErrors();
+    try {
+      const { wo, taskA, taskB } = seedDependentExecuting(h.deps);
+      await h.until('A running', () => taskById(h.deps.store, taskA.id).state === 'RUNNING');
+      const attemptA1 = attemptsFor(h.deps.store, taskA.id)[0]!;
+      const model = attemptA1.model!;
+
+      // Open the circuit via A's retry then provider outage (A2), leaving A
+      // RUNNING (one slot of two taken) and B `PLANNED` (held out of the
+      // assignment race by its dependency on A).
+      h.adapterForAttempt(attemptA1.id).release(
+        failedResult('DEPENDENCY_UNAVAILABLE: provider timed out'),
+      );
+      await h.until('A2 redispatched', () => attemptsFor(h.deps.store, taskA.id).length === 2);
+      const attemptA2 = attemptsFor(h.deps.store, taskA.id)[1]!;
+      await h.until('A2 live', () => h.dispatched(attemptA2.id));
+      h.adapterForAttempt(attemptA2.id).release(failedResult('PROVIDER_OUTAGE: provider down'));
+      await h.until('circuit open', () => circuitSnapshot(h.deps, model).state === 'OPEN');
+
+      // Ready B while the circuit is OPEN: it now has a free concurrency slot and
+      // an idle worker, the exact shape where `assignPass` would route it.
+      transitionTask(h.deps, taskB.id, { to: 'READY', reason: 'test: ready under open circuit' });
+      expect(taskById(h.deps.store, taskB.id).state).toBe('READY');
+
+      const decisionsFor = (taskId: string): number =>
+        h.deps.store
+          .list<{ taskId: string }>('routing_decisions')
+          .filter((row) => row.taskId === taskId).length;
+
+      await h.tickAndSettle();
+      await h.tickAndSettle();
+      // The dispatch was shed: no route decision is persisted for it, and the
+      // durable resource.unavailable park is recorded exactly once.
+      expect(decisionsFor(taskB.id)).toBe(0);
+      expect(attemptsFor(h.deps.store, taskB.id)).toHaveLength(0);
+      const bSheds = h.deps.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .filter((event) => event.type === RESOURCE_UNAVAILABLE)
+        .map((event) => event.payload as { taskId?: string; resource?: string })
+        .filter((payload) => payload.taskId === taskB.id);
+      expect(bSheds).toHaveLength(1);
+
+      // Once the window admits B (the single HALF_OPEN probe), exactly one
+      // routing decision is persisted for the admitted dispatch.
+      h.clock.advance(1_000);
+      await h.until('B admitted', () => attemptsFor(h.deps.store, taskB.id).length === 1);
+      expect(decisionsFor(taskB.id)).toBe(1);
+    } finally {
+      cap.restore();
+      h.deps.store.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E10.3 (#37, RF8(c)) — a scheduler-admitted HALF_OPEN probe settles
+// ---------------------------------------------------------------------------
+
+/**
+ * A `recover()`-level harness over the real circuit breaker. The scheduler
+ * admits a HALF_OPEN probe at dispatch (`beforeDependencyRequest`) and marks the
+ * delivery; a worker failure for that dispatch must then be **counted and settle
+ * the probe** rather than be re-gated and shed (RF8(c)). Uses a controllable
+ * clock to cross the reset window deterministically.
+ */
+function recoveryCircuitHarness(failureThreshold = 2) {
+  const store = openStateStore(join(workDir, `e103-admitted-${crypto.randomUUID()}.db`));
+  const events = openEventLog(store.db);
+  let t = Date.parse('2026-10-01T00:00:00.000Z');
+  const clock = {
+    now: () => new Date(t).toISOString(),
+    advance: (ms: number) => {
+      t += ms;
+    },
+  };
+  const circuit = { failureThreshold, resetTimeoutMs: 1_000, probeTimeoutMs: 500 };
+  const deps = { store, events, now: clock.now, circuit };
+  const failure = (overrides: Partial<FailureContext> = {}): FailureContext => ({
+    attemptId: `attempt_${crypto.randomUUID()}`,
+    taskId: `task_${crypto.randomUUID()}`,
+    workOrderId: `wo_${crypto.randomUUID()}`,
+    failureClass: 'PROVIDER_OUTAGE',
+    error: 'provider down',
+    dependency: 'model-x',
+    requiredModel: 'model-x',
+    changedCondition: 'clean-worktree',
+    attemptCount: 0,
+    sameClassCount: 0,
+    ...overrides,
+  });
+  return { store, events, clock, circuit, deps, failure, close: () => store.close() };
+}
+
+describe('E10.3 circuit-admitted probe settlement (RF8(c))', () => {
+  it('counts a scheduler-admitted probe failure and settles the probe instead of shedding it', () => {
+    const h = recoveryCircuitHarness();
+    try {
+      // Two admitted failures open the circuit (the gate admits each while
+      // CLOSED); the second trips the threshold.
+      recover(h.deps, h.failure());
+      recover(h.deps, h.failure());
+      expect(circuitSnapshot(h.deps, 'model-x').state).toBe('OPEN');
+      expect(circuitSnapshot(h.deps, 'model-x').consecutiveFailures).toBe(2);
+
+      // Cross the reset window: the scheduler's dispatch gate admits the single
+      // HALF_OPEN probe (as it does in `assignPass`/`redispatchPass`).
+      h.clock.advance(1_000);
+      const admitted = beforeDependencyRequest(h.deps, 'model-x', h.circuit);
+      expect(admitted).toMatchObject({ allowed: true, state: 'HALF_OPEN' });
+      expect(circuitSnapshot(h.deps, 'model-x').probeInFlight).toBe(true);
+
+      // The probe fails: the delivery is passed as already-admitted, so recover()
+      // counts it (evidence preserved) and settles the probe — re-opening with a
+      // fresh window rather than shedding its own probe.
+      const action = recover(h.deps, h.failure({ circuitAdmitted: true }));
+      const settled = circuitSnapshot(h.deps, 'model-x');
+      expect(action.kind).toBe('WAITING_RESOURCE');
+      expect(settled.state).toBe('OPEN');
+      expect(settled.probeInFlight).toBe(false);
+      expect(settled.consecutiveFailures).toBe(3);
+    } finally {
+      h.close();
+    }
+  });
+
+  it('a non-admitted delivery while a probe is in flight is a shed (control): no probe is settled, no evidence counted', () => {
+    const h = recoveryCircuitHarness();
+    try {
+      recover(h.deps, h.failure());
+      recover(h.deps, h.failure());
+      h.clock.advance(1_000);
+      expect(beforeDependencyRequest(h.deps, 'model-x', h.circuit)).toMatchObject({
+        allowed: true,
+        state: 'HALF_OPEN',
+      });
+      const before = circuitSnapshot(h.deps, 'model-x');
+
+      // Delivered without the admission marker: recover() re-gates, sees the
+      // in-flight probe and sheds — the probe stays in flight (bounded by the
+      // timeout) and the failure is not counted.
+      const action = recover(h.deps, h.failure());
+      const after = circuitSnapshot(h.deps, 'model-x');
+      expect(action.kind).toBe('WAITING_RESOURCE');
+      expect(after.probeInFlight).toBe(true);
+      expect(after.consecutiveFailures).toBe(before.consecutiveFailures);
+    } finally {
+      h.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E10.3 (#37) — worker-failure classification guards
+// ---------------------------------------------------------------------------
+
+describe('E10.3 classifyWorkerFailure guards', () => {
+  it('does not double-encode a bare dependency class token', () => {
+    const bare = classifyWorkerFailure('DEPENDENCY_UNAVAILABLE', 'model-x');
+    expect(bare.failureClass).toBe('DEPENDENCY_UNAVAILABLE');
+    expect(bare.message).not.toBe('DEPENDENCY_UNAVAILABLE');
+    // encodeFailure must not yield `CLASS: CLASS`.
+    expect(`${bare.failureClass}: ${bare.message}`).not.toBe('DEPENDENCY_UNAVAILABLE: DEPENDENCY_UNAVAILABLE');
+  });
+
+  it('keys a dependency failure on the same fallback as the dispatch gate (a null model → provider)', () => {
+    expect(classifyWorkerFailure('PROVIDER_OUTAGE: down', null).dependency).toBe('provider');
+    expect(classifyWorkerFailure('PROVIDER_OUTAGE: down', undefined).dependency).toBe('provider');
+    expect(classifyWorkerFailure('PROVIDER_OUTAGE: down', 'model-x').dependency).toBe('model-x');
+    // A non-dependency detail is a WORKER_FAILURE and carries no dependency key.
+    expect(classifyWorkerFailure('worker blew up', 'model-x')).toEqual({
+      failureClass: 'WORKER_FAILURE',
+      message: 'worker blew up',
+    });
   });
 });
 
@@ -1392,6 +1699,67 @@ describe('E10.3 GitHub adapter composed into a running process (#37)', () => {
       server.stop();
       e2.stop();
       store.close();
+    }
+  });
+  it('serves the routes through the adapter composed by buildServerDeps (apiBaseUrl / factoryBaseUrl / baseBranch defaults)', async () => {
+    // Reserve a loopback port up front so the runtime's advertised `server.url`
+    // matches the port the server actually binds — exercising the composition's
+    // defaults rather than a hand-built twin.
+    const boot = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('') });
+    const port = boot.port ?? 0;
+    boot.stop(true);
+
+    const text = serializeFactoryConfig({
+      ...DEFAULT_FACTORY_CONFIG,
+      repository: { path: repoPath },
+      server: { hostname: '127.0.0.1', port },
+      verification: VERIFICATION,
+    });
+    const transport = new MockGitHub();
+    transport.issues.set('acme/widgets#99', {
+      repository: 'acme/widgets',
+      number: 99,
+      title: 'Composed adapter subject',
+      body: '- [ ] criterion',
+      labels: [],
+      url: 'https://github.com/acme/widgets/issues/99',
+    });
+    const cap = captureErrors();
+    const deps = buildServerDeps(runtimeFrom(text), {
+      spawn: () => new FakeHerdr(),
+      reconcileOnBoot: false,
+      // Only the transport is supplied: `apiBaseUrl`, `factoryBaseUrl` and
+      // `baseBranch` all default from the resolved runtime config.
+      github: { transport },
+    });
+    const server = startFactoryServer(deps, { port, hostname: '127.0.0.1' });
+    try {
+      const client = createFactoryClient({ baseUrl: server.url });
+      const imported = await client.githubImportIssue({ repository: 'acme/widgets', number: 99 });
+      expect(imported.created).toBe(true);
+      expect(imported.workOrder.repository).toBe('acme/widgets');
+
+      const bundle = {
+        id: 'eb_composed_1',
+        workOrderId: imported.workOrder.id,
+        complete: true,
+        gates: { deterministic: true, behavioral: true, semantic: true, run: true },
+      };
+      deps.store.set('evidence_bundles', bundle.id, bundle);
+      const pr = await client.githubOpenPullRequest({ evidenceBundleId: bundle.id });
+
+      expect(transport.prCalls).toHaveLength(1);
+      // `factoryBaseUrl` default (runtime server url) renders the durable link…
+      expect(transport.prCalls[0]!.body).toContain(
+        `[${bundle.id}](${server.url}/api/observatory/work-orders/${imported.workOrder.id}/drill-down)`,
+      );
+      // …and `baseBranch` default (worktrees.baseBranch) is the PR base.
+      expect(transport.prCalls[0]!.base).toBe('main');
+      expect(pr.head).toBe(`wo-${imported.workOrder.id}/task-${imported.workOrder.id.slice(0, 8)}`);
+    } finally {
+      cap.restore();
+      server.stop();
+      deps.store.close();
     }
   });
 });
