@@ -528,6 +528,26 @@ export class MergeBlockedError extends Error {
   }
 }
 
+/**
+ * Thrown when a GitHub action targets a repository outside the configured
+ * `github:` bound (E11.3, #43). `factory.yaml` claims
+ * `github.repository` bounds what the token may touch; the adapter enforces
+ * that claim on every external side effect, so a caller cannot point the
+ * Factory's token at an unrelated repository.
+ */
+export class RepositoryBoundError extends Error {
+  constructor(
+    readonly attempted: string,
+    readonly bound: string,
+  ) {
+    super(
+      `github repository "${attempted}" is outside the configured bound — ` +
+        `the github: config authorizes "${bound}" only`,
+    );
+    this.name = 'RepositoryBoundError';
+  }
+}
+
 export interface GitHubAdapterOptions {
   /** The only GitHub I/O in the Factory. */
   transport: GitHubTransport;
@@ -537,6 +557,14 @@ export interface GitHubAdapterOptions {
   factoryBaseUrl: string;
   /** Default PR base branch. Defaults to `main`. */
   baseBranch?: string;
+  /**
+   * E11.3 (#43): the `owner/name` the `github:` configuration authorizes.
+   * When present, import/branch/PR/merge is refused with a
+   * {@link RepositoryBoundError} before any GitHub I/O for any other
+   * repository — the configured bound is enforced, not just claimed. Absent
+   * (an explicit caller-wired adapter, tests), every repository is allowed.
+   */
+  allowedRepository?: string;
   /**
    * Branch naming policy. Defaults to `wo-<workOrderId>/task-<workOrderIdShort>`.
    *
@@ -605,6 +633,15 @@ export interface GitHubAdapter {
 export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapter {
   const { transport, client, factoryBaseUrl, checkPolicy, readEvidence } = options;
   const baseBranch = options.baseBranch ?? 'main';
+  // The configured repository bound (E11.3, #43): enforced before any GitHub
+  // I/O on every external side effect, so `github.repository` is what the
+  // docs claim — a bound on what the token may touch — not dead config.
+  const allowedRepository = options.allowedRepository;
+  const requireAllowedRepository = (repository: string): void => {
+    if (allowedRepository !== undefined && repository.trim() !== allowedRepository) {
+      throw new RepositoryBoundError(repository, allowedRepository);
+    }
+  };
   // The Work Order's change-set branch. Shares the E3 `wo-<workOrderId>/task-<…>`
   // namespace (and so the embedded policy scope); the leaf is keyed on the Work
   // Order because E6 opens one PR per Work Order, not per Task.
@@ -620,6 +657,7 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
   }
 
   async function importIssue(ref: IssueRef): Promise<ImportIssueResult> {
+    requireAllowedRepository(ref.repository);
     const issue = await transport.getIssue(ref);
     const marker = issueSourceRef(issue);
 
@@ -656,6 +694,9 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
   ): Promise<GitHubBranch> {
     const repository = requireRepository(workOrder);
     const branch = branchName(workOrder);
+    // The repository bound (E11.3, #43): the Work Order must live in the
+    // configured repository before any token use is authorized.
+    requireAllowedRepository(repository);
     // E7 §8-1: branch creation is a consequential external side effect; the
     // Factory authorizes it (and blocks it under e-stop) before any GitHub I/O.
     // The default `branch.create` scope binds `branchPattern: wo-*/**` and E6's
@@ -676,6 +717,8 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
   ): Promise<GitHubPullRequest> {
     const { workOrder } = await client.getWorkOrder(evidence.workOrderId);
     const repository = requireRepository(workOrder);
+    // The repository bound (E11.3, #43) — before any `pr.create` check or I/O.
+    requireAllowedRepository(repository);
     // E7 §8-1: opening a PR is a `pr.create` check before any GitHub I/O.
     requirePolicy('pr.create', workOrder.id, { branch: branchName(workOrder) });
     // E11.3 (#43): the caller-chosen *base* is policy-gated too — only the
@@ -759,6 +802,9 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
     // 4. Hygiene: the live PR must be this Work Order's open, unmerged change set
     // targeting the configured base and carrying the Work Order + Evidence links.
     const repository = requireRepository(workOrder);
+    // The repository bound (E11.3, #43) — a PR on another repository is refused
+    // before any read-back or merge I/O.
+    requireAllowedRepository(repository);
     if (gate.pullRequest.repository !== repository) {
       throw new MergeBlockedError(
         'HYGIENE_FAILED',

@@ -1,6 +1,7 @@
 import { join, resolve } from 'node:path';
 
 import { CHECK_KINDS, type CheckCategory } from '../verification/engine';
+import { FactoryError } from '../domain/errors';
 import { loadPolicyDocumentFile, parsePolicyDocument } from '../policy/policyLoader';
 import { findDuplicateYamlKeys, parseYamlText } from './yaml';
 import type { PolicyDocument, PolicyLevel, PolicyScope } from '../policy/policy';
@@ -519,6 +520,19 @@ export function parseFactoryConfig(text: string): ConfigParse {
       issue('github', 'github must be a mapping');
     } else {
       const github = root.github;
+      // E11.3 (#43): unknown keys are refused. A typo'd key (e.g. `base_banch`)
+      // must fail loudly, not be silently ignored — and critically, only the
+      // four known keys ever reach the transport composition, so a stray
+      // `token.value` raw secret cannot ride a different key name into the
+      // request surface (the token itself must be an env reference or nothing).
+      for (const key of Object.keys(github)) {
+        if (!['repository', 'token', 'apiBaseUrl', 'baseBranch'].includes(key)) {
+          issue(
+            `github.${key}`,
+            `"${key}" is not a github config key (use repository/token/apiBaseUrl/baseBranch)`,
+          );
+        }
+      }
       if (
         !isNonEmptyString(github.repository) ||
         !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(github.repository.trim())
@@ -577,7 +591,19 @@ export function parseFactoryConfig(text: string): ConfigParse {
   // (an authority widening against the operator's intent). Only the policy
   // configuration's own keys are scanned here: elsewhere in factory.yaml the
   // last-win semantics stay a documented YAML behavior.
-  for (const duplicate of findDuplicateYamlKeys(text, 'policy')) {
+  // E11.4 (#41): a duplicated key anywhere in the policy configuration is
+  // rejected *before decode* — Bun YAML (like most) lets a duplicate key
+  // last-win, so a written `deny` could otherwise be silently dropped in favor
+  // of a later `allow` (an authority widening against the operator's intent).
+  // Both the inline `policy:` subtree **and** a duplicated root-level
+  // `policyFile` key are scanned: the latter's reported path is the bare
+  // `policyFile` (not under `policy.`), so it does not match the inline filter —
+  // last-wins would silently swap the policy source of truth. Elsewhere in
+  // factory.yaml the last-win semantics stay a documented YAML behavior.
+  for (const duplicate of [
+    ...findDuplicateYamlKeys(text, 'policy'),
+    ...findDuplicateYamlKeys(text, 'policyFile'),
+  ]) {
     issue(
       duplicate.path,
       'duplicate key in the policy configuration — YAML would silently keep the last value; list each key once',
@@ -596,14 +622,29 @@ export function resolveFactoryConfig(
   const root = resolve(options.baseDir ?? process.cwd());
   const state = resolve(root, config.storage.state);
   // E11.4 (#41): resolve the policy source of truth. An inline document is
-  // deep-copied (the runtime config is its own copy); a `policyFile:` reference
-  // is read + validated here — an unreadable file or an invalid document throws
-  // a loud `FactoryError` (fail closed), never a permissive fallback.
-  const policy = config.policy
-    ? (JSON.parse(JSON.stringify(config.policy)) as PolicyDocument)
-    : config.policyFile
-      ? loadPolicyDocumentFile(resolve(root, config.policyFile))
-      : undefined;
+  // **parsed + built** here (not deep-copied from the raw YAML decode): the
+  // parser normalizes decision tokens to the engine's uppercase verdicts
+  // (`allow` → `ALLOW`, `require_human` → `REQUIRE_HUMAN`) — the shipped
+  // template writes the lowercase form, and every consumer compares the
+  // uppercase literal, so carrying the raw decode would make a configured
+  // `allow` never allow and `require_human` never gate. A `policyFile:` reference
+  // is read + validated here too — an unreadable file or an invalid document
+  // throws a loud `FactoryError` (`POLICY_INVALID`), never a permissive fallback.
+  let policy: PolicyDocument | undefined;
+  if (config.policy) {
+    const built = parsePolicyDocument(config.policy);
+    if (!built.ok) {
+      throw new FactoryError(
+        'POLICY_INVALID',
+        `inline policy is invalid — ${built.issues
+          .map((policyIssue) => `${policyIssue.path || 'policy'}: ${policyIssue.message}`)
+          .join('; ')}`,
+      );
+    }
+    policy = built.policy;
+  } else if (config.policyFile) {
+    policy = loadPolicyDocumentFile(resolve(root, config.policyFile));
+  }
   return {
     apiVersion: config.apiVersion,
     factoryVersion: config.factoryVersion,

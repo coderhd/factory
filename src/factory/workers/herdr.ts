@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { rm as rmFile } from 'node:fs/promises';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -153,6 +154,16 @@ function field(payload: unknown, key: string): string {
  * Stdout must parse as a JSON document; a non-zero exit is a thrown error with
  * the CLI's stderr — never a silent success.
  */
+
+/** Truncate one argv element for durable error logs — prompts carry whole
+ * prompt/diff payloads (multi-KB) that must not land verbatim in logs. */
+const argPreview = (value: string): string => (value.length > 64 ? `${value.slice(0, 64)}…` : value);
+
+const argvPreview = (args: readonly string[]): string => {
+  const preview = args.map(argPreview).join(' ');
+  return preview.length > 200 ? `${preview.slice(0, 200)}…` : preview;
+};
+
 export function createProcessHerdrCli(command = 'herdr'): HerdrCli {
   const run = (args: readonly string[]): Promise<HerdrCliOutput> =>
     new Promise((resolve, reject) => {
@@ -164,7 +175,7 @@ export function createProcessHerdrCli(command = 'herdr'): HerdrCli {
           if (error) {
             reject(
               new Error(
-                `herdr ${args.join(' ')} failed (exit ${error.code ?? 'unknown'}): ${String(stderr).trim() || error.message}`,
+                `herdr ${argvPreview(args)} failed (exit ${error.code ?? 'unknown'}): ${String(stderr).trim() || error.message}`,
               ),
             );
             return;
@@ -172,7 +183,7 @@ export function createProcessHerdrCli(command = 'herdr'): HerdrCli {
           try {
             resolve(JSON.parse(String(stdout)) as HerdrCliOutput);
           } catch {
-            reject(new Error(`herdr ${args.join(' ')} printed non-JSON output: ${String(stdout).slice(0, 200)}`));
+            reject(new Error(`herdr ${argvPreview(args)} printed non-JSON output: ${String(stdout).slice(0, 200)}`));
           }
         },
       );
@@ -204,6 +215,42 @@ export interface HerdrWorkspaceManager {
 
 export function createHerdrWorkspaceManager(cli: HerdrCli, options: HerdrWorkspaceOptions): HerdrWorkspaceManager {
   let ensured: Promise<{ workspace: string; rootPane: string }> | null = null;
+
+  /**
+   * Boot reconciliation for the live herdr server (E11 final review): the
+   * herdr server is long-lived and outlives this Factory process, so a previous
+   * Factory life's harnesses can still be sitting in our workspace when we
+   * boot. Durable-state reconciliation alone touches nothing live. Best-effort:
+   * sweep the `factory-*` tabs of ONLY this workspace (labels are ours to
+   * manage) and close them — the agent inside is killed with its pane. A
+   * sweeper failure must never fail the boot.
+   */
+  const sweepPreviousLifeTabs = async (workspaceId: string): Promise<void> => {
+    try {
+      const listing = resultOf(await cli.run(['tab', 'list', '--workspace', workspaceId]));
+      const entries = Array.isArray(listing) ? listing : [];
+      for (const entry of entries) {
+        if (!entry || typeof entry !== 'object') continue;
+        const label = (entry as Record<string, unknown>).label;
+        const id = (entry as Record<string, unknown>).id;
+        if (
+          typeof id === 'string' &&
+          id.length > 0 &&
+          typeof label === 'string' &&
+          label.startsWith('factory-')
+        ) {
+          try {
+            await cli.run(['tab', 'close', id]);
+          } catch {
+            // Best-effort teardown; the tab may already be gone.
+          }
+        }
+      }
+    } catch {
+      // No tab listing available (older herdr, transient socket) — proceed.
+    }
+  };
+
   return {
     ensure(): Promise<{ workspace: string; rootPane: string }> {
       // A rejected ensure must not be memoized forever: one transient failure
@@ -217,7 +264,9 @@ export function createHerdrWorkspaceManager(cli: HerdrCli, options: HerdrWorkspa
           const entries = Array.isArray(listing) ? listing : [];
           for (const entry of entries) {
             if (entry && typeof entry === 'object' && (entry as Record<string, unknown>).label === options.label) {
-              return { workspace: field(entry, 'id'), rootPane: '' };
+              const workspace = field(entry, 'id');
+              await sweepPreviousLifeTabs(workspace);
+              return { workspace, rootPane: '' };
             }
           }
           const created = resultOf(
@@ -273,6 +322,8 @@ export function renderTaskPrompt(envelope: ExecutionEnvelope): string {
     '   `status` ("completed" | "failed" | "waiting_input"), `observations` (string[]),',
     '   `verificationRequests` (string[]), `interactions` ({"question": string}[], for',
     '   waiting_input only), `failure` (string|null). Without this report the run is a failure.',
+    '   Do NOT commit `.factory/report.json` — it is collected from the filesystem',
+    '   before git evidence is read; a committed report file pollutes the change set.',
   ];
   return lines.join('\n');
 }
@@ -329,6 +380,11 @@ function parseHarnessReport(text: string): HarnessReport | null {
 }
 
 const REPORT_RELATIVE = join('.factory', 'report.json');
+
+/** True when the directory is a git repository/worktree checkout. */
+function isGitRepositoryDir(dir: string): boolean {
+  return existsSync(join(dir, '.git'));
+}
 
 /** Git evidence read (§17): commits since base + the base diff. */
 async function gitEvidence(
@@ -489,6 +545,11 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
     // re-settled verbatim (stale question loop) if the harness blocks again
     // without rewriting it. Remove it before prompting.
     await rmFile(join(runState.envelope.worktree, REPORT_RELATIVE)).catch(() => undefined);
+    // The overall deadline starts BEFORE the prompt waits (#herdr-501): the
+    // prompt itself honors `--timeout`, so computing the deadline only after
+    // the wait returns would let a run that exhausts its wait claim a second
+    // full wait window (worst case ≈2× the configured timeout).
+    const deadline = Date.now() + waitTimeoutMs;
     await cli.run([
       'agent',
       'prompt',
@@ -498,14 +559,19 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
       '--timeout',
       String(waitTimeoutMs),
     ]);
-    const deadline = Date.now() + waitTimeoutMs;
     for (;;) {
       const reportText = await readFile(join(runState.envelope.worktree, REPORT_RELATIVE), 'utf8').catch(
         () => null,
       );
       const parsed = reportText === null ? null : parseHarnessReport(reportText);
       if (parsed) {
-        const git = await gitEvidence(runState.envelope.worktree, runState.envelope.baseCommit);
+        // Git evidence is enrichment on a real repository checkout. The judge's
+        // pane cwd is a fresh non-git directory (E11.2): probing git there would
+        // only fabricate a bogus "git evidence read failed" observation, so a
+        // non-repo worktree skips the read entirely.
+        const git = isGitRepositoryDir(runState.envelope.worktree)
+          ? await gitEvidence(runState.envelope.worktree, runState.envelope.baseCommit)
+          : { commits: [], diff: null, gitError: null };
       const gitObservations =
         git.gitError !== null ? [...parsed.observations, git.gitError] : parsed.observations;
       if (parsed.status === 'waiting_input') {
@@ -537,8 +603,25 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
         });
         return;
       }
-      // The turn ended but nothing was reported: observe the harness state.
-      const state = field(resultOf(await cli.run(['agent', 'get', runState.agentName])), 'state');
+      // The turn ended but nothing was reported: observe the harness state. A
+      // *transient* probe failure (e.g. herdr's socket hiccupping) must not
+      // kill an otherwise healthy harness — treat the state as unknown and
+      // keep polling to the deadline; the next probe usually succeeds.
+      let state: string | null = null;
+      try {
+        state = field(resultOf(await cli.run(['agent', 'get', runState.agentName])), 'state');
+      } catch {
+        if (Date.now() >= deadline) {
+          await releaseRun();
+          heartbeat();
+          settle(
+            emptyResult(`harness did not write ${REPORT_RELATIVE} within ${waitTimeoutMs}ms`),
+          );
+          return;
+        }
+        await sleep(pollIntervalMs);
+        continue;
+      }
       if (state === 'blocked') {
         // The approval/question UI is up. Read the recent pane text as the live
         // question; the tap into the harness stays open for `deliverAnswer`.
@@ -644,9 +727,12 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
             '--no-focus',
           ]),
         );
-        runState = { envelope, agentName: `factory-${envelope.attemptId}`, tab: field(tabResult, 'tab') };
         // Register the live run immediately after the tab exists, so a later
-        // failure (e.g. agent start) tears the pane down in `releaseRun`.
+        // failure (e.g. missing `root_pane` in a malformed create payload)
+        // tears the pane down in `releaseRun` instead of leaking the tab.
+        const tabId = field(tabResult, 'tab');
+        const rootPane = field(tabResult, 'root_pane');
+        runState = { envelope, agentName: `factory-${envelope.attemptId}`, tab: tabId };
         run = runState;
         const agentArgs = [
           'agent',
@@ -655,7 +741,7 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
           '--kind',
           harness,
           '--pane',
-          field(tabResult, 'root_pane'),
+          rootPane,
         ];
         if (concrete) {
           // The model rides the harness argv after the `--` separator; no

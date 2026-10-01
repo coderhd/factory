@@ -44,7 +44,7 @@ import type {
   MergePullRequestInput,
   PullRequestRef,
 } from '../../src/factory/github/adapter';
-import { PrBaseBlockedError } from '../../src/factory/github/adapter';
+import { PrBaseBlockedError, RepositoryBoundError } from '../../src/factory/github/adapter';
 import {
   DEFAULT_FACTORY_CONFIG,
   parseFactoryConfig,
@@ -299,11 +299,31 @@ describe('E11.3 GitHub transport/token configuration (#43)', () => {
     }
     expect(badRepo.issues.some((issue) => issue.path === 'github.repository')).toBe(true);
 
+    // Unknown github keys are refused (a typo must fail loudly). Critically,
+    // only the four known keys ever reach the composition — a stray key like
+    // `token.value` (a raw secret dressed as a mapping) is rejected too: the
+    // token itself may only ever be an { env: NAME } reference.
+    const unknownKey = parseFactoryConfig(
+      `apiVersion: factory/v0.1\ngithub:\n  repositry: acme/widgets\n  token:\n    env: ${TOKEN_ENV}\n`,
+    );
+    if (unknownKey.ok) throw new Error('an unknown github key must not parse');
+    expect(
+      unknownKey.issues.some(
+        (issue) => issue.path === 'github.repositry' && issue.message.includes('not a github config key'),
+      ),
+    ).toBe(true);
+    expect(unknownKey.issues.some((issue) => issue.path === 'github.repository')).toBe(true);
+
+    const rawTokenValue = parseFactoryConfig(
+      `apiVersion: factory/v0.1\ngithub:\n  repository: acme/widgets\n  token:\n    value: ghp_raw_secret\n`,
+    );
+    if (rawTokenValue.ok) throw new Error('a raw token.value secret must not parse');
+    expect(rawTokenValue.issues.some((issue) => issue.path === 'github.token.env')).toBe(true);
+
     // Where a raw token would read even if accepted — it must not end up in
     // the resolved runtime config: only the env var name is carried.
     const runtime = runtimeFrom(configText());
     expect(JSON.stringify(runtime.github)).not.toContain(TEST_TOKEN);
-    expect(JSON.stringify(runtimeFrom(configText()))).not.toMatch(/ghp_/);
   });
 
   it('resolves the adapter base URL from the effective bind (--port/--hostname override)', async () => {
@@ -492,6 +512,70 @@ describe('E11.3 GitHub transport/token configuration (#43)', () => {
       listener.stop(true);
     }
   });
+
+  it('bounds every GitHub side effect to the configured github.repository (the token may touch only that repo)', async () => {
+    const listener = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('') });
+    const port = listener.port ?? 0;
+    const runtime = runtimeFrom(configText(undefined, { hostname: '127.0.0.1', port }));
+    const transport = new MockGitHub();
+    const deps = buildServerDeps(runtime, {
+      reconcileOnBoot: false,
+      githubTransport: transport,
+      serverBind: { hostname: '127.0.0.1', port },
+    });
+    listener.reload({ fetch: createApiHandler(deps) });
+    const url = `http://127.0.0.1:${port}`;
+    try {
+      expect(deps.github).toBeDefined();
+      const github = deps.github!;
+
+      // Import is bounds-checked before any transport I/O.
+      let thrown: unknown;
+      try {
+        await github.importIssue({ repository: 'other-org/other-repo', number: 9 });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(RepositoryBoundError);
+      expect((thrown as Error).message).toContain('acme/widgets');
+      expect(transport.issueCalls).toHaveLength(0);
+
+      // Branch creation is bounds-checked against the Work Order's repository.
+      const wo = createWorkOrder(deps, { intent: 'x', acceptanceCriteria: ['x'], repository: 'other-org/other-repo' });
+      let branchThrown: unknown;
+      try {
+        await github.createBranch(wo);
+      } catch (error) {
+        branchThrown = error;
+      }
+      expect(branchThrown).toBeInstanceOf(RepositoryBoundError);
+      expect(transport.branchCalls).toHaveLength(0);
+
+      // …and so is PR opening — through the API route (the adapter's client
+      // needs a live E2 API to resolve the Work Order first).
+      deps.store.set('evidence_bundles', 'eb_bound', {
+        id: 'eb_bound',
+        workOrderId: wo.id,
+        complete: true,
+        gates: { deterministic: true, behavioral: true, semantic: true, run: true },
+      });
+      const opened = await fetch(`${url}/api/github/pull-requests`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ evidenceBundleId: 'eb_bound' }),
+      });
+      expect(opened.status).toBeGreaterThanOrEqual(400);
+      expect(transport.prCalls).toHaveLength(0);
+
+      // Control: the configured repository itself stays usable.
+      transport.issues.set('acme/widgets#43', issueDTO());
+      const imported = await github.importIssue({ repository: 'acme/widgets', number: 43 });
+      expect(imported.created).toBe(true);
+    } finally {
+      listener.stop(true);
+      deps.store.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -514,6 +598,7 @@ interface FakeTab {
   id: string;
   pane: string;
   cwd: string;
+  label: string;
   closed: boolean;
 }
 
@@ -574,10 +659,19 @@ class FakeHerdrCli implements HerdrCli {
         id: `tab_${ws.tabs.length}`,
         pane: `pane_${ws.tabs.length}`,
         cwd,
+        label: (argv.indexOf('--label') >= 0 ? argv[argv.indexOf('--label') + 1] : undefined) ?? '',
         closed: false,
       };
       ws.tabs.push(tab);
       return { result: { tab: tab.id, root_pane: tab.pane } };
+    }
+    if (argv[0] === 'tab' && sub === 'list') {
+      const wsId = value('workspace');
+      const ws = this.workspaces.get(wsId);
+      if (!ws) throw new Error(`no such workspace: ${wsId}`);
+      return {
+        result: ws.tabs.filter((tab) => !tab.closed).map((tab) => ({ id: tab.id, label: tab.label })),
+      };
     }
     if (argv[0] === 'agent' && sub === 'start') {
       return { result: { agent: argv[2] } };
@@ -622,6 +716,22 @@ const TEST_ENVELOPE: ExecutionEnvelope = {
   requiredVerification: ['bun test'],
   model: null,
 };
+
+/** A never-running worker for tests that only need a dispatch to settle. */
+function idleAdapter(): WorkerAdapter {
+  return {
+    provision: async () => {},
+    start: async () => {},
+    stop: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    status: async () => ({ state: 'running', lastHeartbeatAt: new Date().toISOString() }),
+    execute: async () => {},
+    deliverAnswer: async () => {},
+    collectArtifacts: () => new Promise<WorkerResult>(() => undefined),
+    destroy: async () => {},
+  };
+}
 
 describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)', () => {
   beforeEach(() => {
@@ -825,6 +935,135 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
     expect(cli.openTabs()).toHaveLength(0);
   });
 
+  it('sweeps the previous life factory-*-tabs on ensure (a crashed Factory cannot strand harnesses in the long-lived server)', async () => {
+    const cli = new FakeHerdrCli();
+    // The herdr server survived a previous Factory life: our workspace still
+    // carries a stale attempt tab and the user's own (unlabeled) pane.
+    cli.workspaces.set('ws_factory', {
+      id: 'ws_factory',
+      label: 'factory',
+      tabs: [
+        { id: 'tab_stale_attempt', pane: 'pane_stale', cwd: repoPath, label: 'factory-attempt_old', closed: false },
+        { id: 'tab_user_pane', pane: 'pane_user', cwd: repoPath, label: 'terminal', closed: false },
+      ],
+    });
+    const workspace = createHerdrWorkspaceManager(cli, { label: 'factory', repoPath });
+    const adapter = createHerdrWorker({ cli, workspace, repoPath, pollIntervalMs: 5, waitTimeoutMs: 500 });
+
+    await adapter.provision();
+
+    // Only OUR `factory-*` tab was killed; the user's pane is untouched — and
+    // the sweep ran before the first run could be dispatched.
+    const open = cli.openTabs();
+    expect(open.map((tab) => tab.id)).toEqual(['tab_user_pane']);
+    expect(cli.callsMatching('tab').some((argv) => argv.join(' ') === 'tab close tab_stale_attempt')).toBe(true);
+    expect(cli.calls.some((argv) => argv.join(' ').includes('tab_user_pane'))).toBe(false);
+  });
+
+  it('plumbs workers.models from config through the default spawn into the harness argv', async () => {
+    const cli = new FakeHerdrCli();
+    cli.onPrompt = (_prompt, cwd) => {
+      // The harness does the work (and commits, so the run carries evidence).
+      execFileSync('git', ['-C', cwd, 'add', '-A'], { encoding: 'utf8' });
+      writeFileSync(join(cwd, 'plumbed.txt'), 'change\n');
+      execFileSync('git', ['-C', cwd, 'add', 'plumbed.txt'], { encoding: 'utf8' });
+      execFileSync('git', ['-C', cwd, 'commit', '-q', '-m', 'plumb the workers.models map'], { encoding: 'utf8' });
+      writeReport(cwd, { status: 'completed', observations: ['done'] });
+    };
+    const text = serializeFactoryConfig({
+      ...DEFAULT_FACTORY_CONFIG,
+      repository: { path: repoPath },
+      workers: {
+        ...DEFAULT_FACTORY_CONFIG.workers,
+        models: { implementer: 'opencode/sonnet-x' },
+      },
+    } as FactoryDesiredConfig);
+    const runtime = runtimeFrom(text);
+    // No `spawn` seam: the production default-spawn path must carry the map.
+    const deps = buildServerDeps(runtime, { reconcileOnBoot: false, herdrCli: cli });
+    try {
+      seedExecutableTask(deps);
+      await tickAndSettle(deps.scheduler!);
+
+      const start = cli.callsMatching('agent').find((argv) => argv[1] === 'start');
+      expect(start).toBeDefined();
+      expect(start!.join(' ')).toContain('-- --model opencode/sonnet-x');
+      // The run was dispatched and settled: every seeded task left READY.
+      expect(deps.store.list<Task>('tasks').every((task) => task.state !== 'READY')).toBe(true);
+      expect(cli.openTabs()).toHaveLength(0);
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('rejects malformed workers.models at parse: non-mapping and non-string model values', () => {
+    const base = serializeFactoryConfig({ ...DEFAULT_FACTORY_CONFIG, repository: { path: repoPath } });
+    const nonMapping = parseFactoryConfig(
+      base.replace('  harness: "opencode"', '  harness: "opencode"\n  models: [implementer]'),
+    );
+    expect(nonMapping.ok).toBe(false);
+    if (!nonMapping.ok) {
+      expect(nonMapping.issues.some((issue) => issue.path === 'workers.models')).toBe(true);
+    }
+
+    const nonString = parseFactoryConfig(
+      base.replace('  harness: "opencode"', '  harness: "opencode"\n  models:\n    implementer: 7'),
+    );
+    expect(nonString.ok).toBe(false);
+    if (!nonString.ok) {
+      expect(
+        nonString.issues.some(
+          (issue) => issue.path === 'workers.models.implementer' && issue.message.includes('non-empty string'),
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it('deliverAnswer without a waiting harness fails loud (the error path is pinned, never a silent no-op)', async () => {
+    const cli = new FakeHerdrCli();
+    const adapter = makeAdapter(cli);
+    await adapter.provision();
+    await adapter.start();
+    let thrown: unknown;
+    try {
+      await adapter.deliverAnswer({ interactionId: 'int_x', question: '?', response: 'answer' });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain('no waiting harness');
+    // The adapter state is untouched: nothing settled, nothing ran.
+    expect((await adapter.collectArtifacts()).failure ?? '').toContain('not running');
+  });
+
+  it('treats a transient agent-get probe failure as unknown state and keeps polling to the deadline', async () => {
+    const underlying = new FakeHerdrCli();
+    underlying.agentState = 'idle'; // turn ended, nothing reported yet
+    const realRun = underlying.run.bind(underlying);
+    let gets = 0;
+    underlying.run = async (args: readonly string[]): Promise<HerdrDoc> => {
+      if (args[0] === 'agent' && args[1] === 'get') {
+        gets += 1;
+        if (gets === 1) throw new Error('herdr socket hiccup');
+      }
+      return realRun(args);
+    };
+    const adapter = makeAdapter(underlying);
+    await adapter.provision();
+    await adapter.start();
+    await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath });
+    const result = await adapter.collectArtifacts();
+
+    // The probe hiccup did not kill the healthy harness: polling continued and
+    // the run failed only on the legitimate report deadline (loud), with the
+    // transient error NOT reported as the failure cause.
+    expect(result.status).toBe('failed');
+    expect(result.failure ?? '').not.toContain('socket hiccup');
+    expect(result.failure ?? '').toContain('report');
+    expect(underlying.openTabs()).toHaveLength(0);
+    expect(gets).toBeGreaterThanOrEqual(2);
+  });
+
   it('renders the execution envelope as the task prompt (worktree, branch, base, report path)', () => {
     const prompt = renderTaskPrompt(TEST_ENVELOPE);
     expect(prompt).toContain(TEST_ENVELOPE.worktree);
@@ -937,6 +1176,20 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
       noiseError = error;
     }
     expect((noiseError as Error).message).toContain('non-JSON');
+
+    // The error argv is a *truncated preview*: a multi-KB prompt (whole prompt/
+    // diff payloads ride argv) must never land verbatim in a durable log line.
+    const hugePrompt = 'X'.repeat(5_000);
+    const long = createProcessHerdrCli(stubScript('herdr-cli-exit2.sh', 'echo "boom" >&2\nexit 2'));
+    let longError: unknown;
+    try {
+      await long.run(['agent', 'prompt', 'a', hugePrompt]);
+    } catch (error) {
+      longError = error;
+    }
+    expect((longError as Error).message.length).toBeLessThan(500);
+    expect((longError as Error).message).not.toContain(hugePrompt.slice(100));
+    expect((longError as Error).message).toContain('agent prompt a');
   });
 });
 
@@ -1183,6 +1436,39 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
     }
   });
 
+  it('refuses verifier composition at boot when workers.models maps a routed capability to the judge model', () => {
+    // The deployment maps the implementer (a generic routed id) to the same
+    // concrete model the judge runs: every judgment would be attested as
+    // independent while being a same-model self-sign-off. Boot refuses — fail
+    // closed, loud — instead of carrying a nominal live guard.
+    const text = serializeFactoryConfig({
+      ...DEFAULT_FACTORY_CONFIG,
+      repository: { path: repoPath },
+      workers: { ...DEFAULT_FACTORY_CONFIG.workers, models: { implementer: 'opencode/judge-claude' } },
+      verification: JUDGE_VERIFICATION,
+    } as FactoryDesiredConfig);
+    const runtime = runtimeFromT(text);
+    let thrown: unknown;
+    try {
+      buildServerDeps(runtime, { reconcileOnBoot: false, herdrCli: new FakeHerdrCli() });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain('writer ≠ verifier');
+    expect((thrown as Error).message).toContain('workers.models.implementer');
+
+    // A distinct concrete model composes fine (the guard is equality-only).
+    const distinct = serializeFactoryConfig({
+      ...DEFAULT_FACTORY_CONFIG,
+      repository: { path: repoPath },
+      workers: { ...DEFAULT_FACTORY_CONFIG.workers, models: { implementer: 'opencode/sonnet-x' } },
+      verification: JUDGE_VERIFICATION,
+    } as FactoryDesiredConfig);
+    const deps = buildServerDeps(runtimeFromT(distinct), { reconcileOnBoot: false, herdrCli: new FakeHerdrCli() });
+    deps.store.close();
+  });
+
   it('fails closed when the judge harness produces no verdict file: every criterion fails, REWORK, no bundle', async () => {    const cli = new FakeHerdrCli();
     cli.onPrompt = (prompt, cwd) => {
       void prompt;
@@ -1209,6 +1495,13 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       expect(deps.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
       // Zero tabs at rest even on the failed judgment.
       expect(cli.openTabs()).toHaveLength(0);
+      // The verdict run is diagnosed, not just parked: the structured event
+      // carries the judge's own "no verdict file" failure.
+      const failure = deps.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .find((event) => event.type === 'verification.failed');
+      const record = (failure!.payload as { failures: Array<{ evidence: { summary: string } }> }).failures[0]!;
+      expect(record.evidence.summary).toContain('no verdict file');
     } finally {
       deps.store.close();
     }
@@ -1235,6 +1528,13 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       expect(deps.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
       // The blocked pane is closed: zero harnesses at rest.
       expect(cli.openTabs()).toHaveLength(0);
+      // The stranded judgment is diagnosed, not silently parked.
+      const failure = deps.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .find((event) => event.type === 'verification.failed');
+      expect(
+        (failure!.payload as { failures: Array<{ evidence: { summary: string } }> }).failures[0]!.evidence.summary,
+      ).toContain('semantic judge');
     } finally {
       deps.store.close();
     }
@@ -1265,6 +1565,12 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       expect(deps.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
       expect(deps.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
       expect(cli.openTabs()).toHaveLength(0);
+      // The judge's own failure is carried into the structured diagnosis.
+      const failure = deps.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .find((event) => event.type === 'verification.failed');
+      const record = (failure!.payload as { failures: Array<{ evidence: { summary: string } }> }).failures[0]!;
+      expect(record.evidence.summary).toContain('judge harness crashed mid-verdict');
     } finally {
       deps.store.close();
     }
@@ -1805,5 +2111,68 @@ describe('E11.4 policy/rules configuration surface (#41)', () => {
     }
     expect(missingThrow).toBeInstanceOf(Error);
     expect((missingThrow as Error).message).toContain('missing-policy.yaml');
+  });
+
+  it('normalizes the template lowercase inline policy: decision tokens land as engine verdicts end to end', async () => {
+    // Exactly the shipped `factory.yaml` template's lowercase shape. The raw
+    // decode used to flow into runtime.policy verbatim, so `decision: "allow"`
+    // never matched the engine's `ALLOW` literal: an allow never allowed, a
+    // require_human never gated, and the audit stamped an invalid token.
+    const text = policyConfigText();
+    const lowercase = parseFactoryConfig(
+      `${text}policy:\n  version: e11-lowercase-1\n  organization:\n    capabilities:\n      repo.write:\n        - decision: allow\n          scope: { branchPattern: "wo-*/**", excludePaths: ["infra/**"] }\n      repo.read:\n        - decision: allow\n`,
+    );
+    if (!lowercase.ok) throw new Error(`lowercase policy invalid: ${JSON.stringify(lowercase.issues)}`);
+    const runtime = resolveFactoryConfig(lowercase.config, { baseDir: workDir });
+
+    // The resolved policy carries the *built* document: uppercase verdicts.
+    expect(
+      runtime.policy!.organization.capabilities['repo.write']!.map((rule) => rule.decision),
+    ).toEqual(['ALLOW']);
+    expect(
+      runtime.policy!.organization.capabilities['repo.read']!.map((rule) => rule.decision),
+    ).toEqual(['ALLOW']);
+
+    // End to end: the same loaded policy drives the scheduler's assignment
+    // gate (the `!== 'ALLOW'` comparison) and the write-time path gate.
+    const deps = buildServerDeps(runtime, {
+      reconcileOnBoot: false,
+      herdrCli: new FakeHerdrCli(),
+      // A settle-closed worker: the point is the assignment gate, not a run.
+      spawn: () => idleAdapter(),
+    });
+    try {
+      const { wo, task } = seedExecutableTask(deps);
+      const schedulerPolicy = createSchedulerPolicy({
+        store: deps.store,
+        events: deps.events,
+        ...(runtime.policy ? { policy: runtime.policy } : {}),
+      });
+      expect(schedulerPolicy.canAssign(task, wo)).toBe('ALLOW');
+      expect(schedulerPolicy.canWriteChangeSet!(task, wo, 'wo-x/impl', ['src/app.ts']).allowed).toBe(true);
+      expect(schedulerPolicy.canWriteChangeSet!(task, wo, 'wo-x/impl', ['infra/x.md']).allowed).toBe(false);
+
+      // The scheduler (which compares the verdict literal) accepts: assigned.
+      await tickAndSettle(deps.scheduler!);
+      expect(deps.store.get<Task>('tasks', task.id)!.state).not.toBe('READY');
+
+      // Durable decisions stamp the configured (lowercase-sourced) version.
+      const versions = deps.store
+        .list<{ policyVersion: string }>('policy_decisions')
+        .map((record) => record.policyVersion);
+      expect(versions).toContain('e11-lowercase-1');
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('rejects a duplicated root-level policyFile key loudly (it would silently swap the policy source)', () => {
+    const duplicated = parseWithAppended('policyFile: ./other-policy.yaml\npolicyFile: ./policy.yaml\n');
+    if (duplicated.ok) throw new Error('a duplicated policyFile key must not parse');
+    expect(
+      duplicated.issues.some(
+        (issue) => issue.path === 'policyFile' && issue.message.includes('duplicate key'),
+      ),
+    ).toBe(true);
   });
 });

@@ -23,7 +23,10 @@ into `buildServerDeps` (`src/cli/factory.ts`).
 An invalid policy never silently falls back to a permissive one:
 
 - inline `policy:` — rejected loudly at parse (`parseFactoryConfig` collects
-  dotted-path issues; `factory init`/`start`/`serve` refuse to load);
+  dotted-path issues; `factory init`/`start`/`serve` refuse to load); resolved
+  with the **built** document (`parsePolicyDocument`), so decision tokens are
+  normalized to the engine verdicts (`allow` → `ALLOW`) before any consumer
+  reads them;
 - `policyFile:` — the *reference* is validated at parse (fs-free); the file's
   *content* is read + validated at resolve (`loadPolicyDocumentFile`), throwing
   `FactoryError('POLICY_INVALID')` for an unreadable file, bad YAML, or a

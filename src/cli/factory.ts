@@ -355,6 +355,23 @@ function resolveVerifier(
 ): WorkVerifier | undefined {
   if (options.verifier) return options.verifier;
   if (!runtime.verification) return undefined;
+  // E11 final review (writer ≠ verifier, concrete models): the live guard
+  // compares the Attempt's model string against the judge's model, but a routed
+  // capability id (e.g. `implementer`) only becomes *concrete* via
+  // `workers.models` at dispatch. If a deployment maps a routed capability to
+  // the same concrete model as the judge, every judge ruling would be a
+  // same-model self-sign-off attested as independent. Refuse the composition at
+  // boot — fail closed, loud — instead of shipping a nominal guard.
+  const judgeModel = concreteModelKey(runtime.verification.judge.model);
+  for (const [capability, mapped] of Object.entries(runtime.workers.models ?? {})) {
+    if (concreteModelKey(mapped) === judgeModel) {
+      throw new Error(
+        `writer ≠ verifier violation: workers.models.${capability} maps to "${mapped}", ` +
+          `the same model as the verification judge ("${runtime.verification.judge.provider}/${runtime.verification.judge.model}") — ` +
+          'refusing to compose the verifier; set a different concrete model for the judge or the routed capability',
+      );
+    }
+  }
   try {
     return createProductionVerifier({
       config: runtime.verification,
@@ -370,6 +387,18 @@ function resolveVerifier(
     );
     return undefined;
   }
+}
+
+/**
+ * The concrete model a routed capability or judge identity resolves to, with
+ * the `provider/` qualifier stripped (the same normalization the E5 live
+ * writer ≠ verifier check applies to both sides) — so a bare and a qualified
+ * spelling of the same model cannot dodge the comparison.
+ */
+function concreteModelKey(model: string): string {
+  const slash = model.indexOf('/');
+  const bare = slash > 0 && slash < model.length - 1 ? model.slice(slash + 1) : model;
+  return bare.trim().toLowerCase();
 }
 
 /**
@@ -550,6 +579,9 @@ export function buildServerDeps(
         // E11.4 (#41): the E6 gates run against the loaded deployment policy.
         ...(runtime.policy ? { policy: runtime.policy } : {}),
         baseBranch: githubInputs.baseBranch,
+        // E11.3 (#43): the configured `github.repository` is an enforced bound
+        // (not a dead claim) on everything the adapter does with the token.
+        ...(runtime.github ? { allowedRepository: runtime.github.repository } : {}),
       })
     : undefined;
   // E9.6 boot reconciliation (spec §18.3): walk durable state → event history →
@@ -638,6 +670,8 @@ export function buildGitHubAdapter(input: {
    * evaluate against the embedded default.
    */
   policy?: PolicyDocument;
+  /** E11.3 (#43): the enforced repository bound (see the adapter options). */
+  allowedRepository?: string;
   baseBranch?: string;
 }): GitHubAdapter {
   return createGitHubAdapter({
@@ -645,6 +679,7 @@ export function buildGitHubAdapter(input: {
     client: input.client,
     factoryBaseUrl: input.factoryBaseUrl,
     ...(input.baseBranch ? { baseBranch: input.baseBranch } : {}),
+    ...(input.allowedRepository !== undefined ? { allowedRepository: input.allowedRepository } : {}),
     checkPolicy: (subject, action) =>
       checkDetailed(
         { store: input.store, events: input.events, ...(input.policy ? { policy: input.policy } : {}) },
