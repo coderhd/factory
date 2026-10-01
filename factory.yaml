@@ -59,9 +59,23 @@ workers:
   # Capability → model map (#44): keys are E9.3's generic capability ids
   # (explorer, generalist, implementer, …), values the concrete opencode
   # models your deployment runs. Unmapped routed ids fail loud at dispatch.
-  # models:
-  #   implementer: opencode/sonnet
-  #   explorer: opencode/haiku
+  models:
+    # Concrete opencode models for E9.3's generic capability ids. We run the two
+    # primaries we develop Factory with (glm-5.3-flash, deepseek-v4.1-flash).
+    # Frontier models are deliberately avoided (glm-5.3, qwen3.8-max, kimi-k3,
+    # grok-4.7, gpt-6-luna); `frontier` is mapped to a primary so escalation
+    # never reaches one. qwen3.8-flash is reserved for the semantic judge below
+    # (writer ≠ verifier: the judge model must differ from every value here).
+    explorer: opencode-go/deepseek-v4.1-flash
+    generalist: opencode-go/glm-5.3-flash
+    implementer: opencode-go/glm-5.3-flash
+    independent-opinion: opencode-go/glm-5.3-flash
+    loop-solver: opencode-go/deepseek-v4.1-flash
+    reviewer: opencode-go/glm-5.3-flash
+    planner: opencode-go/glm-5.3-flash
+    frontier: opencode-go/glm-5.3-flash
+    adversarial: opencode-go/glm-5.3-flash
+    diversifier: opencode-go/glm-5.3-flash
 # Outbound GitHub configuration (E11.3, #43). Optional: when present, `factory
 # start` composes the GitHub adapter (import issues, open change-set PRs) from
 # this section; absent, the GitHub routes 404 (fail closed). The token is a
@@ -106,33 +120,35 @@ workers:
 # synthetic|customer-data), optional `ruleId`. Prefer a separate file:
 # policyFile: ./policy.yaml    # either a policy section OR policyFile, never both
 
-# Production verification (E10.1, #39). Optional: when present, the server
-# composes the real E5 verifier (engine + independent semantic judge) from this
-# section, so a SUCCESS Task is verified and driven to HUMAN_GATE. Absent, the
-# server wires no verifier and fails closed (no promotion). Uncomment and set
-# the judge + command checks for a deployment that supplies a model-calling
-# judge implementation.
-# verification:
-#   judge:
-#     provider: judge-co
-#     model: judge-1
-#     family: judge-family
-#     # E11.2 (#42): the harness kind the judge's fresh pane runs (default opencode).
-#     harness: opencode
-#   prompt:
-#     id: factory-verify
-#     version: "1"
-#   rubric:
-#     - Does the change set satisfy the criterion as written?
-#   checks:
-#     - id: typecheck
-#       category: deterministic
-#       kind: typecheck
-#       command: bun run typecheck
-#     - id: e2e
-#       category: behavioral
-#       kind: e2e
-#       command: bun run e2e
+# Production verification (E10.1, #39; judge harness E11.2, #42). When present,
+# the server composes the real E5 verifier (deterministic command checks + an
+# independent semantic judge run as a fresh opencode harness) and drives a
+# SUCCESS Task through verification to HUMAN_GATE. The judge identity MUST differ
+# from every `workers.models` value (writer ≠ verifier) or the server refuses to
+# start. The commands run in the Attempt's worktree.
+verification:
+  judge:
+    # Different family from the implementers (glm-5.3-flash / deepseek-v4.1-flash).
+    provider: opencode-go
+    model: qwen3.8-flash
+    family: qwen
+    harness: opencode
+  prompt:
+    id: factory-verify
+    version: "1"
+  rubric:
+    - Falsify each acceptance criterion against the change set, not the author's summary.
+    - Inspect the diff and the deterministic results; report per-criterion pass/fail with evidence.
+    - Treat anything you cannot verify from the change set as a failure, not a pass.
+  checks:
+    - id: typecheck
+      category: deterministic
+      kind: typecheck
+      command: sh scripts/check-tsc.sh
+    - id: unit
+      category: deterministic
+      kind: unit
+      command: bun test
 image:
   repository: ghcr.io/coderhd/factory
   tag: "0.1.0"
