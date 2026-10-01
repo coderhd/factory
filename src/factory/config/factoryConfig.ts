@@ -1,6 +1,8 @@
 import { join, resolve } from 'node:path';
 
 import { CHECK_KINDS, type CheckCategory } from '../verification/engine';
+import { loadPolicyDocumentFile, parsePolicyDocument } from '../policy/policyLoader';
+import type { PolicyDocument, PolicyLevel, PolicyScope } from '../policy/policy';
 
 /**
  * E2 desired → runtime configuration (spec §20). `factory.yaml` describes the
@@ -111,6 +113,21 @@ export interface FactoryDesiredConfig {
   verification?: VerificationDesired;
   /** Optional outbound GitHub config (E11.3, #43); absent → no adapter, routes 404. */
   github?: GitHubDesiredConfig;
+  /**
+   * E11.4 (#41): the policy source of truth (ADR 14 §11 shape), validated into
+   * E7's `PolicyDocument`. Present, it is the deployment's override of the
+   * embedded defaults and lands via `buildServerDeps` in the scheduler
+   * (`canAssign`), the write-time `repoWriteGate`, and every `check`/`checkDe-
+   * tailed` call the server composes. Absent, the embedded default stays
+   * authoritative — fail closed, unchanged.
+   */
+  policy?: PolicyDocument;
+  /**
+   * E11.4 (#41): a referenced policy file, resolved against the config
+   * directory at resolve time. Parse stays fs-free: the reference is validated
+   * here, the file's *content* at resolve (both loudly, fail closed).
+   */
+  policyFile?: string;
   image: { repository: string; tag: string };
   compose: {
     healthcheck: { intervalSeconds: number; timeoutSeconds: number; retries: number };
@@ -147,6 +164,8 @@ export interface FactoryRuntimeConfig {
    * only in the adapter module).
    */
   github?: { repository: string; tokenEnv: string; apiBaseUrl?: string; baseBranch: string };
+  /** E11.4 (#41): the loaded policy document; absent when no `policy:` source is configured. */
+  policy?: PolicyDocument;
   image: { repository: string; tag: string; ref: string };
 }
 
@@ -385,6 +404,31 @@ export function parseFactoryConfig(text: string): ConfigParse {
     }
   }
 
+  // E11.4 (#41): the optional policy source of truth (ADR 14 §11). Absent, the
+  // embedded defaults stay authoritative — fail closed, unchanged. Present, the
+  // document must be well-formed: an invalid policy is rejected loudly here
+  // (never silently degraded toward a permissive default). An inline `policy:`
+  // and a `policyFile:` reference are mutually exclusive; a referenced file's
+  // *content* is validated at resolve time (parse is fs-free), still loudly,
+  // before anything boots.
+  if (root.policy !== undefined || root.policyFile !== undefined) {
+    if (root.policy !== undefined && root.policyFile !== undefined) {
+      issue('policy', 'set either an inline policy or a policyFile reference, never both');
+    } else if (root.policy !== undefined) {
+      const parsedPolicy = parsePolicyDocument(root.policy);
+      if (!parsedPolicy.ok) {
+        for (const policyIssue of parsedPolicy.issues) {
+          issue(
+            policyIssue.path ? `policy.${policyIssue.path}` : 'policy',
+            policyIssue.message,
+          );
+        }
+      }
+    } else if (!isNonEmptyString(root.policyFile)) {
+      issue('policyFile', 'policyFile must be a non-empty path string when configured');
+    }
+  }
+
   // E10.1 (#39): the optional verification section. Absent is valid (the server
   // wires no verifier and fails closed); present, every field must be well-formed
   // so production composition never runs a misconfigured judge or check.
@@ -542,6 +586,15 @@ export function resolveFactoryConfig(
 ): FactoryRuntimeConfig {
   const root = resolve(options.baseDir ?? process.cwd());
   const state = resolve(root, config.storage.state);
+  // E11.4 (#41): resolve the policy source of truth. An inline document is
+  // deep-copied (the runtime config is its own copy); a `policyFile:` reference
+  // is read + validated here — an unreadable file or an invalid document throws
+  // a loud `FactoryError` (fail closed), never a permissive fallback.
+  const policy = config.policy
+    ? (JSON.parse(JSON.stringify(config.policy)) as PolicyDocument)
+    : config.policyFile
+      ? loadPolicyDocumentFile(resolve(root, config.policyFile))
+      : undefined;
   return {
     apiVersion: config.apiVersion,
     factoryVersion: config.factoryVersion,
@@ -604,12 +657,65 @@ export function resolveFactoryConfig(
           },
         }
       : {}),
+    ...(policy ? { policy } : {}),
     image: {
       repository: config.image.repository,
       tag: config.image.tag,
       ref: `${config.image.repository}:${config.image.tag}`,
     },
   };
+}
+
+const policyQuoted = (value: string): string => JSON.stringify(value);
+
+function serializePolicyScope(indent: string, scope: PolicyScope): string[] {
+  const lines = [`${indent}scope:`];
+  for (const key of ['paths', 'excludePaths'] as const) {
+    if (scope[key] !== undefined) {
+      lines.push(`${indent}  ${key}:`);
+      for (const pattern of scope[key]!) lines.push(`${indent}    - ${policyQuoted(pattern)}`);
+    }
+  }
+  if (scope.branchPattern !== undefined) lines.push(`${indent}  branchPattern: ${policyQuoted(scope.branchPattern)}`);
+  if (scope.env !== undefined) lines.push(`${indent}  env: ${policyQuoted(scope.env)}`);
+  if (scope.dataClass !== undefined) lines.push(`${indent}  dataClass: ${policyQuoted(scope.dataClass)}`);
+  return lines;
+}
+
+function serializePolicyLevel(key: string, indent: string, level: PolicyLevel): string[] {
+  const lines = [`${indent}${key}:`, `${indent}  capabilities:`];
+  for (const [capability, rules] of Object.entries(level.capabilities)) {
+    if (!rules || rules.length === 0) continue;
+    lines.push(`${indent}    ${policyQuoted(capability)}:`);
+    for (const rule of rules) {
+      lines.push(`${indent}      - decision: ${policyQuoted(rule.decision)}`);
+      if (rule.ruleId !== undefined) lines.push(`${indent}        ruleId: ${policyQuoted(rule.ruleId)}`);
+      if (rule.scope !== undefined) lines.push(...serializePolicyScope(`${indent}        `, rule.scope));
+    }
+  }
+  return lines;
+}
+
+/**
+ * The optional `policy:` section (E11.4, #41; ADR 14 §11) — an inline validated
+ * `PolicyDocument` or a `policyFile:` reference. Absent, nothing is emitted
+ * (the embedded default stays authoritative). Strings are emitted quoted (JSON
+ * scalars are YAML scalars) so capability ids, globs and rule ids containing
+ * `:`/`#` cannot break the document.
+ */
+function serializePolicySection(config: FactoryDesiredConfig): string[] {
+  if (config.policyFile !== undefined) return [`policyFile: ${policyQuoted(config.policyFile)}`];
+  const policy = config.policy;
+  if (!policy) return [];
+  const lines = ['policy:', `  version: ${policyQuoted(policy.version)}`];
+  lines.push(...serializePolicyLevel('organization', '  ', policy.organization));
+  if (policy.projects !== undefined) {
+    lines.push('  projects:');
+    for (const [repository, level] of Object.entries(policy.projects)) {
+      lines.push(...serializePolicyLevel(repository, '    ', level));
+    }
+  }
+  return lines;
 }
 
 /** Render a desired config as the canonical `factory.yaml` text `init` writes. */
@@ -677,6 +783,9 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
             : []),
         ]
       : []),
+    // E11.4 (#41): the optional policy source of truth rides here, before the
+    // verification section.
+    ...serializePolicySection(config),
     ...(config.verification
       ? [
           'verification:',

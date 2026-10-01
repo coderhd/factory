@@ -74,6 +74,38 @@ workers:
 #     env: FACTORY_GITHUB_TOKEN
 #   # apiBaseUrl: https://github.example.com/api/v3   # GitHub Enterprise, optional
 #   # baseBranch: main                                 # PR base branch, optional (default main)
+# Policy/rules configuration (E11.4, #41; ADR 14 §11). Optional: when present,
+# this section is the deployment's policy source of truth and overrides the
+# embedded defaults everywhere (scheduler assignment, the write-time repo.write
+# path gate, every check). Absent, the embedded defaults stay authoritative —
+# fail closed, unchanged. An invalid policy is rejected loudly at load and the
+# server refuses to start; it is never silently degraded to a permissive
+# default. Levels fold Org → Project → WO → Task with monotonic narrowing: a
+# child can never widen a parent, and the deployment-fixed capability ceilings
+# (production.write/secrets.read, production customer-data reads, production
+# deploys) are engine-owned, not configurable in v0.1.
+# policy:
+#   version: v-deploy-1        # your own version string; '<embedded>' is reserved
+#   organization:
+#     capabilities:
+#       repo.write:
+#         - decision: allow
+#           scope: { branchPattern: "wo-*/**", excludePaths: ["infra/**"] }
+#       repo.read:
+#         - decision: allow
+#       secrets.read:
+#         - decision: deny
+#   projects:                    # keyed by the Work Order repository name
+#     client-portal:
+#       capabilities:
+#         repo.write:
+#           - decision: allow
+#             scope: { paths: ["src/**", "docs/**"] }
+# Each rule: `decision: allow|deny|require_human`, optional `scope` (paths /
+# excludePaths globs, branchPattern, env: staging|production, dataClass:
+# synthetic|customer-data), optional `ruleId`. Prefer a separate file:
+# policyFile: ./policy.yaml    # either a policy section OR policyFile, never both
+
 # Production verification (E10.1, #39). Optional: when present, the server
 # composes the real E5 verifier (engine + independent semantic judge) from this
 # section, so a SUCCESS Task is verified and driven to HUMAN_GATE. Absent, the

@@ -22,7 +22,7 @@ import {
 } from '../factory/github/adapter';
 import { openEventLog, type EventLog } from '../factory/events/log';
 import { createEvidenceReadPort } from '../factory/observatory/observatory';
-import { check, checkDetailed, repoWriteGate } from '../factory/policy/policy';
+import { check, checkDetailed, repoWriteGate, type PolicyDocument } from '../factory/policy/policy';
 import type { DAGProposalPayload } from '../factory/planning/dag';
 import { reconcileAfterRestart } from '../factory/recovery/recovery';
 import type { CircuitConfig } from '../factory/recovery/circuitBreaker';
@@ -166,7 +166,17 @@ function loadConfig(dir: string, io: CliIO): LoadedConfig | null {
     for (const issue of parsed.issues) io.err(`${issue.path || 'factory.yaml'}: ${issue.message}`);
     return null;
   }
-  return { text, runtime: resolveFactoryConfig(parsed.config, { baseDir: dir }) };
+  // E11.4 (#41): resolving a referenced `policyFile:` may fail closed (unread-
+  // able file, invalid document). Same contract as a malformed YAML: one
+  // actionable line, exit 1 — never a boot with a degraded policy.
+  let runtime: FactoryRuntimeConfig;
+  try {
+    runtime = resolveFactoryConfig(parsed.config, { baseDir: dir });
+  } catch (error) {
+    io.err(`${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+  return { text, runtime };
 }
 
 function ensureStorageDirs(runtime: FactoryRuntimeConfig): void {
@@ -192,6 +202,12 @@ function ensureStorageDirs(runtime: FactoryRuntimeConfig): void {
 export function createSchedulerPolicy(deps: {
   store: StateStore;
   events: EventLog;
+  /**
+   * E11.4 (#41): the deployment policy (the loaded `policy:` config). Absent,
+   * the E7 engine falls back to the embedded defaults — byte-identical to the
+   * pre-loader behavior.
+   */
+  policy?: PolicyDocument;
 }): SchedulerPolicy {
   return {
     canAssign: (task, workOrder) =>
@@ -531,6 +547,8 @@ export function buildServerDeps(
         factoryBaseUrl: githubInputs.factoryBaseUrl,
         store,
         events,
+        // E11.4 (#41): the E6 gates run against the loaded deployment policy.
+        ...(runtime.policy ? { policy: runtime.policy } : {}),
         baseBranch: githubInputs.baseBranch,
       })
     : undefined;
@@ -562,7 +580,13 @@ export function buildServerDeps(
       worktrees,
       repoPath: runtime.repository.path,
       artifacts,
-      policy: createSchedulerPolicy({ store, events }),
+      policy: createSchedulerPolicy({
+        store,
+        events,
+        // E11.4 (#41): the loaded `policy:` config (or referenced file) drives
+        // assignment and the write-time path gate; absent → embedded default.
+        ...(runtime.policy ? { policy: runtime.policy } : {}),
+      }),
       telemetry: { evidence },
       ...(options.now ? { now: options.now } : {}),
       ...(verifier ? { verifier } : {}),
@@ -608,6 +632,12 @@ export function buildGitHubAdapter(input: {
   factoryBaseUrl: string;
   store: StateStore;
   events: EventLog;
+  /**
+   * E11.4 (#41): the loaded deployment policy. When configured, the E6 gates
+   * (`branch.create`/`pr.create`/merge) evaluate against it; absent, they
+   * evaluate against the embedded default.
+   */
+  policy?: PolicyDocument;
   baseBranch?: string;
 }): GitHubAdapter {
   return createGitHubAdapter({
@@ -616,7 +646,11 @@ export function buildGitHubAdapter(input: {
     factoryBaseUrl: input.factoryBaseUrl,
     ...(input.baseBranch ? { baseBranch: input.baseBranch } : {}),
     checkPolicy: (subject, action) =>
-      checkDetailed({ store: input.store, events: input.events }, subject, action),
+      checkDetailed(
+        { store: input.store, events: input.events, ...(input.policy ? { policy: input.policy } : {}) },
+        subject,
+        action,
+      ),
     readEvidence: (id) => input.store.get<EvidenceBundle>('evidence_bundles', id),
   });
 }

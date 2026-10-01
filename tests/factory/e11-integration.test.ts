@@ -4,9 +4,10 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildServerDeps, type ServerDepsOptions } from '../../src/cli/factory';
+import { buildServerDeps, createSchedulerPolicy, type ServerDepsOptions } from '../../src/cli/factory';
 import type { EvidenceBundle } from '../../src/factory/evidence/bundle';
 import { commitDAG } from '../../src/factory/planning/dag';
+import { check, DEFAULT_POLICY_VERSION, type PolicyDocument } from '../../src/factory/policy/policy';
 import {
   completeAttempt,
   createAttempt,
@@ -1363,5 +1364,341 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       // Resolved: the harness rides the judge config (defaulted).
       expect(resolved.verification!.judge.harness).toBe('opencode');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E11.4 (#41) — the policy/rules configuration surface. An inline `policy:`
+// section (or a `policyFile:` reference) in `factory.yaml` loads, validates and
+// overrides the embedded E7 policy; absent, the embedded default stays
+// authoritative (byte-identical, fail closed). Invalid policies are rejected
+// loudly — never silently degraded toward a permissive default.
+// Hermetic throughout: temp dirs, no network, no real harness spawns.
+// ---------------------------------------------------------------------------
+
+/** The custom deployment policy the override tests run against. */
+const CUSTOM_POLICY: PolicyDocument = {
+  version: 'e11-fixtures-1',
+  organization: {
+    capabilities: {
+      // Denies what the embedded default allows at org level.
+      'repo.read': [{ decision: 'DENY', ruleId: 'org:repo.read' }],
+      // Restricts what the embedded default grants broadly: only `docs/**`
+      // writes are granted; everything else (whole-worktree `**` included) is
+      // outside that scope → DENY.
+      'repo.write': [{ decision: 'ALLOW', scope: { paths: ['docs/**'] }, ruleId: 'org:repo.write' }],
+    },
+  },
+};
+
+/** A policy configuration fixture built over the default desired config. */
+function policyConfigText(policy?: PolicyDocument): string {
+  return serializeFactoryConfig({
+    ...DEFAULT_FACTORY_CONFIG,
+    repository: { path: repoPath },
+    ...(policy ? { policy } : {}),
+  } as FactoryDesiredConfig);
+}
+
+/**
+ * Parse a fixture `factory.yaml` whose trailing lines are appended after the
+ * base (valid) config text, so any issue reported is caused only by those
+ * lines — never by missing required sections.
+ */
+function parseWithAppended(appended: string) {
+  const base = serializeFactoryConfig({
+    ...DEFAULT_FACTORY_CONFIG,
+    repository: { path: repoPath },
+  });
+  return parseFactoryConfig(`${base}${appended}`);
+}
+
+/** Seed a Work Order driven to EXECUTING with one READY task, over real deps. */
+function seedExecutableTask(
+  deps: {
+    store: ReturnType<typeof buildServerDeps>['store'];
+    events: ReturnType<typeof buildServerDeps>['events'];
+  },
+): { wo: WorkOrder; task: Task } {
+  const wo = createWorkOrder(deps, {
+    intent: 'E11.4 policy subject',
+    acceptanceCriteria: ['done'],
+  });
+  for (const to of ['READY', 'PLANNING'] as const) transitionWorkOrder(deps, wo.id, { to });
+  const dag = commitDAG(deps, wo.id, { nodes: [{ nodeId: 'a', title: 'Node 1' }] });
+  transitionWorkOrder(deps, wo.id, { to: 'EXECUTING' });
+  return { wo, task: deps.store.get<Task>('tasks', dag.nodes[0]!.taskId)! };
+}
+
+/** Tick + settle up to a budget of iterations; returns nothing (assert after). */
+async function tickAndSettle(
+  scheduler: NonNullable<ReturnType<typeof buildServerDeps>['scheduler']>,
+  iterations = 10,
+): Promise<void> {
+  for (let i = 0; i < iterations; i += 1) {
+    scheduler.tick();
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+}
+
+describe('E11.4 policy/rules configuration surface (#41)', () => {
+  it('loads an inline policy: overrides check verdicts vs the embedded default and stamps the custom version', () => {
+    const runtime = runtimeFrom(policyConfigText(CUSTOM_POLICY));
+    const deps = buildServerDeps(runtime, { reconcileOnBoot: false, herdrCli: new FakeHerdrCli() });
+    try {
+      // The loaded policy is exactly the configured document.
+      expect(runtime.policy).toEqual(CUSTOM_POLICY);
+      const { wo, task } = seedExecutableTask(deps);
+
+      // repo.read: the embedded default says ALLOW; the configured org rule is DENY.
+      expect(
+        check(
+          { store: deps.store, events: deps.events, policy: runtime.policy },
+          { taskId: task.id, workOrderId: wo.id },
+          { capability: 'repo.read', resource: { path: 'notes.md' } },
+        ),
+      ).toBe('DENY');
+
+      // Control, same seeds: without the override the embedded default speaks
+      // (stays ALLOW) under its own `<embedded>` version — absent config
+      // changes nothing.
+      expect(
+        check(
+          { store: deps.store, events: deps.events },
+          { taskId: task.id, workOrderId: wo.id },
+          { capability: 'repo.read', resource: { path: 'notes.md' } },
+        ),
+      ).toBe('ALLOW');
+
+      // Durable decisions stamp the policy version that resolved them (ADR 14
+      // §11: audit trails never mix policy versions).
+      const versions = deps.store
+        .list<{ policyVersion: string }>('policy_decisions')
+        .map((record) => record.policyVersion);
+      expect(versions).toContain('e11-fixtures-1');
+      expect(versions).toContain(DEFAULT_POLICY_VERSION);
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('honours the loaded policy through the assignment + write-time gates and the scheduler end-to-end', async () => {
+    const runtime = runtimeFrom(policyConfigText(CUSTOM_POLICY));
+    const deps = buildServerDeps(runtime, {
+      reconcileOnBoot: false,
+      spawn: () => new IdleFakeHerdr(),
+      herdrCli: new FakeHerdrCli(),
+    });
+    try {
+      const { wo, task } = seedExecutableTask(deps);
+
+      // Gate level: the assignment gate (repo.write on the worktree branch,
+      // whole-worktree `'**'` binding) is outside the configured `docs/**`
+      // scope → DENY. The write-time path gate folds the same scope over the
+      // change set: inside → allowed, outside → denied.
+      const gateDeps = { store: deps.store, events: deps.events, policy: runtime.policy };
+      const schedulerPolicy = createSchedulerPolicy(gateDeps);
+      expect(schedulerPolicy.canAssign(task, wo)).toBe('DENY');
+      expect(schedulerPolicy.canWriteChangeSet).toBeDefined();
+      expect(schedulerPolicy.canWriteChangeSet!(task, wo, 'wo-x/impl', ['docs/guide.md']).allowed).toBe(true);
+      expect(schedulerPolicy.canWriteChangeSet!(task, wo, 'wo-x/impl', ['src/app.ts']).allowed).toBe(false);
+
+      // End-to-end through buildServerDeps: the scheduler composed with the
+      // loaded policy never assigns the task — it stays READY.
+      await tickAndSettle(deps.scheduler!);
+      expect(deps.store.get<Task>('tasks', task.id)!.state).toBe('READY');
+
+      // Control: same seeds, no policy section — the embedded default assigns
+      // (the READY result is behavioral, not a broken fixture).
+      const defaultDeps = buildServerDeps(runtimeFrom(policyConfigText()), {
+        reconcileOnBoot: false,
+        spawn: () => new IdleFakeHerdr(),
+        herdrCli: new FakeHerdrCli(),
+      });
+      try {
+        const { task: defaultTask } = seedExecutableTask(defaultDeps);
+        await tickAndSettle(defaultDeps.scheduler!);
+        expect(defaultDeps.store.get<Task>('tasks', defaultTask.id)!.state).not.toBe('READY');
+      } finally {
+        defaultDeps.store.close();
+      }
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('absent policy: the embedded default is used unchanged (nothing in config or runtime)', () => {
+    const runtime = runtimeFrom(policyConfigText());
+    expect(runtime.policy).toBeUndefined();
+    expect(policyConfigText()).not.toContain('policy:');
+  });
+
+  it('round-trips: parse → resolve → serialize → parse is stable', () => {
+    const text = policyConfigText(CUSTOM_POLICY);
+    const first = parseFactoryConfig(text);
+    if (!first.ok) throw new Error(`first parse failed: ${JSON.stringify(first.issues)}`);
+    expect(first.config.policy).toEqual(CUSTOM_POLICY);
+    expect(resolveFactoryConfig(first.config, { baseDir: workDir }).policy).toEqual(CUSTOM_POLICY);
+    const second = parseFactoryConfig(serializeFactoryConfig(first.config));
+    if (!second.ok) throw new Error(`second parse failed: ${JSON.stringify(second.issues)}`);
+    expect(second.config.policy).toEqual(CUSTOM_POLICY);
+    expect(serializeFactoryConfig(second.config)).toBe(text);
+  });
+
+  it('rejects an invalid inline policy loudly at parse: unknown capability, bad decision, malformed scope', () => {
+    const unknownCapability = parseWithAppended(
+      [
+        'policy:',
+        '  version: e11-bad-1',
+        '  organization:',
+        '    capabilities:',
+        '      repo.frobnicate:',
+        '        - decision: deny',
+      ].join('\n'),
+    );
+    if (unknownCapability.ok) throw new Error('an unknown capability must not parse');
+    expect(
+      unknownCapability.issues.some(
+        (issue) =>
+          issue.path === 'policy.organization.capabilities.repo.frobnicate' &&
+          issue.message.includes('known capability'),
+      ),
+    ).toBe(true);
+
+    const badDecision = parseWithAppended(
+      [
+        'policy:',
+        '  version: e11-bad-2',
+        '  organization:',
+        '    capabilities:',
+        '      repo.write:',
+        '        - decision: maybe',
+      ].join('\n'),
+    );
+    if (badDecision.ok) throw new Error('an invalid decision must not parse');
+    expect(badDecision.issues.some((issue) => issue.path.includes('repo.write') && issue.path.includes('decision'))).toBe(true);
+
+    const malformedScope = parseWithAppended(
+      [
+        'policy:',
+        '  version: e11-bad-3',
+        '  organization:',
+        '    capabilities:',
+        '      repo.write:',
+        '        - decision: allow',
+        '          scope:',
+        '            paths: src/**',
+        '      repo.read:',
+        '        - decision: allow',
+        '          scope:',
+        '            filesystem: anything',
+      ].join('\n'),
+    );
+    if (malformedScope.ok) throw new Error('a malformed scope must not parse');
+    expect(malformedScope.issues.some((issue) => issue.path === 'policy.organization.capabilities.repo.write[0].scope.paths')).toBe(true);
+    expect(malformedScope.issues.some((issue) => issue.path === 'policy.organization.capabilities.repo.read[0].scope.filesystem')).toBe(true);
+  });
+
+  it('rejects version markers and ambiguous sources loudly: <embedded> version, policy + policyFile together', () => {
+    const embeddedMarker = parseWithAppended(
+      [
+        `policy:`,
+        `  version: ${DEFAULT_POLICY_VERSION}`,
+        '  organization:',
+        '    capabilities:',
+        '      repo.read:',
+        '        - decision: deny',
+      ].join('\n'),
+    );
+    if (embeddedMarker.ok) throw new Error('the <embedded> version marker must not be configurable');
+    expect(embeddedMarker.issues.some((issue) => issue.path === 'policy.version')).toBe(true);
+
+    const bothSources = parseWithAppended(
+      [
+        'policyFile: ./policy.yaml',
+        'policy:',
+        '  version: e11-bad-4',
+        '  organization:',
+        '    capabilities:',
+        '      repo.read:',
+        '        - decision: deny',
+      ].join('\n'),
+    );
+    if (bothSources.ok) throw new Error('an inline policy and a policyFile reference together must not parse');
+    expect(bothSources.issues.some((issue) => issue.path === 'policy')).toBe(true);
+
+    const badFileRef = parseWithAppended('policyFile: 42\n');
+    if (badFileRef.ok) throw new Error('a non-string policyFile must not parse');
+    expect(badFileRef.issues.some((issue) => issue.path === 'policyFile')).toBe(true);
+  });
+
+  it('loads a referenced policyFile resolved against the config dir; unreadable or invalid content fails closed loudly', () => {
+    const policyPath = join(workDir, 'policy.yaml');
+    writeFileSync(
+      policyPath,
+      [
+        'version: e11-file-1',
+        'organization:',
+        '  capabilities:',
+        '    repo.read:',
+        '      - decision: allow',
+        '    repo.write:',
+        '      - decision: deny',
+      ].join('\n'),
+    );
+    const config = parseFactoryConfig(
+      `${serializeFactoryConfig({
+        ...DEFAULT_FACTORY_CONFIG,
+        repository: { path: repoPath },
+      })}policyFile: ./policy.yaml\n`,
+    );
+    if (!config.ok) throw new Error(`fixture invalid: ${JSON.stringify(config.issues)}`);
+    const runtime = resolveFactoryConfig(config.config, { baseDir: workDir });
+    expect(runtime.policy).toEqual({
+      version: 'e11-file-1',
+      organization: {
+        capabilities: {
+          'repo.read': [{ decision: 'ALLOW' }],
+          'repo.write': [{ decision: 'DENY' }],
+        },
+      },
+    });
+
+    // A referenced file whose content is invalid is rejected loudly at load —
+    // never silently degraded toward the (permissive-leaning) default.
+    writeFileSync(join(workDir, 'bad-policy.yaml'), 'version: x\norganization: {}\n');
+    const invalid = parseFactoryConfig(
+      `${serializeFactoryConfig({
+        ...DEFAULT_FACTORY_CONFIG,
+        repository: { path: repoPath },
+      })}policyFile: ./bad-policy.yaml\n`,
+    );
+    if (!invalid.ok) throw new Error(`fixture invalid: ${JSON.stringify(invalid.issues)}`);
+    let thrown: unknown;
+    try {
+      resolveFactoryConfig(invalid.config, { baseDir: workDir });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain('bad-policy.yaml');
+    expect((thrown as Error).message).toContain('capabilities');
+
+    // A referenced file that does not exist fails loud too.
+    const missing = parseFactoryConfig(
+      `${serializeFactoryConfig({
+        ...DEFAULT_FACTORY_CONFIG,
+        repository: { path: repoPath },
+      })}policyFile: ./missing-policy.yaml\n`,
+    );
+    if (!missing.ok) throw new Error(`fixture invalid: ${JSON.stringify(missing.issues)}`);
+    let missingThrow: unknown;
+    try {
+      resolveFactoryConfig(missing.config, { baseDir: workDir });
+    } catch (error) {
+      missingThrow = error;
+    }
+    expect(missingThrow).toBeInstanceOf(Error);
+    expect((missingThrow as Error).message).toContain('missing-policy.yaml');
   });
 });
