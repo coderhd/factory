@@ -2,6 +2,7 @@ import { join, resolve } from 'node:path';
 
 import { CHECK_KINDS, type CheckCategory } from '../verification/engine';
 import { loadPolicyDocumentFile, parsePolicyDocument } from '../policy/policyLoader';
+import { findDuplicateYamlKeys, parseYamlText } from './yaml';
 import type { PolicyDocument, PolicyLevel, PolicyScope } from '../policy/policy';
 
 /**
@@ -213,12 +214,7 @@ export const DEFAULT_FACTORY_CONFIG: FactoryDesiredConfig = {
 };
 
 function parseYaml(text: string): { value: unknown } | { error: string } {
-  try {
-    const yaml = (Bun as unknown as { YAML: { parse(input: string): unknown } }).YAML;
-    return { value: yaml.parse(text) };
-  } catch (error) {
-    return { error: error instanceof Error ? error.message : String(error) };
-  }
+  return parseYamlText(text);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -575,6 +571,19 @@ export function parseFactoryConfig(text: string): ConfigParse {
     }
   }
 
+  // E11.4 (#41): a duplicated key inside the policy section is rejected *before
+  // decode* — Bun YAML (like most) lets a duplicate key last-win, so a written
+  // `deny` could otherwise be silently dropped in favor of a later `allow`
+  // (an authority widening against the operator's intent). Only the policy
+  // configuration's own keys are scanned here: elsewhere in factory.yaml the
+  // last-win semantics stay a documented YAML behavior.
+  for (const duplicate of findDuplicateYamlKeys(text, 'policy')) {
+    issue(
+      duplicate.path,
+      'duplicate key in the policy configuration — YAML would silently keep the last value; list each key once',
+    );
+  }
+
   if (issues.length > 0) return { ok: false, issues };
   return { ok: true, config: root as unknown as FactoryDesiredConfig };
 }
@@ -710,9 +719,16 @@ function serializePolicySection(config: FactoryDesiredConfig): string[] {
   const lines = ['policy:', `  version: ${policyQuoted(policy.version)}`];
   lines.push(...serializePolicyLevel('organization', '  ', policy.organization));
   if (policy.projects !== undefined) {
-    lines.push('  projects:');
-    for (const [repository, level] of Object.entries(policy.projects)) {
-      lines.push(...serializePolicyLevel(repository, '    ', level));
+    // An empty projects map is emitted inline — a childless `projects:` line
+    // would re-parse as null and brick a valid config on a `factory init`
+    // rewrite.
+    if (Object.keys(policy.projects).length === 0) {
+      lines.push('  projects: {}');
+    } else {
+      lines.push('  projects:');
+      for (const [repository, level] of Object.entries(policy.projects)) {
+        lines.push(...serializePolicyLevel(repository, '    ', level));
+      }
     }
   }
   return lines;

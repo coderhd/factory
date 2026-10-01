@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 
 import { FactoryError } from '../domain/errors';
+import { findDuplicateYamlKeys, parseYamlText } from '../config/yaml';
 import {
   CAPABILITIES,
   DEFAULT_POLICY_VERSION,
@@ -22,9 +23,10 @@ import {
  * anything it cannot prove well-formed.
  *
  * Deliberately strict and boring: unknown capability ids, unknown decision
- * tokens, malformed scopes, unknown keys, and the `<embedded>` version marker
- * are all load failures — a misconfigured policy must never silently degrade
- * toward a permissive default (monotonic narrowing and the engine's
+ * tokens, malformed scopes (including an empty `capabilities` mapping — nothing
+ * to define is a typo, not a policy), unknown keys, and the `<embedded>` version
+ * marker are all load failures — a misconfigured policy must never silently
+ * degrade toward a permissive default (monotonic narrowing and the engine's
  * deployment-fixed ceilings stay authoritative regardless; a configured level
  * can only narrow — the fold enforces that at decision time).
  */
@@ -65,10 +67,23 @@ function isStringList(value: unknown): value is string[] {
   return Array.isArray(value) && value.length > 0 && value.every(isNonEmptyString);
 }
 
-/** Parse + validate a raw (already YAML-decoded) policy document. Pure. */
+type IssueFn = (path: string, message: string) => void;
+
+/** Nudge: the token→verdict map with a type-narrowed lookup (never `undefined`). */
+type DecisionToken = keyof typeof DECISION_BY_TOKEN;
+
+function isDecisionToken(token: string): token is DecisionToken {
+  return token in DECISION_BY_TOKEN;
+}
+
+/**
+ * Parse + validate a raw (already YAML-decoded) policy document. One pass:
+ * each rule is validated and built together, so the built document is exactly
+ * the validated shape (no re-derivation that could drift apart).
+ */
 export function parsePolicyDocument(raw: unknown): PolicyParse {
   const issues: PolicyParseIssue[] = [];
-  const issue = (path: string, message: string): void => {
+  const issue: IssueFn = (path, message) => {
     issues.push({ path, message });
   };
   const parseErr = (): PolicyParse => ({ ok: false, issues });
@@ -127,10 +142,7 @@ export function parsePolicyDocument(raw: unknown): PolicyParse {
   return { ok: true, policy };
 }
 
-type IssueFn = (path: string, message: string) => void;
-
-function validateLevel(level: unknown, prefix: string, issue: IssueFn): void {
-  if (!isPlainObject(level)) {
+function validateLevel(level: unknown, prefix: string, issue: IssueFn): void {  if (!isPlainObject(level)) {
     issue(prefix, 'a policy level must be a mapping');
     return;
   }
@@ -141,6 +153,10 @@ function validateLevel(level: unknown, prefix: string, issue: IssueFn): void {
   }
   if (!isPlainObject(level.capabilities)) {
     issue(`${prefix}.capabilities`, 'capabilities is required (a mapping of capability id → rules)');
+    return;
+  }
+  if (Object.keys(level.capabilities).length === 0) {
+    issue(`${prefix}.capabilities`, 'capabilities must define at least one capability (an empty mapping defines nothing — omit the key, or a typo was meant here)');
     return;
   }
   for (const [capability, rawRules] of Object.entries(level.capabilities)) {
@@ -158,34 +174,6 @@ function validateLevel(level: unknown, prefix: string, issue: IssueFn): void {
     }
     rules.forEach((rule, index) => validateRule(rule, `${prefix}.capabilities.${capability}[${index}]`, issue));
   }
-}
-
-function validateRule(rule: unknown, base: string, issue: IssueFn): void {
-  if (!isPlainObject(rule)) {
-    issue(base, 'a policy rule must be a mapping');
-    return;
-  }
-  for (const key of Object.keys(rule)) {
-    if (!RULE_KEYS.includes(key)) {
-      issue(`${base}.${key}`, `"${key}" is not a policy rule key (use decision/scope/ruleId)`);
-    }
-  }
-  const rawDecision = rule.decision;
-  if (typeof rawDecision !== 'string' || !isNonEmptyString(rawDecision)) {
-    issue(`${base}.decision`, 'decision is required (allow / deny / require_human)');
-  } else {
-    const token = rawDecision.trim().toLowerCase();
-    if (!DECISION_BY_TOKEN[token]) {
-      issue(
-        `${base}.decision`,
-        `decision "${rawDecision}" is not a valid decision (use allow, deny or require_human)`,
-      );
-    }
-  }
-  if (rule.ruleId !== undefined && !isNonEmptyString(rule.ruleId)) {
-    issue(`${base}.ruleId`, 'ruleId must be a non-empty string when present');
-  }
-  if (rule.scope !== undefined) validateScope(rule.scope, `${base}.scope`, issue);
 }
 
 function validateScope(scope: unknown, base: string, issue: IssueFn): void {
@@ -217,10 +205,39 @@ function validateScope(scope: unknown, base: string, issue: IssueFn): void {
   }
 }
 
+function validateRule(rule: unknown, base: string, issue: IssueFn): void {
+  if (!isPlainObject(rule)) {
+    issue(base, 'a policy rule must be a mapping');
+    return;
+  }
+  for (const key of Object.keys(rule)) {
+    if (!RULE_KEYS.includes(key)) {
+      issue(`${base}.${key}`, `"${key}" is not a policy rule key (use decision/scope/ruleId)`);
+    }
+  }
+  const rawDecision = rule.decision;
+  if (typeof rawDecision !== 'string' || !isNonEmptyString(rawDecision)) {
+    issue(`${base}.decision`, 'decision is required (allow / deny / require_human)');
+  } else if (!isDecisionToken(rawDecision.trim().toLowerCase())) {
+    issue(
+      `${base}.decision`,
+      `decision "${rawDecision}" is not a valid decision (use allow, deny or require_human)`,
+    );
+  }
+  if (rule.ruleId !== undefined && !isNonEmptyString(rule.ruleId)) {
+    issue(`${base}.ruleId`, 'ruleId must be a non-empty string when present');
+  }
+  if (rule.scope !== undefined) validateScope(rule.scope, `${base}.scope`, issue);
+}
+
 function buildRule(raw: unknown): CapabilityRule {
   const rule = raw as Record<string, unknown>;
+  const token = (rule.decision as string).trim().toLowerCase();
+  // The decision token is validated; the fallback keeps the build total (and
+  // fail-closed) even if validate/build call order is ever refactored.
+  const decision = isDecisionToken(token) ? DECISION_BY_TOKEN[token] : 'DENY';
   return {
-    decision: DECISION_BY_TOKEN[(rule.decision as string).trim().toLowerCase()]!,
+    decision,
     ...('ruleId' in rule ? { ruleId: rule.ruleId as string } : {}),
     ...(rule.scope !== undefined ? { scope: rule.scope as PolicyScope } : {}),
   };
@@ -239,8 +256,10 @@ function buildLevel(raw: unknown): PolicyLevel {
 /**
  * Load and validate a policy document from a YAML file (the `policyFile:`
  * reference). Throws a loud {@link FactoryError} (`POLICY_INVALID`) naming the
- * file for an unreadable file, unparseable YAML or a malformed document — so a
- * deployment never boots on an invalid policy.
+ * file for an unreadable file, unparseable YAML, **duplicated keys** (Bun YAML
+ * decodes a duplicate mapping key last-win — a written `deny` could silently
+ * lose to a later `allow`), or a malformed document — so a deployment never
+ * boots on an invalid policy.
  */
 export function loadPolicyDocumentFile(path: string): PolicyDocument {
   let text: string;
@@ -252,19 +271,23 @@ export function loadPolicyDocumentFile(path: string): PolicyDocument {
       `policy file is unreadable: ${path} (${error instanceof Error ? error.message : String(error)})`,
     );
   }
-  let raw: unknown;
-  try {
-    const yaml = (Bun as unknown as { YAML: { parse(input: string): unknown } }).YAML;
-    raw = yaml.parse(text);
-  } catch (error) {
-    throw new FactoryError('POLICY_INVALID', `${path}: invalid YAML — ${error instanceof Error ? error.message : String(error)}`);
-  }
-  const parsed = parsePolicyDocument(raw);
-  if (!parsed.ok) {
+  const duplicates = findDuplicateYamlKeys(text);
+  if (duplicates.length > 0) {
     throw new FactoryError(
       'POLICY_INVALID',
-      `${path}: invalid policy — ${parsed.issues.map((issue) => `${issue.path || 'policy'}: ${issue.message}`).join('; ')}`,
+      `${path}: duplicate key(s) ${duplicates.map((duplicate) => `"${duplicate.path}"`).join(', ')} — YAML would silently keep the last value; list each key once`,
     );
   }
-  return parsed.policy;
+  const parsed = parseYamlText(text);
+  if ('error' in parsed) {
+    throw new FactoryError('POLICY_INVALID', `${path}: invalid YAML — ${parsed.error}`);
+  }
+  const validated = parsePolicyDocument(parsed.value);
+  if (!validated.ok) {
+    throw new FactoryError(
+      'POLICY_INVALID',
+      `${path}: invalid policy — ${validated.issues.map((issue) => `${issue.path || 'policy'}: ${issue.message}`).join('; ')}`,
+    );
+  }
+  return validated.policy;
 }

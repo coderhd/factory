@@ -34,9 +34,18 @@ Loudly rejected: unknown capability ids (against the
 `allow|deny|require_human`, case-insensitive), malformed scopes (unknown
 qualifiers; `paths`/`excludePaths` must be non-empty glob lists; `branchPattern`
 a non-empty glob; `env` ∈ `staging|production`; `dataClass` ∈
-`synthetic|customer-data`), unknown keys at any level, a version stamp equal to
-the reserved `<embedded>` marker, and setting an inline policy together with a
-`policyFile`.
+`synthetic|customer-data`), an empty `capabilities` mapping at any level (an
+empty level defines nothing — omit the key, or the entry is a typo), unknown
+keys at any level, a version stamp equal to the reserved `<embedded>` marker,
+and setting an inline policy together with a `policyFile`. A **duplicated key**
+inside the policy configuration is rejected before decode — YAML decoders let a
+duplicate mapping key last-win, so a repeated capability (`repo.read:` listed
+twice) would otherwise silently keep only the last rule, possibly widening
+authority against the operator's written intent. Inline policy sections are
+scanned for duplicates under `policy:`/`policyFile` in `factory.yaml`; a
+referenced policy file itself is scanned end to end. (Duplicate keys elsewhere
+in `factory.yaml` keep YAML's ordinary last-win semantics — the scan is scoped
+to the policy source of truth.)
 
 ## Invariants (unchanged, enforced at decision time)
 
@@ -51,9 +60,11 @@ the reserved `<embedded>` marker, and setting an inline policy together with a
 
 ## Serialization / round trip
 
-`serializeFactoryConfig` emits the section (quoted scalars) and
-`parse → resolve → serialize → parse` is stable, so `factory init` rewriting a
-configured `factory.yaml` preserves the policy document.
+`serializeFactoryConfig` emits the section (quoted scalars); an empty `projects`
+map is emitted inline (`projects: {}`) so a `factory init` rewrite cannot turn a
+valid config into a childless key that re-parses as null. An empty
+`capabilities` mapping is rejected at parse instead (see above), so no policy
+that survives validation can round-trip into a broken document.
 
 See ADR 14 (`factory-docs/architecture/policy-and-risk-model.md` §11) for the
 normative shape sketch, and §7 for the worked narrowing examples the loaded

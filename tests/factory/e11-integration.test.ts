@@ -1597,6 +1597,111 @@ describe('E11.4 policy/rules configuration surface (#41)', () => {
     if (malformedScope.ok) throw new Error('a malformed scope must not parse');
     expect(malformedScope.issues.some((issue) => issue.path === 'policy.organization.capabilities.repo.write[0].scope.paths')).toBe(true);
     expect(malformedScope.issues.some((issue) => issue.path === 'policy.organization.capabilities.repo.read[0].scope.filesystem')).toBe(true);
+
+    const emptyCapabilities = parseWithAppended(
+      [
+        'policy:',
+        '  version: e11-bad-5',
+        '  organization:',
+        '    capabilities: {}',
+      ].join('\n'),
+    );
+    if (emptyCapabilities.ok) throw new Error('an empty capabilities mapping must not parse');
+    expect(
+      emptyCapabilities.issues.some(
+        (issue) =>
+          issue.path === 'policy.organization.capabilities' &&
+          issue.message.includes('at least one capability'),
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects a duplicated key inside the policy section loudly (before a last-win decode): inline', () => {
+    // `repo.read` listed twice — decoded, only the second rule would survive
+    // (the written `deny` silently dropped in favor of `allow`).
+    const duplicated = parseWithAppended(
+      [
+        'policy:',
+        '  version: e11-dup-1',
+        '  organization:',
+        '    capabilities:',
+        '      repo.read:',
+        '        - decision: deny',
+        '      repo.read:',
+        '        - decision: allow',
+      ].join('\n'),
+    );
+    if (duplicated.ok) throw new Error('a duplicated policy key must not parse');
+    expect(
+      duplicated.issues.some(
+        (issue) =>
+          issue.path === 'policy.organization.capabilities.repo.read' &&
+          issue.message.includes('duplicate key'),
+      ),
+    ).toBe(true);
+
+    // A repeated *version* key under the policy root is caught too.
+    const duplicatedVersion = parseWithAppended(
+      [
+        'policy:',
+        '  version: e11-dup-2',
+        '  organization:',
+        '    capabilities:',
+        '      repo.read:',
+        '        - decision: deny',
+        '  version: e11-dup-2',
+      ].join('\n'),
+    );
+    if (duplicatedVersion.ok) throw new Error('a duplicated policy version key must not parse');
+    expect(duplicatedVersion.issues.some((issue) => issue.path === 'policy.version')).toBe(true);
+
+    // A duplicated key in a referenced policy file fails closed at load.
+    writeFileSync(
+      join(workDir, 'dup-policy.yaml'),
+      [
+        'version: e11-dup-file',
+        'organization:',
+        '  capabilities:',
+        '    repo.read:',
+        '      - decision: deny',
+        '    repo.read:',
+        '      - decision: allow',
+      ].join('\n'),
+    );
+    const withFile = parseFactoryConfig(
+      `${serializeFactoryConfig({
+        ...DEFAULT_FACTORY_CONFIG,
+        repository: { path: repoPath },
+      })}policyFile: ./dup-policy.yaml\n`,
+    );
+    if (!withFile.ok) throw new Error(`fixture invalid: ${JSON.stringify(withFile.issues)}`);
+    let thrown: unknown;
+    try {
+      resolveFactoryConfig(withFile.config, { baseDir: workDir });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain('dup-policy.yaml');
+    expect((thrown as Error).message).toContain('duplicate');
+  });
+
+  it('round-trips an inline policy whose projects map is empty (emitted inline, not as a childless key)', () => {
+    const emptyProjects: PolicyDocument = {
+      version: 'e11-empty-projects',
+      organization: { capabilities: { 'repo.read': [{ decision: 'DENY' }] } },
+      projects: {},
+    };
+    const text = policyConfigText(emptyProjects);
+    expect(text).toContain('projects: {}');
+    const first = parseFactoryConfig(text);
+    if (!first.ok) throw new Error(`parse failed: ${JSON.stringify(first.issues)}`);
+    expect(first.config.policy).toEqual(emptyProjects);
+    expect(resolveFactoryConfig(first.config, { baseDir: workDir }).policy).toEqual(emptyProjects);
+    const second = parseFactoryConfig(serializeFactoryConfig(first.config));
+    if (!second.ok) throw new Error(`re-parse failed: ${JSON.stringify(second.issues)}`);
+    expect(second.config.policy).toEqual(emptyProjects);
+    expect(serializeFactoryConfig(second.config)).toBe(text);
   });
 
   it('rejects version markers and ambiguous sources loudly: <embedded> version, policy + policyFile together', () => {
