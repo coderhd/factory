@@ -36,8 +36,12 @@ export interface VerificationCheckDesired {
 }
 
 export interface VerificationDesired {
-  /** The judge identity — must differ from the writing model (writer ≠ verifier). */
-  judge: { provider: string; model: string; family?: string; version?: string };
+  /**
+   * The judge identity — must differ from the writing model (writer ≠ verifier).
+   * `harness` names the coding-agent harness the judge's fresh pane runs
+   * (E11.2, #42); it defaults to `opencode` at resolve time.
+   */
+  judge: { provider: string; model: string; family?: string; version?: string; harness?: string };
   prompt: { id: string; version: string };
   rubric: string[];
   checks: VerificationCheckDesired[];
@@ -410,6 +414,11 @@ export function parseFactoryConfig(text: string): ConfigParse {
         ) {
           issue('verification.judge.version', 'judge.version must be a non-empty string when present');
         }
+        // E11.2 (#42): the judge's harness kind. Absent it defaults to `opencode`
+        // at resolve time; present it must be a real harness name.
+        if (verification.judge.harness !== undefined && !isNonEmptyString(verification.judge.harness)) {
+          issue('verification.judge.harness', 'judge.harness must be a non-empty string when present');
+        }
       }
       if (!isPlainObject(verification.prompt)) {
         issue('verification.prompt', 'verification.prompt is required');
@@ -569,7 +578,11 @@ export function resolveFactoryConfig(
     ...(config.verification
       ? {
           verification: {
-            judge: { ...config.verification.judge },
+            judge: {
+              ...config.verification.judge,
+              // E11.2 (#42): the judge's harness kind, defaulted to `opencode`.
+              harness: config.verification.judge.harness ?? 'opencode',
+            },
             prompt: { ...config.verification.prompt },
             rubric: [...config.verification.rubric],
             checks: config.verification.checks.map((check) => ({ ...check })),
@@ -675,6 +688,9 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
             : []),
           ...(config.verification.judge.version
             ? [`    version: ${JSON.stringify(config.verification.judge.version)}`]
+            : []),
+          ...(config.verification.judge.harness !== undefined
+            ? [`    harness: ${JSON.stringify(config.verification.judge.harness)}`]
             : []),
           '  prompt:',
           `    id: ${JSON.stringify(config.verification.prompt.id)}`,

@@ -40,6 +40,7 @@ import {
   createHerdrWorkspaceManager,
   type HerdrCli,
 } from '../factory/workers/herdr';
+import { createHarnessSemanticJudge } from '../factory/verification/judgeHarness';
 import { createWorkerManager, type SpawnWorker, type WorkerProfile } from '../factory/workers/manager';
 import { createWorktreeManager, taskWorktreeBranch } from '../factory/worktrees/worktree';
 
@@ -322,15 +323,19 @@ function resolveDefaultWorkerProfile(runtime: FactoryRuntimeConfig): WorkerProfi
  * Resolve the production `WorkVerifier` for this boot (E10.1, #39). An explicit
  * `verifier` option wins (the injectable test seam). Otherwise, when the
  * resolved config carries a `verification:` section, compose the real E5-backed
- * verifier from it. Composition is fail-closed: a misconfiguration is logged
- * loudly and **no** verifier is wired, so a SUCCESS Task parks rather than being
- * promoted on a half-built verifier. When the section is absent, this returns
- * `undefined` — exactly the pre-#39 behaviour.
+ * verifier from it. The `judge` argument is the `SemanticJudge` implementation
+ * the composition binds (E11.2, #42): production passes the harness-backed
+ * judge when none was injected; tests may inject a hermetic fake judge seam.
+ * Composition is fail-closed: a misconfiguration is logged loudly and **no**
+ * verifier is wired, so a SUCCESS Task parks rather than being promoted on a
+ * half-built verifier. When the section is absent, this returns `undefined` —
+ * exactly the pre-#39 behaviour.
  */
 function resolveVerifier(
   runtime: FactoryRuntimeConfig,
   options: ServerDepsOptions,
   store: StateStore,
+  judge?: SemanticJudge,
 ): WorkVerifier | undefined {
   if (options.verifier) return options.verifier;
   if (!runtime.verification) return undefined;
@@ -339,7 +344,7 @@ function resolveVerifier(
       config: runtime.verification,
       store,
       workingDirectory: runtime.repository.path,
-      ...(options.verification?.judge ? { judge: options.verification.judge } : {}),
+      ...(judge ? { judge } : {}),
       ...(options.verification?.runCommand ? { runCommand: options.verification.runCommand } : {}),
       ...(options.now ? { now: options.now } : {}),
     });
@@ -455,15 +460,37 @@ export function buildServerDeps(
   ensureStorageDirs(runtime);
   const store = openStateStore(runtime.paths.db);
   const events = openEventLog(store.db);
-  const verifier = resolveVerifier(runtime, options, store);
-  // E11.1 (#44): the herdr CLI runner and the dedicated `factory` workspace
-  // manager are server-scoped and shared by every worker adapter — the herdr
-  // environment is ensured once and reused; harnesses spawn/kill on demand.
+  // E11.1 (#44)/E11.2 (#42): the herdr CLI runner and the dedicated `factory`
+  // workspace manager are server-scoped, shared by every worker adapter AND the
+  // semantic judge's harness — the environment is ensured once and reused;
+  // harnesses spawn/kill on demand, zero at rest.
   const herdrCli = options.herdrCli ?? createProcessHerdrCli('herdr');
   const herdrWorkspace = createHerdrWorkspaceManager(herdrCli, {
     label: runtime.workers.workspaceLabel ?? 'factory',
     repoPath: runtime.repository.path,
   });
+  // E11.2 (#42): the model-calling judge seam. An explicitly injected judge
+  // (tests) wins; otherwise, when a `verification:` section is configured, the
+  // production judge is the harness-backed one — an opencode harness in a fresh
+  // pane, driven over the same shared herdr CLI. A `verification:` section
+  // without a config-composable judge is refused by `createProductionVerifier`
+  // (fail closed, inside `resolveVerifier`).
+  const judge =
+    options.verification?.judge ??
+    (runtime.verification
+      ? createHarnessSemanticJudge({
+          cli: herdrCli,
+          workspace: herdrWorkspace,
+          identity: {
+            provider: runtime.verification.judge.provider,
+            model: runtime.verification.judge.model,
+            ...(runtime.verification.judge.family ? { family: runtime.verification.judge.family } : {}),
+            ...(runtime.verification.judge.version ? { version: runtime.verification.judge.version } : {}),
+          },
+          harness: runtime.verification.judge.harness,
+        })
+      : undefined);
+  const verifier = resolveVerifier(runtime, options, store, judge);
   const workers = createWorkerManager({
     store,
     events,

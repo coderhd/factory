@@ -85,6 +85,8 @@ workers:
 #     provider: judge-co
 #     model: judge-1
 #     family: judge-family
+#     # E11.2 (#42): the harness kind the judge's fresh pane runs (default opencode).
+#     harness: opencode
 #   prompt:
 #     id: factory-verify
 #     version: "1"

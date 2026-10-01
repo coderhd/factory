@@ -5,6 +5,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { buildServerDeps, type ServerDepsOptions } from '../../src/cli/factory';
+import type { EvidenceBundle } from '../../src/factory/evidence/bundle';
+import { commitDAG } from '../../src/factory/planning/dag';
+import {
+  completeAttempt,
+  createAttempt,
+  createWorkOrder,
+  transitionTask,
+  transitionWorkOrder,
+  type Attempt,
+  type Task,
+  type WorkOrder,
+} from '../../src/factory/domain/workOrder';
+import type { CommandRunner, VerificationConfig } from '../../src/factory/verification/production';
 import {
   createHerdrWorker,
   createHerdrWorkspaceManager,
@@ -13,9 +26,11 @@ import {
   type ExecutionEnvelope,
   type HerdrCli,
   type WorkerAdapter,
+  type WorkerAnswer,
+  type WorkerResult,
+  type WorkerStatus,
 } from '../../src/factory/workers/herdr';
 import { createApiHandler } from '../../src/factory/api/server';
-import type { WorkOrder } from '../../src/factory/domain/workOrder';
 import type {
   CreateBranchInput,
   CreatePullRequestInput,
@@ -567,7 +582,8 @@ class FakeHerdrCli implements HerdrCli {
       return { result: { agent: argv[2] } };
     }
     if (argv[0] === 'agent' && (sub === 'prompt' || sub === 'send-keys')) {
-      const text = argv[2] ?? '';
+      // The real CLI shape is `agent prompt <name> <text>` — capture the text.
+      const text = argv[3] ?? (argv[2] as string | undefined) ?? '';
       const tab = this.openTabs().at(-1);
       if (tab) this.onPrompt?.(text, tab.cwd);
       return { result: { ok: true } };
@@ -920,5 +936,323 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
       noiseError = error;
     }
     expect((noiseError as Error).message).toContain('non-JSON');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E11.2 (#42) — production semantic-judge provider + CLI wiring.
+// The judge runs as an opencode harness in a fresh pane (its own tab, a
+// different model than the developer), prompted with the Work Order, criteria,
+// change set, deterministic/behavioral results and rubric — never the developer
+// transcript — and returns per-criterion rulings through a verdict file.
+// Hermetic throughout (R5): the herdr CLI is an injected fake, the worker and
+// command seams are fakes; real herdr/opencode are never spawned.
+// ---------------------------------------------------------------------------
+
+/** A fake command runner: every configured check passes without a subprocess. */
+const passingRunner: CommandRunner = async (input) => ({
+  exitCode: 0,
+  stdout: `${input.command} ok`,
+  stderr: '',
+});
+
+const JUDGE_VERIFICATION: VerificationConfig = {
+  judge: {
+    provider: 'opencode',
+    model: 'judge-claude',
+    family: 'judge-family',
+    harness: 'opencode',
+  },
+  prompt: { id: 'factory-verify', version: '1' },
+  rubric: ['Rule on every acceptance criterion; falsified=true only when you can show it unmet.'],
+  checks: [
+    { id: 'typecheck', category: 'deterministic', kind: 'typecheck', command: 'bun run typecheck' },
+    { id: 'e2e', category: 'behavioral', kind: 'playwright', command: 'bun run e2e' },
+  ],
+};
+
+/** Fake worker for the scheduler's implementer side (never runs a harness). */
+class IdleFakeHerdr implements WorkerAdapter {
+  async provision(): Promise<void> {}
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  async pause(): Promise<void> {}
+  async resume(): Promise<void> {}
+  async status(): Promise<WorkerStatus> {
+    return { state: 'running', lastHeartbeatAt: new Date().toISOString() };
+  }
+  async execute(_envelope: ExecutionEnvelope): Promise<void> {}
+  async collectArtifacts(): Promise<WorkerResult> {
+    return new Promise<WorkerResult>(() => undefined as never);
+  }
+  async deliverAnswer(_answer: WorkerAnswer): Promise<void> {}
+  async destroy(): Promise<void> {}
+}
+
+describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), 'factory-e112-'));
+    repoPath = initRepo(workDir);
+  });
+
+  afterEach(() => {
+    rmSync(workDir, { recursive: true, force: true });
+    delete process.env[TOKEN_ENV];
+  });
+
+  function verificationText(verification?: VerificationConfig): string {
+    const withKeys: FactoryDesiredConfig = {
+      ...DEFAULT_FACTORY_CONFIG,
+      repository: { path: repoPath },
+    };
+    return verification
+      ? serializeFactoryConfig({ ...withKeys, verification })
+      : serializeFactoryConfig(withKeys);
+  }
+
+  function runtimeFromT(text: string): ReturnType<typeof resolveFactoryConfig> {
+    const parsed = parseFactoryConfig(text);
+    if (!parsed.ok) throw new Error(`fixture factory.yaml invalid: ${JSON.stringify(parsed.issues)}`);
+    return resolveFactoryConfig(parsed.config, { baseDir: workDir });
+  }
+
+  /** Seed a WO with one task and drive it straight to SUCCESS (`model` = writer). */
+  function seedAndDriveToSuccess(
+    deps: {
+      store: ReturnType<typeof buildServerDeps>['store'];
+      events: ReturnType<typeof buildServerDeps>['events'];
+    },
+    model: string,
+  ): { wo: WorkOrder; task: Task } {
+    const wo = createWorkOrder(deps, {
+      intent: 'E11.2 judge subject',
+      acceptanceCriteria: ['the helper is exported'],
+    });
+    for (const to of ['READY', 'PLANNING'] as const) transitionWorkOrder(deps, wo.id, { to });
+    const dag = commitDAG(deps, wo.id, { nodes: [{ nodeId: 'a', title: 'A' }] });
+    transitionWorkOrder(deps, wo.id, { to: 'EXECUTING' });
+    const task = deps.store.get<Task>('tasks', dag.nodes[0].taskId)!;
+    const attempt = createAttempt(deps, { taskId: task.id, model });
+    completeAttempt(deps, attempt.id, {
+      outcome: 'success',
+      diff: 'diff --git a/helper.ts b/helper.ts\n+export const helper = 1;',
+      artifactIds: [],
+    });
+    for (const to of ['READY', 'ASSIGNED', 'RUNNING', 'SUCCESS'] as const) transitionTask(deps, task.id, { to });
+    return { wo, task };
+  }
+
+  /** Tick until a predicate holds (verification is async; routing is on-tick). */
+  async function tickUntil(
+    scheduler: NonNullable<ReturnType<typeof buildServerDeps>['scheduler']>,
+    deps: { store: ReturnType<typeof buildServerDeps>['store'] },
+    check: () => boolean,
+    what: string,
+    timeoutMs = 10_000,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      scheduler.tick();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      if (check()) return;
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    }
+  }
+
+  /** What the fake judge harness does when prompted: report + verdict files. */
+  function fakeJudgeScenario(
+    cli: FakeHerdrCli,
+    verdict: unknown,
+  ): { prompts: string[]; cwds: string[] } {
+    const prompts: string[] = [];
+    const cwds: string[] = [];
+    cli.onPrompt = (prompt, cwd) => {
+      prompts.push(prompt);
+      cwds.push(cwd);
+      mkdirSync(join(cwd, '.factory'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.factory', 'report.json'),
+        JSON.stringify({ status: 'completed', observations: ['judged'], artifacts: [], interactions: [], verificationRequests: [], failure: null }),
+      );
+      writeFileSync(join(cwd, '.factory', 'judge-verdict.json'), JSON.stringify(verdict));
+    };
+    return { prompts, cwds };
+  }
+
+  it('composes the harness judge from verification config: fresh tab, fresh-context prompt, verdict file, teardown → HUMAN_GATE with a persisted bundle', async () => {
+    const cli = new FakeHerdrCli();
+    const verdict = {
+      rulings: [
+        {
+          criterion: 'the helper is exported',
+          falsified: false,
+          evidence: { summary: 'diff exports helper' },
+        },
+      ],
+    };
+    const { prompts, cwds } = fakeJudgeScenario(cli, verdict);
+    const runtime = runtimeFromT(verificationText(JUDGE_VERIFICATION));
+    // Production path: no `verifier`, no `verification.judge` seam — the judge is
+    // composed from config onto the (injected, fake) herdr CLI.
+    const deps = buildServerDeps(runtime, {
+      reconcileOnBoot: false,
+      spawn: () => new IdleFakeHerdr(),
+      verification: { runCommand: passingRunner },
+      herdrCli: cli,
+    });
+    try {
+      const { wo, task } = seedAndDriveToSuccess(deps, 'writer-xl');
+      await tickUntil(deps.scheduler!, deps, () =>
+        deps.store.get<WorkOrder>('work_orders', wo.id)!.state === 'HUMAN_GATE', 'HUMAN_GATE');
+
+      // The bundle is persisted and complete; task VERIFIED; WO at HUMAN_GATE.
+      const bundles = deps.store.list<EvidenceBundle>('evidence_bundles');
+      expect(bundles).toHaveLength(1);
+      expect(bundles[0]!.complete).toBe(true);
+      expect(bundles[0]!.workOrderId).toBe(wo.id);
+      expect(deps.store.get<Task>('tasks', task.id)!.state).toBe('VERIFIED');
+
+      // The judge ran as an opencode harness in its own fresh tab with the
+      // configured concrete model, and was torn down (zero tabs at rest).
+      const judgeStart = cli.callsMatching('agent').find((argv) => argv[1] === 'start')!.join(' ');
+      expect(judgeStart).toContain('--kind opencode');
+      expect(judgeStart).toContain('-- --model opencode/judge-claude');
+      const judgeTabCreate = cli.callsMatching('tab').find((argv) => argv[1] === 'create')!.join(' ');
+      expect(judgeTabCreate).toContain('--no-focus');
+      expect(cli.openTabs()).toHaveLength(0);
+
+      // The judge's fresh-context prompt carries the WO + criteria + change set
+      // + deterministic results + rubric + the verdict/report contract — and
+      // never any developer transcript.
+      expect(prompts).toHaveLength(1);
+      const prompt = prompts[0]!;
+      expect(prompt).toContain('E11.2 judge subject');
+      expect(prompt).toContain('the helper is exported');
+      expect(prompt).toContain('+export const helper = 1;');
+      expect(prompt).toContain('bun run typecheck ok');
+      expect(prompt).toContain('bun run e2e ok');
+      expect(prompt).toContain('Rule on every acceptance criterion');
+      expect(prompt).toContain('judge-verdict.json');
+      expect(prompt.toLowerCase()).not.toContain('transcript');
+      // The judge pane's cwd is its own fresh directory (not the repo checkout).
+      expect(cwds[0]).not.toBe(repoPath);
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('enforces writer ≠ verifier through the composed judge: same model as the developer → no bundle, REWORK', async () => {
+    const cli = new FakeHerdrCli();
+    fakeJudgeScenario(cli, {}); // would happily report if the judge ever ran
+    const runtime = runtimeFromT(
+      verificationText({ ...JUDGE_VERIFICATION, judge: { ...JUDGE_VERIFICATION.judge, model: 'writer-xl' } }),
+    );
+    const deps = buildServerDeps(runtime, {
+      reconcileOnBoot: false,
+      spawn: () => new IdleFakeHerdr(),
+      verification: { runCommand: passingRunner },
+      herdrCli: cli,
+    });
+    try {
+      const { wo, task } = seedAndDriveToSuccess(deps, 'writer-xl');
+      await tickUntil(deps.scheduler!, deps, () =>
+        deps.store.get<Task>('tasks', task.id)!.state === 'REWORK', 'REWORK');
+
+      expect(deps.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      const rejection = deps.events
+        .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
+        .find((event) => event.type === 'verification.rejected');
+      expect((rejection!.payload as { diagnosis: string }).diagnosis).toMatch(/same-model self-sign-off/i);
+      // The judge harness was never prompted — refusal happens before any run.
+      expect(cli.callsMatching('agent').find((argv) => argv[1] === 'prompt')).toBeUndefined();
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('fails closed when the judge harness produces no verdict file: every criterion fails, REWORK, no bundle', async () => {
+    const cli = new FakeHerdrCli();
+    cli.onPrompt = (prompt, cwd) => {
+      void prompt;
+      mkdirSync(join(cwd, '.factory'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.factory', 'report.json'),
+        JSON.stringify({ status: 'completed', observations: [], artifacts: [], interactions: [], verificationRequests: [], failure: null }),
+      );
+      // no judge-verdict.json — the run completes but produces no verdict
+    };
+    const runtime = runtimeFromT(verificationText(JUDGE_VERIFICATION));
+    const deps = buildServerDeps(runtime, {
+      reconcileOnBoot: false,
+      spawn: () => new IdleFakeHerdr(),
+      verification: { runCommand: passingRunner },
+      herdrCli: cli,
+    });
+    try {
+      const { wo, task } = seedAndDriveToSuccess(deps, 'writer-xl');
+      await tickUntil(deps.scheduler!, deps, () =>
+        deps.store.get<Task>('tasks', task.id)!.state === 'REWORK', 'REWORK');
+
+      expect(deps.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      expect(deps.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      // Zero tabs at rest even on the failed judgment.
+      expect(cli.openTabs()).toHaveLength(0);
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('fails closed when no verification section is configured: the SUCCESS task parks with a loud diagnostic', async () => {
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
+    try {
+      const runtime = runtimeFromT(verificationText(undefined));
+      const deps = buildServerDeps(runtime, {
+        reconcileOnBoot: false,
+        spawn: () => new IdleFakeHerdr(),
+        herdrCli: new FakeHerdrCli(),
+      });
+      try {
+        const { wo, task } = seedAndDriveToSuccess(deps, 'writer-xl');
+        await tickUntil(deps.scheduler!, deps, () =>
+          errors.some((line) => /verifier/i.test(line)), 'the missing-verifier diagnostic');
+
+        expect(deps.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+        expect(deps.store.get<Task>('tasks', task.id)!.state).toBe('SUCCESS');
+        expect(deps.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('EXECUTING');
+      } finally {
+        deps.store.close();
+      }
+    } finally {
+      console.error = originalError;
+    }
+  });
+
+  it('validates the judge harness kind in config: empty harness is refused with a dotted path; round-trips when present', () => {
+    const bad = serializeFactoryConfig({
+      ...DEFAULT_FACTORY_CONFIG,
+      repository: { path: repoPath },
+      verification: { ...JUDGE_VERIFICATION, judge: { ...JUDGE_VERIFICATION.judge, harness: '' } },
+    } as FactoryDesiredConfig);
+    const parsedBad = parseFactoryConfig(bad);
+    expect(parsedBad.ok).toBe(false);
+    if (!parsedBad.ok) {
+      expect(parsedBad.issues.some((issue) => issue.path === 'verification.judge.harness')).toBe(true);
+    }
+
+    const good = serializeFactoryConfig({
+      ...DEFAULT_FACTORY_CONFIG,
+      repository: { path: repoPath },
+      verification: JUDGE_VERIFICATION,
+    } as FactoryDesiredConfig);
+    const parsed = parseFactoryConfig(good);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.config.verification!.judge).toEqual(JUDGE_VERIFICATION.judge);
+      const resolved = resolveFactoryConfig(parsed.config, { baseDir: workDir });
+      // Resolved: the harness rides the judge config (defaulted).
+      expect(resolved.verification!.judge.harness).toBe('opencode');
+    }
   });
 });
