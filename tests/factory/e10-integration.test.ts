@@ -4,9 +4,18 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildGitHubAdapter, buildServerDeps, runCli, type CliIO } from '../../src/cli/factory';
+import {
+  buildGitHubAdapter,
+  buildServerDeps,
+  createSchedulerPolicy,
+  runCli,
+  type CliIO,
+} from '../../src/cli/factory';
 import { createFactoryClient } from '../../src/factory/api/client';
 import { createApiHandler, startFactoryServer } from '../../src/factory/api/server';
+import { createScheduler, type Scheduler } from '../../src/factory/scheduler/scheduler';
+import { createWorkerManager, type WorkerProfile } from '../../src/factory/workers/manager';
+import { createWorktreeManager } from '../../src/factory/worktrees/worktree';
 import {
   DEFAULT_FACTORY_CONFIG,
   parseFactoryConfig,
@@ -16,7 +25,11 @@ import {
 } from '../../src/factory/config/factoryConfig';
 import { createEmptyEvidenceReadPort } from '../../src/factory/observatory/observatory';
 import { openEventLog } from '../../src/factory/events/log';
-import { beforeDependencyRequest, circuitSnapshot } from '../../src/factory/recovery/circuitBreaker';
+import {
+  beforeDependencyRequest,
+  circuitSnapshot,
+  recordDependencySuccess,
+} from '../../src/factory/recovery/circuitBreaker';
 import { taskWorktreeBranch } from '../../src/factory/worktrees/worktree';
 import { check as policyCheck } from '../../src/factory/policy/policy';
 import type {
@@ -650,6 +663,7 @@ interface ProducerHarness {
   until(label: string, predicate: () => boolean, maxTicks?: number): Promise<void>;
   adapterForAttempt(attemptId: string): ScriptedHerdr;
   dispatched(attemptId: string): boolean;
+  scheduler(): Scheduler;
 }
 
 function producerHarness(): ProducerHarness {
@@ -690,6 +704,9 @@ function producerHarness(): ProducerHarness {
     },
     dispatched(attemptId): boolean {
       return adapters.some((candidate) => candidate.envelope?.attemptId === attemptId);
+    },
+    scheduler(): Scheduler {
+      return deps.scheduler!;
     },
   };
 }
@@ -945,7 +962,8 @@ describe('E10.2 worker-failure re-dispatch producer', () => {
 function circuitHarness(
   options: { maxConcurrentTasks?: number } = {},
 ): ProducerHarness & {
-  clock: { advance(ms: number): void };
+  clock: { now(): string; advance(ms: number): void };
+  restart(): Scheduler;
 } {
   const text = serializeFactoryConfig({
     ...DEFAULT_FACTORY_CONFIG,
@@ -965,20 +983,23 @@ function circuitHarness(
       t += ms;
     },
   };
+  const spawn = (): ScriptedHerdr => {
+    const adapter = new ScriptedHerdr();
+    adapters.push(adapter);
+    return adapter;
+  };
+  const circuit = { failureThreshold: 2, resetTimeoutMs: 1_000, probeTimeoutMs: 500 };
   const deps = buildServerDeps(runtime, {
-    spawn: () => {
-      const adapter = new ScriptedHerdr();
-      adapters.push(adapter);
-      return adapter;
-    },
+    spawn,
     now: clock.now,
     verification: { judge: passingJudge(), runCommand: passingRunner() },
     // A small, deterministic circuit: two consecutive failures trip it; a 1s
     // reset window opens the half-open probe without a real-time wait.
-    circuit: { failureThreshold: 2, resetTimeoutMs: 1_000, probeTimeoutMs: 500 },
+    circuit,
   });
+  let scheduler: Scheduler = deps.scheduler!;
   const tickAndSettle = async (): Promise<void> => {
-    deps.scheduler!.tick();
+    scheduler.tick();
     await new Promise((resolve) => setTimeout(resolve, 1));
   };
   return {
@@ -987,6 +1008,52 @@ function circuitHarness(
     adapters,
     clock,
     tickAndSettle,
+    /**
+     * Simulate a Factory restart: a **fresh** scheduler (and worker/worktree
+     * managers) over the same durable store + event log, so `parkedRecoveries`
+     * re-seeds from the durable `recovery.parked` log exactly as a new process
+     * would.
+     */
+    restart(): Scheduler {
+      // A real restart reconciles worker leases: pre-restart workers are gone, so
+      // mark them reclaimed and provision a fresh idle worker for the reopened
+      // Attempt (mirrors post-crash reconcile + re-provision).
+      for (const worker of deps.store.list<Record<string, unknown> & { id: string }>('workers')) {
+        deps.store.set('workers', worker.id, {
+          ...worker,
+          runtimeState: 'RECLAIMED',
+          lease: null,
+        });
+      }
+      const workers = createWorkerManager({ store: deps.store, events: deps.events, spawn, now: clock.now });
+      workers.provisionWorker('herdr');
+      const worktrees = createWorktreeManager({
+        rootDir: runtime.worktrees.rootDir,
+        baseBranch: runtime.worktrees.baseBranch,
+      });
+      scheduler = createScheduler(
+        {
+          store: deps.store,
+          events: deps.events,
+          workers,
+          worktrees,
+          repoPath: runtime.repository.path,
+          artifacts: createArtifactStore(runtime.paths.artifacts),
+          policy: createSchedulerPolicy({ store: deps.store, events: deps.events }),
+          now: clock.now,
+          circuit,
+        },
+        {
+          maxConcurrentTasks: runtime.scheduler.maxConcurrentTasks,
+          tickIntervalMs: runtime.scheduler.tickIntervalMs,
+          provisioning: {
+            ...runtime.scheduler.provisioning,
+            defaultProfile: runtime.scheduler.provisioning.defaultProfile as WorkerProfile,
+          },
+        },
+      );
+      return scheduler;
+    },
     async until(label, predicate, maxTicks = 30): Promise<void> {
       for (let i = 0; i < maxTicks; i += 1) {
         await tickAndSettle();
@@ -1004,6 +1071,9 @@ function circuitHarness(
     dispatched(attemptId): boolean {
       return adapters.some((candidate) => candidate.envelope?.attemptId === attemptId);
     },
+    scheduler(): Scheduler {
+      return scheduler;
+    },
   };
 }
 
@@ -1018,6 +1088,24 @@ function seedTwoExecuting(deps: {
     nodes: [
       { nodeId: 'a', title: 'A' },
       { nodeId: 'b', title: 'B' },
+    ],
+  });
+  transitionWorkOrder(deps, wo.id, { to: 'EXECUTING' });
+  return { wo, tasks: dag.nodes.map((node) => deps.store.get<Task>('tasks', node.taskId)!) };
+}
+
+/** Seed an EXECUTING Work Order with three independent nodes (three Tasks). */
+function seedThreeExecuting(deps: {
+  store: ReturnType<typeof buildServerDeps>['store'];
+  events: ReturnType<typeof buildServerDeps>['events'];
+}): { wo: WorkOrder; tasks: Task[] } {
+  const wo = createWorkOrder(deps, { intent: 'E10.3 circuit subject', acceptanceCriteria: ['accepted'] });
+  for (const to of ['READY', 'PLANNING'] as const) transitionWorkOrder(deps, wo.id, { to });
+  const dag = commitDAG(deps, wo.id, {
+    nodes: [
+      { nodeId: 'a', title: 'A' },
+      { nodeId: 'b', title: 'B' },
+      { nodeId: 'c', title: 'C' },
     ],
   });
   transitionWorkOrder(deps, wo.id, { to: 'EXECUTING' });
@@ -1314,6 +1402,104 @@ describe('E10.3 circuit live producer (spec §18.9)', () => {
       h.clock.advance(1_000);
       await h.until('B admitted', () => attemptsFor(h.deps.store, taskB.id).length === 1);
       expect(decisionsFor(taskB.id)).toBe(1);
+    } finally {
+      cap.restore();
+      h.deps.store.close();
+    }
+  });
+  it('does not re-strand across a restart: a resolved park is dropped, the newest park reopens, and no stale entry suppresses the next park (RF8(a))', async () => {
+    const h = circuitHarness({ maxConcurrentTasks: 3 });
+    const cap = captureErrors();
+    try {
+      const { tasks } = seedThreeExecuting(h.deps);
+      const wo = h.deps.store.get<Task>('tasks', tasks[0]!.id)!.workOrderId;
+      await h.until('three running', () => runningTasks(h.deps.store, tasks).length === 3);
+      const runners = runningTasks(h.deps.store, tasks);
+      const [runnerA, runnerB, runnerC] = runners as [Task, Task, Task];
+      const attemptA1 = attemptsFor(h.deps.store, runnerA.id)[0]!;
+      const model = attemptA1.model!;
+
+      // 1. A retries (keeping a live Attempt); B's provider outage opens the
+      //    circuit (park₁ on attemptB1).
+      h.adapterForAttempt(attemptA1.id).release(
+        failedResult('DEPENDENCY_UNAVAILABLE: provider timed out'),
+      );
+      await h.until('A2 redispatched', () => attemptsFor(h.deps.store, runnerA.id).length === 2);
+      const attemptA2 = attemptsFor(h.deps.store, runnerA.id)[1]!;
+      await h.until('A2 live', () => h.dispatched(attemptA2.id));
+      const attemptB1 = attemptsFor(h.deps.store, runnerB.id)[0]!;
+      h.adapterForAttempt(attemptB1.id).release(failedResult('PROVIDER_OUTAGE: provider down'));
+      await h.until('circuit open', () => circuitSnapshot(h.deps, model).state === 'OPEN');
+
+      // 2. A2 succeeds → the circuit closes → the reopener resolves park₁
+      //    (attemptB1) and re-dispatches B (attemptB2). park₁'s reopen is applied
+      //    durably (`reopen:attemptB1:model`).
+      h.adapterForAttempt(attemptA2.id).release({
+        status: 'completed',
+        commits: [],
+        artifacts: [],
+        interactions: [],
+        observations: [],
+        verificationRequests: [],
+        diff: 'diff --git a/a b/a\n+recovered',
+        failure: null,
+      });
+      await h.until('B2 redispatched', () => attemptsFor(h.deps.store, runnerB.id).length === 2);
+      const attemptB2 = attemptsFor(h.deps.store, runnerB.id)[1]!;
+      await h.until('B2 live', () => h.dispatched(attemptB2.id));
+
+      // 3. C's provider outage is failure #1 while the circuit is CLOSED again,
+      //    then B2's outage is failure #2 → OPEN. So park₂ (attemptB2) is created
+      //    while the circuit is OPEN and is therefore **unresolved** at restart.
+      const attemptC1 = attemptsFor(h.deps.store, runnerC.id)[0]!;
+      h.adapterForAttempt(attemptC1.id).release(failedResult('PROVIDER_OUTAGE: provider down'));
+      await h.until('C parked', () => circuitSnapshot(h.deps, model).consecutiveFailures === 1);
+      h.adapterForAttempt(attemptB2.id).release(failedResult('PROVIDER_OUTAGE: provider down'));
+      await h.until('park2', () =>
+        h.deps.events
+          .readEvents({ aggregateType: 'work_order', aggregateId: wo })
+          .filter((event) => event.type === RECOVERY_PARKED)
+          .some((event) => (event.payload as { attemptId?: string }).attemptId === attemptB2.id),
+      );
+      await h.until('circuit reopened', () => circuitSnapshot(h.deps, model).state === 'OPEN');
+
+      // 4. RESTART: a fresh scheduler re-seeds `parkedRecoveries` from the log.
+      //    The resolved park₁ (attemptB1) must be dropped; only the newest park
+      //    (attemptB2) seeded — no phantom entry naming the stale Attempt.
+      const restarted = h.restart();
+      const parkedAfterRestart = restarted.status().queue.parkedRecovery.filter(
+        (entry) => entry.taskId === runnerB.id,
+      );
+      expect(parkedAfterRestart).toHaveLength(1);
+      expect(parkedAfterRestart[0]).toMatchObject({
+        kind: 'WAITING_RESOURCE',
+        dependency: model,
+        attemptId: attemptB2.id,
+      });
+
+      // 5. Close the circuit → the reopener acts on the seeded park: B reopens
+      //    (attemptB3 minted and dispatched) and the park is cleared.
+      recordDependencySuccess({ events: h.deps.events, now: h.clock.now }, model);
+      await h.until('B3 redispatched', () => attemptsFor(h.deps.store, runnerB.id).length === 3);
+      const attemptB3 = attemptsFor(h.deps.store, runnerB.id)[2]!;
+      await h.until('B3 live', () => h.dispatched(attemptB3.id));
+      expect(h.deps.store.get<Attempt>('attempts', attemptB3.id)!.outcome).toBeNull();
+      expect(
+        h.scheduler().status().queue.parkedRecovery.some((entry) => entry.taskId === runnerB.id),
+      ).toBe(false);
+
+      // 6. B3 flakes → a third park must be recorded durably. A stale seeded entry
+      //    could not suppress it: the guard is keyed on the live Attempt and the
+      //    resolved park₁ is gone from the seed entirely.
+      h.adapterForAttempt(attemptB3.id).release(failedResult('PROVIDER_OUTAGE: provider down'));
+      await h.until('park3', () =>
+        h.deps.events
+          .readEvents({ aggregateType: 'work_order', aggregateId: wo })
+          .filter((event) => event.type === RECOVERY_PARKED)
+          .some((event) => (event.payload as { attemptId?: string }).attemptId === attemptB3.id),
+      );
+      // Bounded: the third park did not mint an unbounded fourth Attempt.
+      expect(attemptsFor(h.deps.store, runnerB.id)).toHaveLength(3);
     } finally {
       cap.restore();
       h.deps.store.close();

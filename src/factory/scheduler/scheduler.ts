@@ -16,6 +16,7 @@ import {
   parseFailureClass,
   recover,
   reopenAfterDependencyRecovery,
+  RECOVERY_ACTION_APPLIED,
   RESOURCE_UNAVAILABLE,
   type FailureClass,
   type FailureContext,
@@ -397,6 +398,23 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
    * occurs — the loud surface that keeps a RUNNING Task from being a silent
    * dead-end. Rendered by `status()`.
    */
+  /**
+   * E10.3 (#37): durable parks seeded from the log. A `recovery.parked` event is
+   * resolved once its dependency reopen has been applied
+   * (`RECOVERY_ACTION_APPLIED` key `reopen:{attemptId}:{dependency}`), and a Task
+   * may accumulate several parks across outages — so the seed keeps only the
+   * **newest unresolved** park per `(taskId, kind)`. Otherwise a stale park for a
+   * prior Attempt would (a) suppress the next park via the `parkRecovery` guard,
+   * (b) be surfaced in `status()`, and (c) replay its already-applied reopen key
+   * forever, stranding the Task after a restart.
+   */
+  const appliedRecoveryKeys = new Set(
+    deps.events
+      .readEvents()
+      .filter((event) => event.type === RECOVERY_ACTION_APPLIED)
+      .map((event) => (event.payload as { key?: string }).key)
+      .filter((key): key is string => typeof key === 'string'),
+  );
   const parkedRecoveries: Array<{
     taskId: string;
     workOrderId: string;
@@ -409,10 +427,18 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
      * dependency's circuit closes.
      */
     dependency?: string;
-  }> = deps.events
-    .readEvents()
-    .filter((event) => event.type === RECOVERY_PARKED)
-    .map((event) => {
+  }> = (() => {
+    const seeded: Array<{
+      taskId: string;
+      workOrderId: string;
+      kind: string;
+      attemptId: string;
+      reason?: string;
+      dependency?: string;
+    }> = [];
+    const indexByTaskKind = new Map<string, number>();
+    for (const event of deps.events.readEvents()) {
+      if (event.type !== RECOVERY_PARKED) continue;
       const payload = event.payload as {
         taskId?: string;
         attemptId?: string;
@@ -420,15 +446,33 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         reason?: string;
         dependency?: string;
       };
-      return {
-        taskId: payload.taskId ?? '',
+      const taskId = payload.taskId ?? '';
+      const attemptId = payload.attemptId ?? '';
+      const kind = payload.kind ?? 'UNKNOWN';
+      const dependency = payload.dependency;
+      // A park whose dependency reopen was already applied is resolved: it must
+      // not be re-seeded (it would otherwise be a permanently stale entry).
+      if (dependency && attemptId && appliedRecoveryKeys.has(`reopen:${attemptId}:${dependency}`)) {
+        continue;
+      }
+      const entry = {
+        taskId,
         workOrderId: event.aggregateId,
-        kind: payload.kind ?? 'UNKNOWN',
-        attemptId: payload.attemptId ?? '',
+        kind,
+        attemptId,
         ...(payload.reason ? { reason: payload.reason } : {}),
-        ...(payload.dependency ? { dependency: payload.dependency } : {}),
+        ...(dependency ? { dependency } : {}),
       };
-    });
+      const signature = `${taskId}|${kind}`;
+      const existing = indexByTaskKind.get(signature);
+      if (existing !== undefined) seeded[existing] = entry;
+      else {
+        indexByTaskKind.set(signature, seeded.length);
+        seeded.push(entry);
+      }
+    }
+    return seeded;
+  })();
   let timer: ReturnType<typeof setInterval> | null = null;
   /** One-time guard so a missing `repoPath` warns loudly but only once. */
   let warnedMissingRepoPath = false;
@@ -904,7 +948,22 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     reason: string | undefined,
     dependency?: string,
   ): void {
-    if (parkedRecoveries.some((entry) => entry.taskId === task.id && entry.kind === kind)) return;
+    // Idempotent per (Task, kind, parked Attempt): a replayed delivery for the
+    // *same* Attempt does not re-record, but a park for a *newer* Attempt is never
+    // suppressed by a stale entry from an earlier outage (E10.3 #37: the guard is
+    // keyed on the live Attempt + dependency, so a restart's leftover park cannot
+    // silently swallow the Task's next park).
+    if (
+      parkedRecoveries.some(
+        (entry) =>
+          entry.taskId === task.id &&
+          entry.kind === kind &&
+          entry.attemptId === attemptId &&
+          entry.dependency === dependency,
+      )
+    ) {
+      return;
+    }
     const at = now();
     const entry = {
       taskId: task.id,
@@ -942,8 +1001,11 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
    * the park entry for a Task it reopens so `status()` does not show a stale park.
    */
   function reopenDependencyPass(): void {
+    const resolved = new Set<string>();
     for (const entry of [...parkedRecoveries]) {
       if (entry.kind !== 'WAITING_RESOURCE' || !entry.dependency) continue;
+      // A `(taskId, kind)` pair already resolved by an earlier entry this pass.
+      if (resolved.has(`${entry.taskId}|${entry.kind}`)) continue;
       const task = deps.store.get<Task>('tasks', entry.taskId);
       // Only a RUNNING Task with no open Attempt is a stranded park; a Task that
       // already has one is handled by `redispatchPass`.
@@ -971,11 +1033,17 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         },
       );
       if (action.kind !== 'RETRY_NEW_ATTEMPT') continue;
-      // Reopened: the Task is no longer parked — drop the visible park entry so
-      // status() reflects the live re-dispatch, and clear this dependency's
+      // Reopened: the Task is no longer parked. Drop **every** park entry for this
+      // (Task, kind) — not just this one — so a stale entry from an earlier
+      // outage cannot linger in memory or `status()`, and clear this dependency's
       // dispatch markers so a future outage is fresh.
-      const index = parkedRecoveries.indexOf(entry);
-      if (index >= 0) parkedRecoveries.splice(index, 1);
+      resolved.add(`${entry.taskId}|${entry.kind}`);
+      for (let i = parkedRecoveries.length - 1; i >= 0; i -= 1) {
+        const candidate = parkedRecoveries[i]!;
+        if (candidate.taskId === entry.taskId && candidate.kind === entry.kind) {
+          parkedRecoveries.splice(i, 1);
+        }
+      }
       clearDependencyMarkers(entry.dependency);
     }
   }
@@ -1068,11 +1136,13 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
   }
 
   /**
-   * Route one candidate's assignment through E4 (E9.3, RE7(b)) and persist the
-   * decision's provenance. Returns the selected model, or `null` when the route
-   * is blocked — in which case no Attempt is created, the Task stays READY, and
-   * E4's `RoutingBlockedError` is mapped to E7's `resource.unavailable` park
-   * event bound to the Work Order (RE7(c)). Never substitutes a blocked model.
+   * Route one candidate's assignment through E4 (E9.3, RE7(b)). Returns the
+   * selected model **and its unpersisted decision record** — the caller persists
+   * it only once the dependency gate admits the dispatch (E10.3 #37, RF8(b)) — or
+   * `null` when the route is blocked, in which case no Attempt is created, the
+   * Task stays READY, and E4's `RoutingBlockedError` is mapped to E7's
+   * `resource.unavailable` park event bound to the Work Order (RE7(c)). Never
+   * substitutes a blocked model.
    */
   function routeForAssignment(
     candidate: { task: Task; workOrder: WorkOrder },
