@@ -1,4 +1,6 @@
 import { FactoryError } from '../domain/errors';
+import { timingSafeEqual } from 'node:crypto';
+import { Buffer } from 'node:buffer';
 import {
   createWorkOrder,
   transitionTask,
@@ -9,6 +11,8 @@ import {
   type WorkOrderState,
 } from '../domain/workOrder';
 import type { EventLog } from '../events/log';
+import { PolicyBlockedError, type EvidenceReceipt, type GitHubAdapter } from '../github/adapter';
+import type { EvidenceBundle } from '../evidence/bundle';
 import type { EvidenceReadPort } from '../observatory/observatory';
 import { commitDAG, getActiveDAG, proposeDAG, type DAGProposalPayload } from '../planning/dag';
 import {
@@ -34,6 +38,10 @@ import {
   type CommitDagResultDto,
   type FactoryControlsDto,
   type GateDecision,
+  type GitHubImportRequest,
+  type GitHubImportResultDto,
+  type GitHubOpenPrRequest,
+  type GitHubPullRequestDto,
   type HandshakeDto,
   type HealthDto,
   type InteractionDto,
@@ -59,10 +67,30 @@ export interface FactoryServerDeps {
   evidence: EvidenceReadPort;
   /** Optional E3 scheduler; exposes its status projection when present. */
   scheduler?: Scheduler;
+  /**
+   * E10.3 (#37) the E6 GitHub adapter, composed by `buildServerDeps` with the
+   * live E7 policy and durable evidence reader. Only the two operator routes
+   * below use it. Absent, those routes 404 — no ungoverned GitHub path is ever
+   * exposed, and the transport is mocked in tests (Ruling R6).
+   */
+  github?: GitHubAdapter;
   version?: string;
   schemaVersion?: string;
   instanceId?: string;
+  /**
+   * E10.4 (#40) control-plane authentication. Configured, every mutating route
+   * requires `Authorization: Bearer <token>` and the human-action actor is the
+   * configured principal (a request-body actor is ignored). Absent, the trust
+   * boundary is the loopback bind — documented in compose.yaml/§20.
+   */
+  auth?: ServerAuth;
   now?: () => string;
+}
+
+/** The shared bearer credential and the operator identity it authenticates. */
+export interface ServerAuth {
+  token: string;
+  actor: string;
 }
 
 export type ApiHandler = (request: Request) => Promise<Response>;
@@ -90,6 +118,12 @@ const STATUS_BY_CODE: Record<string, number> = {
   APPROVAL_ACTOR_REQUIRED: 400,
   OPERATOR_REQUIRED: 400,
   DAG_INVALID: 422,
+  // E10.3 (#37) GitHub operator surface.
+  GITHUB_NOT_CONFIGURED: 404,
+  EVIDENCE_BUNDLE_NOT_FOUND: 404,
+  INVALID_GITHUB_REQUEST: 400,
+  GITHUB_POLICY_BLOCKED: 403,
+  GITHUB_UNAVAILABLE: 502,
 };
 
 function json(body: unknown, status = 200): Response {
@@ -119,6 +153,30 @@ async function readJson<T>(request: Request): Promise<T | null> {
 function stringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   return value.filter((item): item is string => typeof item === 'string');
+}
+
+// ---------------------------------------------------------------------------
+// E10.4 (#40) — the auth boundary (bearer token, §20)
+// ---------------------------------------------------------------------------
+
+/** Extract the bearer credential from the Authorization header (no logging). */
+function bearerToken(request: Request): string | null {
+  const header = (request.headers.get('authorization') ?? '').trim();
+  const match = /^Bearer[ ]+(.+)$/i.exec(header);
+  return match ? match[1]! : null;
+}
+
+/** Constant-time token comparison; unequal lengths still burn a comparison. */
+function tokensEqual(presented: string, configured: string): boolean {
+  const left = Buffer.from(presented, 'utf8');
+  const right = Buffer.from(configured, 'utf8');
+  if (left.length !== right.length) {
+    // Equal-burn: compare equal-length buffers so the call's timing does not
+    // leak the configured token's length.
+    timingSafeEqual(right, right);
+    return false;
+  }
+  return timingSafeEqual(left, right);
 }
 
 const GATE_TRANSITIONS: Record<GateDecision, WorkOrderState> = {
@@ -283,6 +341,24 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
     const segments = url.pathname.split('/').filter(Boolean);
     const method = request.method.toUpperCase();
 
+    // E10.4 (#40) auth boundary. When auth is configured: GET stays public
+    // (documented read-only decision), every mutating method requires a valid
+    // bearer credential, and the human-action actor is the **authenticated
+    // principal** — a body-supplied actor is never trusted. The credential and
+    // header are never logged. Absent auth, the loopback bind is the boundary
+    // and the historical body-actor behavior holds.
+    const authenticatedActor =
+      deps.auth !== undefined && tokensEqual(bearerToken(request) ?? '', deps.auth.token)
+        ? deps.auth.actor
+        : undefined;
+    if (deps.auth !== undefined && authenticatedActor === undefined && method !== 'GET') {
+      return apiError(
+        'UNAUTHENTICATED',
+        'mutating requests require a valid bearer credential',
+        401,
+      );
+    }
+
     if (segments[0] !== 'api') return apiError('NOT_FOUND', `no route for ${url.pathname}`, 404);
     const [resource, id, action] = [segments[1], segments[2], segments[3]];
 
@@ -319,7 +395,11 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
       }
       if (method === 'POST' && id !== undefined && action === undefined) {
         const body = await readJson<{ actor?: unknown }>(request);
-        const actor = typeof body?.actor === 'string' ? body.actor.trim() : '';
+        // E10.4 (#40): authenticated deployments take the operator from the
+        // bearer credential, never the body; open (loopback) mode keeps the
+        // body actor.
+        const bodyActor = typeof body?.actor === 'string' ? body.actor.trim() : '';
+        const actor = authenticatedActor ?? bodyActor;
         if (actor.length === 0) return apiError('OPERATOR_REQUIRED', 'actor is required', 400);
         const controlDeps = { store: deps.store, events: deps.events, now };
         const state =
@@ -460,7 +540,11 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
         if (response === null || response.trim().length === 0) {
           return apiError('INVALID_REQUEST', 'response is required', 400);
         }
-        const actor = typeof body?.actor === 'string' ? body.actor.trim() : undefined;
+        // E10.4 (#40): the answering operator is the authenticated principal
+        // when auth is configured; otherwise a body actor (loopback mode).
+        const actor =
+          authenticatedActor ??
+          (typeof body?.actor === 'string' ? body.actor.trim() : undefined);
         return json(await answerInteraction(deps, id, response, actor || undefined));
       }
     }
@@ -481,7 +565,10 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
         if (decision !== 'APPROVAL' && decision !== 'DENY') {
           return apiError('INVALID_REQUEST', 'decision must be APPROVAL or DENY', 400);
         }
-        const actor = typeof body?.actor === 'string' ? body.actor.trim() : '';
+        // E10.4 (#40): the receipt actor is the authenticated principal in
+        // authenticated deployments; open (loopback) mode keeps the body actor
+        // and its required non-empty check below.
+        const actor = authenticatedActor ?? (typeof body?.actor === 'string' ? body.actor.trim() : '');
         if (actor.length === 0) return apiError('APPROVAL_ACTOR_REQUIRED', 'actor is required', 400);
         const comment = typeof body?.comment === 'string' ? body.comment : undefined;
         const approval = answerApprovalRoute(deps, id, {
@@ -490,6 +577,84 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
           ...(comment ? { comment } : {}),
         });
         return json({ approval });
+      }
+    }
+
+    if (resource === 'github') {
+      const adapter = deps.github;
+      if (!adapter) return apiError('GITHUB_NOT_CONFIGURED', 'github adapter is not configured', 404);
+
+      // POST /api/github/import { repository, number } — issue → Work Order.
+      if (method === 'POST' && id === 'import' && action === undefined) {
+        const body = await readJson<Partial<GitHubImportRequest>>(request);
+        const repository = typeof body?.repository === 'string' ? body.repository.trim() : '';
+        const number = typeof body?.number === 'number' ? body.number : Number(body?.number);
+        if (repository.length === 0 || !Number.isInteger(number) || number <= 0) {
+          return apiError(
+            'INVALID_GITHUB_REQUEST',
+            'import requires { repository: "owner/name", number: <positive integer> }',
+            400,
+          );
+        }
+        try {
+          const result: GitHubImportResultDto = await adapter.importIssue({ repository, number });
+          return json(result, result.created ? 201 : 200);
+        } catch (error) {
+          if (error instanceof PolicyBlockedError) {
+            return apiError('GITHUB_POLICY_BLOCKED', error.message, 403);
+          }
+          return apiError(
+            'GITHUB_UNAVAILABLE',
+            error instanceof Error ? error.message : String(error),
+            502,
+          );
+        }
+      }
+
+      // POST /api/github/pull-requests { evidenceBundleId } — open a PR whose
+      // body links the **durable** evidence receipt. The route reads the bundle
+      // by id from the store: a caller cannot present a bundle that was never
+      // persisted, and the adapter runs its `pr.create` policy gate.
+      if (method === 'POST' && id === 'pull-requests' && action === undefined) {
+        const body = await readJson<Partial<GitHubOpenPrRequest>>(request);
+        const evidenceBundleId =
+          typeof body?.evidenceBundleId === 'string' ? body.evidenceBundleId.trim() : '';
+        if (evidenceBundleId.length === 0) {
+          return apiError(
+            'INVALID_GITHUB_REQUEST',
+            'opening a pull request requires { evidenceBundleId }',
+            400,
+          );
+        }
+        const evidence = deps.store.get<EvidenceBundle>('evidence_bundles', evidenceBundleId);
+        if (!evidence) {
+          return apiError(
+            'EVIDENCE_BUNDLE_NOT_FOUND',
+            `evidence bundle not found: ${evidenceBundleId}`,
+            404,
+          );
+        }
+        const receipt: EvidenceReceipt = evidence;
+        const openOptions: { baseBranch?: string; title?: string } = {};
+        if (typeof body?.baseBranch === 'string' && body.baseBranch.trim().length > 0) {
+          openOptions.baseBranch = body.baseBranch.trim();
+        }
+        if (typeof body?.title === 'string' && body.title.trim().length > 0) {
+          openOptions.title = body.title.trim();
+        }
+        try {
+          const pr: GitHubPullRequestDto = await adapter.openPR(receipt, openOptions);
+          return json(pr, 201);
+        } catch (error) {
+          if (error instanceof PolicyBlockedError) {
+            return apiError('GITHUB_POLICY_BLOCKED', error.message, 403);
+          }
+          return apiError(
+            'GITHUB_UNAVAILABLE',
+            error instanceof Error ? error.message : String(error),
+            502,
+          );
+        }
       }
     }
 

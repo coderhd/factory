@@ -8,6 +8,10 @@ import type {
   DrillDownDto,
   FactoryControlsDto,
   GateDecision,
+  GitHubImportRequest,
+  GitHubImportResultDto,
+  GitHubOpenPrRequest,
+  GitHubPullRequestDto,
   HandshakeDto,
   HealthDto,
   InteractionDto,
@@ -38,6 +42,12 @@ export class FactoryApiError extends Error {
 export interface FactoryClientOptions {
   baseUrl: string;
   fetch?: typeof fetch;
+  /**
+   * E10.4 (#40) the shared bearer credential. Present, every request carries
+   * `Authorization: Bearer <token>`; absent, no header is sent. The secret
+   * lives in the caller's configuration and is never logged.
+   */
+  token?: string;
 }
 
 export interface FactoryClient {
@@ -60,6 +70,17 @@ export interface FactoryClient {
   emergencyStop(actor: string): Promise<FactoryControlsDto>;
   pause(actor: string): Promise<FactoryControlsDto>;
   resume(actor: string): Promise<FactoryControlsDto>;
+  /**
+   * E10.3 (#37): reconcile a GitHub issue into a Work Order through the server.
+   * The server composes the E6 adapter; the client only speaks the contract.
+   */
+  githubImportIssue(request: GitHubImportRequest): Promise<GitHubImportResultDto>;
+  /**
+   * E10.3 (#37): open a PR whose body links the durable Evidence Bundle receipt
+   * named by `evidenceBundleId`. The server reads the receipt and runs the E6
+   * adapter's live `pr.create` policy gate.
+   */
+  githubOpenPullRequest(request: GitHubOpenPrRequest): Promise<GitHubPullRequestDto>;
 }
 
 export function createFactoryClient(options: FactoryClientOptions): FactoryClient {
@@ -67,9 +88,15 @@ export function createFactoryClient(options: FactoryClientOptions): FactoryClien
   const fetchImpl = options.fetch ?? fetch;
 
   async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    // GET routes are the declared-public read boundary (E10.4), so the bearer
+    // credential is attached to non-GET requests only — it never rides along
+    // on reads, and it is never logged.
+    const headers: Record<string, string> = {};
+    if (options.token && method !== 'GET') headers.authorization = `Bearer ${options.token}`;
+    if (body !== undefined) headers['content-type'] = 'application/json';
     const response = await fetchImpl(`${base}/api${path}`, {
       method,
-      headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const text = await response.text();
@@ -159,5 +186,9 @@ export function createFactoryClient(options: FactoryClientOptions): FactoryClien
       request<FactoryControlsDto>('POST', '/factory/emergency-stop', { actor }),
     pause: (actor) => request<FactoryControlsDto>('POST', '/factory/pause', { actor }),
     resume: (actor) => request<FactoryControlsDto>('POST', '/factory/resume', { actor }),
+    githubImportIssue: (input) =>
+      request<GitHubImportResultDto>('POST', '/github/import', input),
+    githubOpenPullRequest: (input) =>
+      request<GitHubPullRequestDto>('POST', '/github/pull-requests', input),
   };
 }

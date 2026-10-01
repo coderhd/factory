@@ -3,6 +3,7 @@ import {
   createAttempt,
   transitionTask,
   type Assignment,
+  type Attempt,
   type Task,
   type WorkOrder,
 } from '../domain/workOrder';
@@ -407,4 +408,117 @@ export function startTask(deps: SchedulerDeps, assignment: AssignmentRecord): Ex
 
   void deps.workers.execute(assignment.workerId, envelope);
   return envelope;
+}
+
+export interface ReopenAttemptIntent {
+  /** The already-open Attempt (recovery's clean baseline) to re-dispatch. */
+  attemptId: string;
+  workerId: string;
+  worktree: { taskId: string; branch: string; worktreePath: string; baseCommit: string };
+}
+
+/**
+ * Re-open an existing open Attempt under a fresh Assignment and dispatch it
+ * (E10.2, #38). Recovery's `RETRY_NEW_ATTEMPT` already minted the clean-baseline
+ * Attempt, so this does **not** call `createAttempt` — it binds that Attempt to a
+ * fresh worker/Assignment/worktree and dispatches the envelope. The Task is
+ * already `RUNNING` (invariant 9), so there is no Task transition: only the
+ * Assignment, the worker's `BUSY` state and a lease bound to the existing
+ * Attempt. Fails loud if the Attempt is missing or already settled (a
+ * double-dispatch would be a duplicate side effect).
+ */
+export function reopenAttempt(deps: SchedulerDeps, intent: ReopenAttemptIntent): AssignmentRecord {
+  const now = deps.now ?? DEFAULT_NOW;
+  return deps.store.db.transaction((): AssignmentRecord => {
+    const attempt = deps.store.get<Attempt>('attempts', intent.attemptId);
+    if (!attempt) throw new FactoryError('ATTEMPT_NOT_FOUND', `attempt not found: ${intent.attemptId}`);
+    if (attempt.outcome !== null) {
+      throw new FactoryError(
+        'ATTEMPT_SETTLED',
+        `attempt ${attempt.id} is ${attempt.outcome}; reopen requires an open Attempt`,
+      );
+    }
+    const task = deps.store.get<Task>('tasks', intent.worktree.taskId);
+    if (!task) throw new FactoryError('TASK_NOT_FOUND', `task not found: ${intent.worktree.taskId}`);
+    if (task.state !== 'RUNNING') {
+      throw new FactoryError(
+        'TASK_NOT_RUNNING',
+        `task ${task.id} is ${task.state}; reopen requires RUNNING (invariant 9)`,
+      );
+    }
+    const worker = deps.store.get<WorkerRecord>('workers', intent.workerId);
+    if (!worker) throw new FactoryError('WORKER_NOT_FOUND', `worker not found: ${intent.workerId}`);
+    if (worker.runtimeState !== 'IDLE') {
+      throw new FactoryError(
+        'WORKER_NOT_IDLE',
+        `worker ${worker.id} is ${worker.runtimeState}; reopen requires IDLE`,
+      );
+    }
+
+    const t = now();
+    const assignment: AssignmentRecord = {
+      id: `assignment_${crypto.randomUUID()}`,
+      taskId: task.id,
+      workerId: worker.id,
+      branch: intent.worktree.branch,
+      worktreePath: intent.worktree.worktreePath,
+      baseCommit: intent.worktree.baseCommit,
+      closedAt: null,
+      model: attempt.model,
+      createdAt: t,
+      updatedAt: t,
+    };
+    deps.store.set('assignments', assignment.id, assignment);
+    deps.store.set('workers', worker.id, { ...worker, runtimeState: 'BUSY', lastActiveAt: t });
+    deps.events.appendEvent({
+      type: ASSIGNMENT_CREATED,
+      aggregateType: 'assignment',
+      aggregateId: assignment.id,
+      payload: { assignment },
+    });
+    deps.workers.renewLease(
+      worker.id,
+      { attemptId: attempt.id, taskId: task.id },
+      deps.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS,
+    );
+    return assignment;
+  })();
+}
+
+/**
+ * Dispatch an already-open Attempt's envelope to its bound worker (the worker
+ * must be `BUSY` with a lease on the Attempt — see {@link reopenAttempt}).
+ * Split from `reopenAttempt` so the durable Assignment write and the async
+ * external dispatch are not one transaction (the dispatch must never roll back
+ * state on a runtime hiccup).
+ */
+export function dispatchReopenedAttempt(deps: SchedulerDeps, assignment: AssignmentRecord): void {
+  const task = deps.store.get<Task>('tasks', assignment.taskId);
+  if (!task) throw new FactoryError('TASK_NOT_FOUND', `task not found: ${assignment.taskId}`);
+  const workOrder = deps.store.get<WorkOrder>('work_orders', task.workOrderId);
+  if (!workOrder) {
+    throw new FactoryError('WORK_ORDER_NOT_FOUND', `work order not found: ${task.workOrderId}`);
+  }
+  const worker = deps.store.get<WorkerRecord>('workers', assignment.workerId);
+  const attemptId = worker?.lease?.attemptId;
+  if (!attemptId) {
+    throw new FactoryError('LEASE_NOT_FOUND', `worker ${assignment.workerId} has no lease to dispatch`);
+  }
+
+  const envelope: ExecutionEnvelope = {
+    workOrderId: workOrder.id,
+    taskId: task.id,
+    attemptId,
+    repository: workOrder.repository ?? deps.repoPath ?? '',
+    baseCommit: assignment.baseCommit,
+    branch: assignment.branch,
+    worktree: assignment.worktreePath,
+    authorizationCapabilities: [],
+    initialContext: envelopeContext(workOrder, task),
+    retrievalEndpoint: null,
+    skills: [],
+    requiredVerification: workOrder.requiredVerification,
+  };
+
+  void deps.workers.execute(assignment.workerId, envelope);
 }

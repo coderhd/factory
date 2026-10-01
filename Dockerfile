@@ -34,6 +34,13 @@ EXPOSE 8787
 # daemonises a child and would exit immediately in the container). The bind
 # address is `--hostname`, so the mapped port is reachable from the host; the
 # loopback default in `factory.yaml` is for local dev.
+#
+# E10.4 (#40) FAIL-CLOSED: a non-loopback effective bind requires
+# `server.auth { token, actor }` in the copied `factory.yaml` — template/print
+# the secret at build/bootstrap time and keep it out of version control.
+# Without it, the server REFUSES to bind 0.0.0.0 and exits non-zero (it never
+# serves mutating routes unauthenticated).
+#
 # NOTE: the port 8787 is repeated in three places that must stay in sync — this
 # CMD, `EXPOSE` above, and the `ports:`/`factory.yaml` port. Change all three
 # together (the flag pins the container port to the published mapping).

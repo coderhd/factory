@@ -19,6 +19,7 @@ Final architecture capture for the Root / Factory ecosystem. The existing `2026-
 
 ## Routing (Factory Server v0.1, E4)
 
+- `implementation/control-plane-auth.md` — E10.4 (#40): the control-plane trust boundary (shared bearer token, read-only GET decision, authenticated actor on human-action receipts, secret handling)
 - `architecture/decision-model-routing-core.md` — E4.1: generic DecisionModel seam, capability matrix, budget gates
 - `architecture/routing-decision-log.md` — E4.2: decision persistence, `routing.log` format + example line, override/appeal paths, ticket routing fields
 

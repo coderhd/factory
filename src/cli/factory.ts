@@ -7,6 +7,7 @@ import { startFactoryServer, type FactoryServerDeps } from '../factory/api/serve
 import { createBackup, restoreBackup } from '../factory/backup/archive';
 import {
   DEFAULT_FACTORY_CONFIG,
+  isLoopbackHostname,
   parseFactoryConfig,
   resolveFactoryConfig,
   serializeFactoryConfig,
@@ -23,8 +24,14 @@ import { createEvidenceReadPort } from '../factory/observatory/observatory';
 import { check, checkDetailed, repoWriteGate } from '../factory/policy/policy';
 import type { DAGProposalPayload } from '../factory/planning/dag';
 import { reconcileAfterRestart } from '../factory/recovery/recovery';
+import type { CircuitConfig } from '../factory/recovery/circuitBreaker';
 import { createScheduler, type SchedulerPolicy } from '../factory/scheduler/scheduler';
 import { createArtifactStore, openStateStore, type StateStore } from '../factory/state/store';
+import {
+  createProductionVerifier,
+  type CommandRunner,
+} from '../factory/verification/production';
+import type { SemanticJudge } from '../factory/verification/semantic';
 import type { WorkVerifier } from '../factory/verification/orchestrator';
 import { createHerdrWorker } from '../factory/workers/herdr';
 import { createWorkerManager, type SpawnWorker, type WorkerProfile } from '../factory/workers/manager';
@@ -83,6 +90,16 @@ function resolveDir(args: ParsedArgs, io: CliIO): string {
 
 const configPath = (dir: string): string => join(dir, 'factory.yaml');
 const runtimeFilePath = (dir: string): string => join(dir, '.factory', 'runtime.json');
+
+/**
+ * E10.4 (#40): the control-plane bearer credential for client commands —
+ * `--token <token>` or the `FACTORY_TOKEN` environment variable. The secret
+ * flows into the Authorization header and is never logged.
+ */
+function credentialOptions(args: ParsedArgs): { token?: string } {
+  const token = flag(args, 'token') ?? process.env.FACTORY_TOKEN;
+  return token ? { token } : {};
+}
 
 interface RuntimeFile {
   pid: number;
@@ -189,14 +206,29 @@ export interface ServerDepsOptions {
   spawn?: SpawnWorker;
   now?: () => string;
   /**
-   * E9.4 verification seam. Tests wire a verifier here; `cmdServe` calls
-   * {@link buildServerDeps} with no options, so production does **not** yet
-   * compose one (`createE5Verifier` currently has no non-test caller).
-   * Production verifier composition is tracked in GitHub issue #39. Absent the
-   * verifier, the scheduler fails closed — a SUCCESS Task is never promoted
-   * without a persisted Evidence Bundle.
+   * E9.4 verification seam. Tests wire a verifier here; production instead
+   * composes one from the resolved `verification:` config (E10.1, #39) via
+   * {@link createProductionVerifier}. Absent both, the scheduler fails closed —
+   * a SUCCESS Task is never promoted without a persisted Evidence Bundle.
    */
   verifier?: WorkVerifier;
+  /**
+   * E10.1 (#39) production verifier seams. These are the *deployment*
+   * implementations the composed verifier needs — the model-calling judge and
+   * the command executor — never a verifier itself, so the composition under
+   * test is the real `buildServerDeps` path. Tests inject hermetic fakes here
+   * (fake judge, no subprocess); production leaves them unset for the real
+   * implementations.
+   */
+  verification?: {
+    judge?: SemanticJudge;
+    runCommand?: CommandRunner;
+  };
+  /**
+   * E10.3 (#37) circuit-breaker tuning for the live dependency producer. Wired
+   * onto the scheduler; defaults to the module defaults.
+   */
+  circuit?: Partial<CircuitConfig>;
   /**
    * E9.6 boot reconciliation. On a real server start this runs first (spec
    * §18.3), so a crash that left an in-flight Attempt behind is interrupted and
@@ -204,6 +236,27 @@ export interface ServerDepsOptions {
    * build deps over pre-seeded state can opt out.
    */
   reconcileOnBoot?: boolean;
+  /**
+   * E10.3 (#37) GitHub route composition. When supplied, `buildServerDeps`
+   * constructs the E6 adapter here — the **only** place a `GitHubTransport` is
+   * injected — wiring it to the real E7 `checkDetailed` policy and the durable
+   * `evidence_bundles` read-back, and attaches it to `FactoryServerDeps.github`
+   * so the server's operator routes can import an issue and open a PR. The
+   * transport itself (production: the REST client; tests: a mock) is the
+   * caller's; auth/config is out of #37's scope. Absent, no adapter is built and
+   * the GitHub routes 404 (fail closed).
+   */
+  github?: {
+    transport: GitHubTransport;
+    /**
+     * Base URL of the E2 API the adapter's client mutates through. Defaults to
+     * the resolved `server.url` (the running process's own API). Tests that bind
+     * the server to an ephemeral port pass the bound URL here.
+     */
+    apiBaseUrl?: string;
+    /** Factory base URL used to render the PR body's links. Defaults to `server.url`. */
+    factoryBaseUrl?: string;
+  };
 }
 
 /**
@@ -237,6 +290,39 @@ function resolveDefaultWorkerProfile(runtime: FactoryRuntimeConfig): WorkerProfi
   return configured as WorkerProfile;
 }
 
+/**
+ * Resolve the production `WorkVerifier` for this boot (E10.1, #39). An explicit
+ * `verifier` option wins (the injectable test seam). Otherwise, when the
+ * resolved config carries a `verification:` section, compose the real E5-backed
+ * verifier from it. Composition is fail-closed: a misconfiguration is logged
+ * loudly and **no** verifier is wired, so a SUCCESS Task parks rather than being
+ * promoted on a half-built verifier. When the section is absent, this returns
+ * `undefined` — exactly the pre-#39 behaviour.
+ */
+function resolveVerifier(
+  runtime: FactoryRuntimeConfig,
+  options: ServerDepsOptions,
+  store: StateStore,
+): WorkVerifier | undefined {
+  if (options.verifier) return options.verifier;
+  if (!runtime.verification) return undefined;
+  try {
+    return createProductionVerifier({
+      config: runtime.verification,
+      store,
+      workingDirectory: runtime.repository.path,
+      ...(options.verification?.judge ? { judge: options.verification.judge } : {}),
+      ...(options.verification?.runCommand ? { runCommand: options.verification.runCommand } : {}),
+      ...(options.now ? { now: options.now } : {}),
+    });
+  } catch (error) {
+    console.error(
+      `scheduler: verifier composition failed (${error instanceof Error ? error.message : String(error)}); no verifier wired — SUCCESS Tasks will not be verified or promoted`,
+    );
+    return undefined;
+  }
+}
+
 export function buildServerDeps(
   runtime: FactoryRuntimeConfig,
   options: ServerDepsOptions = {},
@@ -247,6 +333,7 @@ export function buildServerDeps(
   ensureStorageDirs(runtime);
   const store = openStateStore(runtime.paths.db);
   const events = openEventLog(store.db);
+  const verifier = resolveVerifier(runtime, options, store);
   const workers = createWorkerManager({
     store,
     events,
@@ -261,6 +348,24 @@ export function buildServerDeps(
   // One store-backed evidence reader serves both the Observatory projection and
   // E9.7's per-Attempt telemetry (human-leverage layer) — a single read seam.
   const evidence = createEvidenceReadPort(store);
+  // E10.3 (#37): compose the E6 GitHub adapter into the running process when a
+  // transport is supplied. Its client speaks the E2 API (the sole mutation
+  // authority), its policy gate is the real E7 `checkDetailed`, and its evidence
+  // read-back is the durable `evidence_bundles` receipt — the same sources the
+  // server itself uses. Absent a transport, none is built (routes 404).
+  const github = options.github
+    ? buildGitHubAdapter({
+        transport: options.github.transport,
+        client: createFactoryClient({
+          baseUrl: options.github.apiBaseUrl ?? runtime.server.url,
+          ...(runtime.server.auth ? { token: runtime.server.auth.token } : {}),
+        }),
+        factoryBaseUrl: options.github.factoryBaseUrl ?? runtime.server.url,
+        store,
+        events,
+        baseBranch: runtime.worktrees.baseBranch,
+      })
+    : undefined;
   // E9.6 boot reconciliation (spec §18.3): walk durable state → event history →
   // RUNNING Attempts → worker leases before the loop starts. Post-restart no
   // adapter is live, so every lease is treated as stopped (via
@@ -291,7 +396,9 @@ export function buildServerDeps(
       artifacts,
       policy: createSchedulerPolicy({ store, events }),
       telemetry: { evidence },
-      ...(options.verifier ? { verifier: options.verifier } : {}),
+      ...(options.now ? { now: options.now } : {}),
+      ...(verifier ? { verifier } : {}),
+      ...(options.circuit ? { circuit: options.circuit } : {}),
     },
     {
       maxConcurrentTasks: runtime.scheduler.maxConcurrentTasks,
@@ -307,6 +414,10 @@ export function buildServerDeps(
     events,
     evidence,
     scheduler,
+    ...(github ? { github } : {}),
+    // E10.4 (#40): carry the resolved bearer credential + principal into the
+    // API surface so authenticated deployments gate mutating routes.
+    ...(runtime.server.auth ? { auth: { ...runtime.server.auth } } : {}),
     version: runtime.factoryVersion,
     schemaVersion: runtime.schemaVersion,
   };
@@ -389,6 +500,22 @@ async function cmdStatus(args: ParsedArgs, io: CliIO): Promise<number> {
   return 0;
 }
 
+/**
+ * E10.4 (#40), serve-time fail-closed re-check: config validation sees only the
+ * YAML `server.hostname`, but `--hostname` (the container path) can widen the
+ * *effective* bind past it. A non-loopback effective bind without
+ * `server.auth` is refused here too — mutating routes must not be reachable
+ * off-loopback unauthenticated.
+ */
+function effectiveBindAuthError(hostname: string, runtime: FactoryRuntimeConfig): string | null {
+  if (isLoopbackHostname(hostname) || runtime.server.auth) return null;
+  return (
+    `refusing to bind ${hostname}: the control plane requires a bearer credential when the ` +
+    'effective bind is not loopback — configure server.auth { token, actor } in factory.yaml ' +
+    '(see factory-docs/implementation/control-plane-auth.md)'
+  );
+}
+
 async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   const dir = resolveDir(args, io);
   const loaded = loadConfig(dir, io);
@@ -396,8 +523,13 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   const port = flag(args, 'port') !== undefined ? Number(flag(args, 'port')) : loaded.runtime.server.port;
   // The bind address is the resolved `server.hostname` (spec §20); `--hostname`
   // overrides it for a container, where the loopback default is unreachable
-  // through a mapped port.
+  // through a mapped port. A non-loopback effective bind requires auth (E10.4).
   const hostname = flag(args, 'hostname') ?? loaded.runtime.server.hostname;
+  const bindError = effectiveBindAuthError(hostname, loaded.runtime);
+  if (bindError) {
+    io.err(bindError);
+    return 1;
+  }
 
   const deps = buildServerDeps(loaded.runtime);
   const handle = startFactoryServer(deps, { port, hostname });
@@ -430,6 +562,13 @@ async function cmdStart(args: ParsedArgs, io: CliIO): Promise<number> {
   if (!loaded) return 1;
   const port = flag(args, 'port') ?? String(loaded.runtime.server.port);
   const hostname = flag(args, 'hostname') ?? loaded.runtime.server.hostname;
+  // Fail fast on an unauthenticated wide bind **before** spawning the child
+  // (E10.4): the serve child's error output is not visible to the caller.
+  const bindError = effectiveBindAuthError(hostname, loaded.runtime);
+  if (bindError) {
+    io.err(bindError);
+    return 1;
+  }
 
   if (!hasFlag(args, 'detached')) {
     const withPort = { ...args, flags: withFlag(args, 'port', port) };
@@ -572,7 +711,12 @@ async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
     io.err('no server URL; pass --url or start the server first');
     return 1;
   }
-  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+  const client = createFactoryClient({
+    baseUrl: url,
+    fetch: io.fetch,
+    // E10.4 (#40): the bearer credential for authenticated deployments.
+    ...credentialOptions(args),
+  });
 
   if (sub === 'submit') {
     const intent = flag(args, 'intent');
@@ -646,13 +790,79 @@ async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
   return 1;
 }
 
+/**
+ * E10.3 (#37) GitHub operator surface (spec §4.2/§28). `factory github import
+ * --repo <owner/name> --issue <n>` reconciles an issue into a Work Order;
+ * `factory github pr --bundle <evidenceBundleId>` opens a PR that links the
+ * durable Evidence Bundle. Both call the API — the server composes the E6
+ * adapter, and the CLI never talks to GitHub.
+ */
+async function cmdGithub(args: ParsedArgs, io: CliIO): Promise<number> {
+  const sub = args.positionals[1];
+  const url = resolveUrl(args, io);
+  if (!url) {
+    io.err('no server URL; pass --url or start the server first');
+    return 1;
+  }
+  const client = createFactoryClient({
+    baseUrl: url,
+    fetch: io.fetch,
+    // E10.4 (#40): the bearer credential for authenticated deployments.
+    ...credentialOptions(args),
+  });
+
+  if (sub === 'import') {
+    const repository = flag(args, 'repo');
+    const number = flag(args, 'issue');
+    if (!repository || !number) {
+      io.err('usage: factory github import --repo <owner/name> --issue <number> [--url <url>]');
+      return 1;
+    }
+    const parsed = Number(number);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      io.err(`--issue must be a positive integer (got "${number}")`);
+      return 1;
+    }
+    io.out(JSON.stringify(await client.githubImportIssue({ repository, number: parsed })));
+    return 0;
+  }
+
+  if (sub === 'pr') {
+    const evidenceBundleId = flag(args, 'bundle');
+    if (!evidenceBundleId) {
+      io.err('usage: factory github pr --bundle <evidenceBundleId> [--base <branch>] [--title <text>] [--url <url>]');
+      return 1;
+    }
+    const base = flag(args, 'base');
+    const title = flag(args, 'title');
+    io.out(
+      JSON.stringify(
+        await client.githubOpenPullRequest({
+          evidenceBundleId,
+          ...(base ? { baseBranch: base } : {}),
+          ...(title ? { title } : {}),
+        }),
+      ),
+    );
+    return 0;
+  }
+
+  io.err(`unknown github subcommand: ${sub ?? ''}`);
+  return 1;
+}
+
 async function cmdObservatory(args: ParsedArgs, io: CliIO): Promise<number> {
   const url = resolveUrl(args, io);
   if (!url) {
     io.err('no server URL; pass --url or start the server first');
     return 1;
   }
-  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+  const client = createFactoryClient({
+    baseUrl: url,
+    fetch: io.fetch,
+    // E10.4 (#40): the bearer credential for authenticated deployments.
+    ...credentialOptions(args),
+  });
   io.out(JSON.stringify(await client.observatory()));
   return 0;
 }
@@ -670,7 +880,12 @@ async function cmdControl(args: ParsedArgs, io: CliIO): Promise<number> {
     io.err('no server URL; pass --url or start the server first');
     return 1;
   }
-  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+  const client = createFactoryClient({
+    baseUrl: url,
+    fetch: io.fetch,
+    // E10.4 (#40): the bearer credential for authenticated deployments.
+    ...credentialOptions(args),
+  });
 
   if (sub === 'status') {
     io.out(JSON.stringify(await client.factoryControls()));
@@ -679,7 +894,7 @@ async function cmdControl(args: ParsedArgs, io: CliIO): Promise<number> {
   if (sub === 'pause' || sub === 'resume' || sub === 'emergency-stop') {
     const actor = flag(args, 'actor');
     if (!actor) {
-      io.err(`usage: factory control ${sub} --actor <id> [--url <url>]`);
+      io.err(`usage: factory control ${sub} --actor <id> [--token <tok>] [--url <url>]`);
       return 1;
     }
     const controls =
@@ -703,7 +918,12 @@ async function cmdApprovals(args: ParsedArgs, io: CliIO): Promise<number> {
     io.err('no server URL; pass --url or start the server first');
     return 1;
   }
-  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+  const client = createFactoryClient({
+    baseUrl: url,
+    fetch: io.fetch,
+    // E10.4 (#40): the bearer credential for authenticated deployments.
+    ...credentialOptions(args),
+  });
 
   if (sub === 'list') {
     const status = flag(args, 'status') as 'PENDING' | 'ANSWERED' | 'SPENT' | undefined;
@@ -746,12 +966,17 @@ const HELP = [
   '  wo submit --intent <text> [--url]      create a Work Order (DRAFT)',
   '  wo status <workOrderId> [--url]        read Work Order status',
   '  wo plan <workOrderId> --dag <file>     commit a planner DAG proposal',
-  '  wo answer <interactionId> <response> [--actor <id>]  answer a QUESTION',
+  '  wo answer <interactionId> <response> [--actor <id>]  answer a QUESTION (--actor is overridden when the server requires a credential)',
   '  approvals list [--status <state>]      list policy approvals',
   '  approvals answer <approvalId> --decision APPROVAL|DENY --actor <id>  answer an approval',
   '  observatory [--url]                    read Observatory projections',
+  '  github import --repo <owner/name> --issue <n>  import a GitHub issue into a Work Order',
+  '  github pr --bundle <evidenceBundleId>  open a PR linking the Evidence Bundle',
   '  control status [--url]                 read pause/e-stop controls',
-  '  control <pause|resume|emergency-stop> --actor <id>  set a factory control',
+  '  control <pause|resume|emergency-stop> --actor <id>  set a factory control (--actor is overridden when the server requires a credential)',
+  '',
+  "  Client commands accept --token <tok> (or $FACTORY_TOKEN) when the server",
+  '  requires a bearer credential (E10.4).',
 ].join('\n');
 
 export async function runCli(argv: string[], io: CliIO): Promise<number> {
@@ -781,6 +1006,8 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         return await cmdApprovals(args, io);
       case 'observatory':
         return await cmdObservatory(args, io);
+      case 'github':
+        return await cmdGithub(args, io);
       case 'control':
         return await cmdControl(args, io);
       case 'help':

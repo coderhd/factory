@@ -1,5 +1,7 @@
 import { join, resolve } from 'node:path';
 
+import { CHECK_KINDS, type CheckCategory } from '../verification/engine';
+
 /**
  * E2 desired → runtime configuration (spec §20). `factory.yaml` describes the
  * *desired* Factory deployment; this module validates it and resolves it into
@@ -16,10 +18,46 @@ export const FACTORY_API_VERSION = 'factory/v0.1';
 export const FACTORY_VERSION = '0.1.0';
 export const FACTORY_SCHEMA_VERSION = '1';
 
+/**
+ * E10.1 (#39) production verification configuration (spec §9, §14). The desired
+ * config names the independent semantic judge, the prompt/rubric provenance it
+ * runs under, and the deterministic/behavioral command checks to register on
+ * the E5 engine. It is optional: absent, the server wires no verifier and fails
+ * closed exactly as before. Present, the production composition module turns it
+ * into a live `WorkVerifier`.
+ */
+export interface VerificationCheckDesired {
+  /** Stable verifier identity recorded on results and failures. */
+  id: string;
+  category: CheckCategory;
+  kind: string;
+  /** The command a check runs; pass/fail is derived from its exit code. */
+  command: string;
+}
+
+export interface VerificationDesired {
+  /** The judge identity — must differ from the writing model (writer ≠ verifier). */
+  judge: { provider: string; model: string; family?: string; version?: string };
+  prompt: { id: string; version: string };
+  rubric: string[];
+  checks: VerificationCheckDesired[];
+}
+
 export interface FactoryDesiredConfig {
   apiVersion: string;
   factoryVersion: string;
-  server: { hostname: string; port: number };
+  server: {
+    hostname: string;
+    port: number;
+    /**
+     * E10.4 (#40) optional control-plane authentication: a shared bearer
+     * credential and the operator identity it authenticates. Present, every
+     * mutating route requires `Authorization: Bearer <token>` and human-action
+     * actors come from `actor`. Absent, the trust boundary is the loopback
+     * bind (a non-loopback bind is a config error).
+     */
+    auth?: { token: string; actor: string };
+  };
   storage: { state: string; artifacts: string; knowledge: string };
   /** The local repository the Factory creates per-Task worktrees from (§15/§17). */
   repository: { path: string };
@@ -36,6 +74,8 @@ export interface FactoryDesiredConfig {
   };
   worktrees: { rootDir: string; baseBranch: string };
   workers: { profiles: string[] };
+  /** Optional production verification surface (E10.1, #39); absent → fail closed. */
+  verification?: VerificationDesired;
   image: { repository: string; tag: string };
   compose: {
     healthcheck: { intervalSeconds: number; timeoutSeconds: number; retries: number };
@@ -46,7 +86,7 @@ export interface FactoryRuntimeConfig {
   apiVersion: string;
   factoryVersion: string;
   schemaVersion: string;
-  server: { hostname: string; port: number; url: string };
+  server: { hostname: string; port: number; url: string; auth?: { token: string; actor: string } };
   paths: { root: string; state: string; artifacts: string; knowledge: string; db: string };
   repository: { path: string };
   scheduler: {
@@ -56,6 +96,8 @@ export interface FactoryRuntimeConfig {
   };
   worktrees: { rootDir: string; baseBranch: string };
   workers: { profiles: string[] };
+  /** Optional production verification surface, carried through resolution. */
+  verification?: VerificationDesired;
   image: { repository: string; tag: string; ref: string };
 }
 
@@ -122,6 +164,15 @@ function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
+/**
+ * The hostnames that may serve the control plane unauthenticated (§20).
+ * Exported for the serve path's effective-bind re-check (E10.4, #40): config
+ * validation sees only the YAML hostname, `--hostname` can widen the bind.
+ */
+export function isLoopbackHostname(hostname: string): boolean {
+  return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
+}
+
 /** Validate a `factory.yaml` document; returns every issue with a dotted path. */
 export function parseFactoryConfig(text: string): ConfigParse {
   const parsed = parseYaml(text);
@@ -151,6 +202,34 @@ export function parseFactoryConfig(text: string): ConfigParse {
     if (!isNonEmptyString(root.server.hostname)) issue('server.hostname', 'hostname is required');
     if (!isPositiveInteger(root.server.port) || root.server.port > 65535) {
       issue('server.port', 'port must be an integer between 1 and 65535');
+    }
+    // E10.4 (#40): auth is optional for a loopback/dev bind, but a deployment
+    // that exposes the control plane off-loopback must configure it — the
+    // config *fails closed* instead of serving mutating routes unauthenticated.
+    if (root.server.auth !== undefined) {
+      if (!isPlainObject(root.server.auth)) {
+        issue('server.auth', 'server.auth must be a mapping');
+      } else {
+        if (!isNonEmptyString(root.server.auth.token)) {
+          issue('server.auth.token', 'token is required when auth is configured');
+        } else if (root.server.auth.token.trim().length < 24) {
+          issue(
+            'server.auth.token',
+            'token must be a high-entropy secret of at least 24 characters (never a passphrase)',
+          );
+        }
+        if (!isNonEmptyString(root.server.auth.actor)) {
+          issue(
+            'server.auth.actor',
+            'actor is required when auth is configured (the authenticated operator identity)',
+          );
+        }
+      }
+    } else if (typeof root.server.hostname === 'string' && !isLoopbackHostname(root.server.hostname)) {
+      issue(
+        'server.auth',
+        'server.auth is required when binding a non-loopback hostname (the control plane must not be writable unauthenticated)',
+      );
     }
   }
 
@@ -231,6 +310,87 @@ export function parseFactoryConfig(text: string): ConfigParse {
     issue('workers.profiles', 'profiles must be a non-empty list of strings');
   }
 
+  // E10.1 (#39): the optional verification section. Absent is valid (the server
+  // wires no verifier and fails closed); present, every field must be well-formed
+  // so production composition never runs a misconfigured judge or check.
+  if (root.verification !== undefined) {
+    if (!isPlainObject(root.verification)) {
+      issue('verification', 'verification must be a mapping');
+    } else {
+      const verification = root.verification;
+      if (!isPlainObject(verification.judge)) {
+        issue('verification.judge', 'verification.judge is required');
+      } else {
+        if (!isNonEmptyString(verification.judge.provider)) {
+          issue('verification.judge.provider', 'judge.provider is required');
+        }
+        if (!isNonEmptyString(verification.judge.model)) {
+          issue('verification.judge.model', 'judge.model is required');
+        }
+        if (
+          verification.judge.family !== undefined &&
+          !isNonEmptyString(verification.judge.family)
+        ) {
+          issue('verification.judge.family', 'judge.family must be a non-empty string when present');
+        }
+        if (
+          verification.judge.version !== undefined &&
+          !isNonEmptyString(verification.judge.version)
+        ) {
+          issue('verification.judge.version', 'judge.version must be a non-empty string when present');
+        }
+      }
+      if (!isPlainObject(verification.prompt)) {
+        issue('verification.prompt', 'verification.prompt is required');
+      } else {
+        if (!isNonEmptyString(verification.prompt.id)) {
+          issue('verification.prompt.id', 'prompt.id is required');
+        }
+        if (!isNonEmptyString(verification.prompt.version)) {
+          issue('verification.prompt.version', 'prompt.version is required');
+        }
+      }
+      if (
+        !Array.isArray(verification.rubric) ||
+        verification.rubric.length === 0 ||
+        verification.rubric.some((item) => !isNonEmptyString(item))
+      ) {
+        issue('verification.rubric', 'rubric must be a non-empty list of strings');
+      }
+      if (!Array.isArray(verification.checks) || verification.checks.length === 0) {
+        issue('verification.checks', 'verification.checks must be a non-empty list of command checks');
+      } else {
+        const seen = new Set<string>();
+        verification.checks.forEach((raw, index) => {
+          const base = `verification.checks[${index}]`;
+          if (!isPlainObject(raw)) {
+            issue(base, 'each check must be a mapping');
+            return;
+          }
+          if (!isNonEmptyString(raw.id)) {
+            issue(`${base}.id`, 'check.id is required');
+          } else if (seen.has(raw.id)) {
+            issue(`${base}.id`, `duplicate check id: ${raw.id}`);
+          } else {
+            seen.add(raw.id);
+          }
+          const category = raw.category;
+          if (category !== 'deterministic' && category !== 'behavioral') {
+            issue(`${base}.category`, 'category must be "deterministic" or "behavioral"');
+          } else if (!isNonEmptyString(raw.kind) || !CHECK_KINDS[category].includes(raw.kind as never)) {
+            issue(
+              `${base}.kind`,
+              `kind must be one of the ${category} checks (${CHECK_KINDS[category].join(', ')})`,
+            );
+          }
+          if (!isNonEmptyString(raw.command)) {
+            issue(`${base}.command`, 'check.command is required');
+          }
+        });
+      }
+    }
+  }
+
   if (!isPlainObject(root.image)) {
     issue('image', 'image is required');
   } else {
@@ -271,6 +431,7 @@ export function resolveFactoryConfig(
       hostname: config.server.hostname,
       port: config.server.port,
       url: `http://${config.server.hostname}:${config.server.port}`,
+      ...(config.server.auth ? { auth: { ...config.server.auth } } : {}),
     },
     paths: {
       root,
@@ -290,6 +451,16 @@ export function resolveFactoryConfig(
       baseBranch: config.worktrees.baseBranch,
     },
     workers: { profiles: [...config.workers.profiles] },
+    ...(config.verification
+      ? {
+          verification: {
+            judge: { ...config.verification.judge },
+            prompt: { ...config.verification.prompt },
+            rubric: [...config.verification.rubric],
+            checks: config.verification.checks.map((check) => ({ ...check })),
+          },
+        }
+      : {}),
     image: {
       repository: config.image.repository,
       tag: config.image.tag,
@@ -306,6 +477,15 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
     'server:',
     `  hostname: ${config.server.hostname}`,
     `  port: ${config.server.port}`,
+    // The token is emitted quoted so the YAML stays parseable for any secret
+    // content; keep the secret itself out of version control (see compose.yaml).
+    ...(config.server.auth
+      ? [
+          '  auth:',
+          `    token: ${JSON.stringify(config.server.auth.token)}`,
+          `    actor: ${JSON.stringify(config.server.auth.actor)}`,
+        ]
+      : []),
     'storage:',
     `  state: ${config.storage.state}`,
     `  artifacts: ${config.storage.artifacts}`,
@@ -327,6 +507,35 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
     'workers:',
     '  profiles:',
     ...config.workers.profiles.map((profile) => `    - ${profile}`),
+    ...(config.verification
+      ? [
+          'verification:',
+          '  judge:',
+          `    provider: ${JSON.stringify(config.verification.judge.provider)}`,
+          `    model: ${JSON.stringify(config.verification.judge.model)}`,
+          ...(config.verification.judge.family
+            ? [`    family: ${JSON.stringify(config.verification.judge.family)}`]
+            : []),
+          ...(config.verification.judge.version
+            ? [`    version: ${JSON.stringify(config.verification.judge.version)}`]
+            : []),
+          '  prompt:',
+          `    id: ${JSON.stringify(config.verification.prompt.id)}`,
+          `    version: ${JSON.stringify(config.verification.prompt.version)}`,
+          '  rubric:',
+          // Rubric items and commands are arbitrary text (colons, quotes, `&&`),
+          // so quote them as JSON scalars — a valid YAML double-quoted scalar —
+          // rather than emit YAML that a `:` or `#` would break.
+          ...config.verification.rubric.map((item) => `    - ${JSON.stringify(item)}`),
+          '  checks:',
+          ...config.verification.checks.flatMap((check) => [
+            `    - id: ${JSON.stringify(check.id)}`,
+            `      category: ${JSON.stringify(check.category)}`,
+            `      kind: ${JSON.stringify(check.kind)}`,
+            `      command: ${JSON.stringify(check.command)}`,
+          ]),
+        ]
+      : []),
     'image:',
     `  repository: ${config.image.repository}`,
     `  tag: "${config.image.tag}"`,

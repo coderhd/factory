@@ -1,4 +1,5 @@
 import type { Attempt, Task, WorkOrder } from '../domain/workOrder';
+import type { GitHubPullRequest, ImportIssueResult } from '../github/adapter';
 import type { DrillDownStage } from '../observatory/observatory';
 import type { ApprovalRecord } from '../policy/policy';
 import type { DAGVersion, RecordedProposal } from '../planning/dag';
@@ -122,3 +123,33 @@ export interface ApiErrorDto {
 
 /** Human-gate verbs mapped onto Factory-owned Work Order transitions. */
 export type GateDecision = 'APPROVE' | 'REWORK' | 'REJECT';
+
+/**
+ * E10.3 (#37) GitHub operator surface (spec §4.2/§28). The server composes the
+ * E6 adapter and exposes only these two operator actions over the API; every
+ * GitHub side effect still authorizes through the live E7 policy inside the
+ * adapter, and the PR body's Evidence Bundle link is read from the **durable**
+ * `evidence_bundles` receipt by id (never a caller-supplied bundle).
+ */
+export interface GitHubImportRequest {
+  /** `owner/name`. */
+  repository: string;
+  /** The GitHub issue number to reconcile into a Work Order. */
+  number: number;
+}
+
+export type GitHubImportResultDto = ImportIssueResult;
+
+export interface GitHubOpenPrRequest {
+  /**
+   * The id of the durable Evidence Bundle the PR links. Only the id is trusted:
+   * the server re-reads the receipt from `evidence_bundles` and 404s when it is
+   * absent — an in-memory bundle cannot authorize an external PR.
+   */
+  evidenceBundleId: string;
+  /** Optional PR base override; defaults to the adapter's configured base. */
+  baseBranch?: string;
+  title?: string;
+}
+
+export type GitHubPullRequestDto = GitHubPullRequest;

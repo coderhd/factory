@@ -8,9 +8,21 @@ apiVersion: factory/v0.1
 factoryVersion: 0.1.0
 server:
   # Bind address for the API. 127.0.0.1 is local dev; a container passes
-  # `--hostname 0.0.0.0` (or sets this) so the mapped port is reachable.
+  # `--hostname 0.0.0.0` (or sets this) so the mapped port is reachable. A
+  # non-loopback hostname requires `server.auth` (E10.4, #40) — the config
+  # fails to load otherwise.
   hostname: 127.0.0.1
   port: 8787
+  # Control-plane authentication (E10.4, #40), e.g. for a container deployment:
+  #   auth:
+  #     token: replace-with-a-random-secret-of-24-plus-characters
+  #     actor: operator-ada
+  # The token IS a deployment secret: generate it (`openssl rand -base64 32`),
+  # keep it out of version control, and give it only to clients. When set,
+  # every mutating route requires `Authorization: Bearer <token>`; read-only
+  # (GET) routes stay public, and the `actor` — never a request-body actor —
+  # signs the durable human-action receipts (approvals, answers, e-stop).
+  # See factory-docs/implementation/control-plane-auth.md.
 storage:
   # Relative paths resolve against the deployment directory. compose mounts
   # volumes onto these (`/app/.factory/*`).
@@ -39,6 +51,31 @@ worktrees:
 workers:
   profiles:
     - herdr
+# Production verification (E10.1, #39). Optional: when present, the server
+# composes the real E5 verifier (engine + independent semantic judge) from this
+# section, so a SUCCESS Task is verified and driven to HUMAN_GATE. Absent, the
+# server wires no verifier and fails closed (no promotion). Uncomment and set
+# the judge + command checks for a deployment that supplies a model-calling
+# judge implementation.
+# verification:
+#   judge:
+#     provider: judge-co
+#     model: judge-1
+#     family: judge-family
+#   prompt:
+#     id: factory-verify
+#     version: "1"
+#   rubric:
+#     - Does the change set satisfy the criterion as written?
+#   checks:
+#     - id: typecheck
+#       category: deterministic
+#       kind: typecheck
+#       command: bun run typecheck
+#     - id: e2e
+#       category: behavioral
+#       kind: e2e
+#       command: bun run e2e
 image:
   repository: ghcr.io/coderhd/factory
   tag: "0.1.0"

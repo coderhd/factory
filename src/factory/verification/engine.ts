@@ -76,6 +76,14 @@ export type CheckOutcome =
 /** What a check is given to run against. The engine hands it a defensive copy. */
 export interface CheckContext {
   changeSet: ChangeSet;
+  /**
+   * The directory that physically holds the change under verification — the
+   * Attempt's worktree checkout. Optional: a caller without an assignment (unit
+   * checks, a direct engine run) leaves it unset, and a check falls back to its
+   * own working directory. A command check MUST run here when present, or its
+   * evidence may attest to code that is not the change under verification.
+   */
+  worktreePath?: string;
 }
 
 /** A pluggable verification check registered by category. */
@@ -148,6 +156,11 @@ export interface VerifyOptions {
   criteria?: string[];
   /** Maps each acceptance criterion to the checks that verify it. */
   criterionChecks?: Record<string, string[]>;
+  /**
+   * The Attempt's worktree checkout (the directory holding the change under
+   * verification). Threaded to every check via {@link CheckContext.worktreePath}.
+   */
+  worktreePath?: string;
 }
 
 export interface VerificationEngine {
@@ -344,7 +357,10 @@ export function createVerificationEngine(): VerificationEngine {
       }
     }
 
-    const context: CheckContext = { changeSet: cloneChangeSet(changeSet) };
+    const context: CheckContext = {
+      changeSet: cloneChangeSet(changeSet),
+      ...(options.worktreePath !== undefined ? { worktreePath: options.worktreePath } : {}),
+    };
     const checks: CheckResult[] = [];
     for (const provider of providers) {
       checks.push(await runCheck(provider, criteriaFor.get(provider.id) ?? [], context));
