@@ -42,6 +42,12 @@ export class FactoryApiError extends Error {
 export interface FactoryClientOptions {
   baseUrl: string;
   fetch?: typeof fetch;
+  /**
+   * E10.4 (#40) the shared bearer credential. Present, every request carries
+   * `Authorization: Bearer <token>`; absent, no header is sent. The secret
+   * lives in the caller's configuration and is never logged.
+   */
+  token?: string;
 }
 
 export interface FactoryClient {
@@ -82,9 +88,13 @@ export function createFactoryClient(options: FactoryClientOptions): FactoryClien
   const fetchImpl = options.fetch ?? fetch;
 
   async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const authorization: Record<string, string> = {};
+    if (options.token) authorization.authorization = `Bearer ${options.token}`;
+    const headers: Record<string, string> =
+      body === undefined ? authorization : { ...authorization, 'content-type': 'application/json' };
     const response = await fetchImpl(`${base}/api${path}`, {
       method,
-      headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const text = await response.text();

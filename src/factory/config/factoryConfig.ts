@@ -46,7 +46,18 @@ export interface VerificationDesired {
 export interface FactoryDesiredConfig {
   apiVersion: string;
   factoryVersion: string;
-  server: { hostname: string; port: number };
+  server: {
+    hostname: string;
+    port: number;
+    /**
+     * E10.4 (#40) optional control-plane authentication: a shared bearer
+     * credential and the operator identity it authenticates. Present, every
+     * mutating route requires `Authorization: Bearer <token>` and human-action
+     * actors come from `actor`. Absent, the trust boundary is the loopback
+     * bind (a non-loopback bind is a config error).
+     */
+    auth?: { token: string; actor: string };
+  };
   storage: { state: string; artifacts: string; knowledge: string };
   /** The local repository the Factory creates per-Task worktrees from (§15/§17). */
   repository: { path: string };
@@ -75,7 +86,7 @@ export interface FactoryRuntimeConfig {
   apiVersion: string;
   factoryVersion: string;
   schemaVersion: string;
-  server: { hostname: string; port: number; url: string };
+  server: { hostname: string; port: number; url: string; auth?: { token: string; actor: string } };
   paths: { root: string; state: string; artifacts: string; knowledge: string; db: string };
   repository: { path: string };
   scheduler: {
@@ -153,6 +164,11 @@ function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
+/** The hostnames that may serve the control plane unauthenticated (§20). */
+function isLoopbackHostname(hostname: string): boolean {
+  return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
+}
+
 /** Validate a `factory.yaml` document; returns every issue with a dotted path. */
 export function parseFactoryConfig(text: string): ConfigParse {
   const parsed = parseYaml(text);
@@ -182,6 +198,34 @@ export function parseFactoryConfig(text: string): ConfigParse {
     if (!isNonEmptyString(root.server.hostname)) issue('server.hostname', 'hostname is required');
     if (!isPositiveInteger(root.server.port) || root.server.port > 65535) {
       issue('server.port', 'port must be an integer between 1 and 65535');
+    }
+    // E10.4 (#40): auth is optional for a loopback/dev bind, but a deployment
+    // that exposes the control plane off-loopback must configure it — the
+    // config *fails closed* instead of serving mutating routes unauthenticated.
+    if (root.server.auth !== undefined) {
+      if (!isPlainObject(root.server.auth)) {
+        issue('server.auth', 'server.auth must be a mapping');
+      } else {
+        if (!isNonEmptyString(root.server.auth.token)) {
+          issue('server.auth.token', 'token is required when auth is configured');
+        } else if (root.server.auth.token.trim().length < 24) {
+          issue(
+            'server.auth.token',
+            'token must be a high-entropy secret of at least 24 characters (never a passphrase)',
+          );
+        }
+        if (!isNonEmptyString(root.server.auth.actor)) {
+          issue(
+            'server.auth.actor',
+            'actor is required when auth is configured (the authenticated operator identity)',
+          );
+        }
+      }
+    } else if (typeof root.server.hostname === 'string' && !isLoopbackHostname(root.server.hostname)) {
+      issue(
+        'server.auth',
+        'server.auth is required when binding a non-loopback hostname (the control plane must not be writable unauthenticated)',
+      );
     }
   }
 
@@ -383,6 +427,7 @@ export function resolveFactoryConfig(
       hostname: config.server.hostname,
       port: config.server.port,
       url: `http://${config.server.hostname}:${config.server.port}`,
+      ...(config.server.auth ? { auth: { ...config.server.auth } } : {}),
     },
     paths: {
       root,
@@ -428,6 +473,15 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
     'server:',
     `  hostname: ${config.server.hostname}`,
     `  port: ${config.server.port}`,
+    // The token is emitted quoted so the YAML stays parseable for any secret
+    // content; keep the secret itself out of version control (see compose.yaml).
+    ...(config.server.auth
+      ? [
+          '  auth:',
+          `    token: ${JSON.stringify(config.server.auth.token)}`,
+          `    actor: ${JSON.stringify(config.server.auth.actor)}`,
+        ]
+      : []),
     'storage:',
     `  state: ${config.storage.state}`,
     `  artifacts: ${config.storage.artifacts}`,

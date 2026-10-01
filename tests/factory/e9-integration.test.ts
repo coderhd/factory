@@ -3473,7 +3473,9 @@ describe('E9.9 factory.yaml config surface', () => {
 
     const text = readFileSync(join(dir, 'factory.yaml'), 'utf8').replace(
       'hostname: 127.0.0.1',
-      'hostname: 0.0.0.0',
+      // A non-loopback bind requires `server.auth` (E10.4, #40): any deployment
+      // that exposes the control plane off-loopback must bear a credential.
+      ['hostname: 0.0.0.0', '  auth:', '    token: e9-detached-test-bearer-token-0001', '    actor: operator-e9'].join('\n'),
     );
     writeFileSync(join(dir, 'factory.yaml'), text);
 

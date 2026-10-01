@@ -8,9 +8,21 @@ apiVersion: factory/v0.1
 factoryVersion: 0.1.0
 server:
   # Bind address for the API. 127.0.0.1 is local dev; a container passes
-  # `--hostname 0.0.0.0` (or sets this) so the mapped port is reachable.
+  # `--hostname 0.0.0.0` (or sets this) so the mapped port is reachable. A
+  # non-loopback hostname requires `server.auth` (E10.4, #40) — the config
+  # fails to load otherwise.
   hostname: 127.0.0.1
   port: 8787
+  # Control-plane authentication (E10.4, #40), e.g. for a container deployment:
+  #   auth:
+  #     token: replace-with-a-random-secret-of-24-plus-characters
+  #     actor: operator-ada
+  # The token IS a deployment secret: generate it (`openssl rand -base64 32`),
+  # keep it out of version control, and give it only to clients. When set,
+  # every mutating route requires `Authorization: Bearer <token>`; read-only
+  # (GET) routes stay public, and the `actor` — never a request-body actor —
+  # signs the durable human-action receipts (approvals, answers, e-stop).
+  # See factory-docs/implementation/control-plane-auth.md.
 storage:
   # Relative paths resolve against the deployment directory. compose mounts
   # volumes onto these (`/app/.factory/*`).

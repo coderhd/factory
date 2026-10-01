@@ -12,7 +12,9 @@ import {
   type CliIO,
 } from '../../src/cli/factory';
 import { createFactoryClient } from '../../src/factory/api/client';
-import { createApiHandler, startFactoryServer } from '../../src/factory/api/server';
+import { createApiHandler, startFactoryServer, type ApiHandler } from '../../src/factory/api/server';
+import type { AnswerResultDto, InteractionDto } from '../../src/factory/api/contract';
+import type { ApprovalRecord } from '../../src/factory/policy/policy';
 import { createScheduler, type Scheduler } from '../../src/factory/scheduler/scheduler';
 import { createWorkerManager, type WorkerProfile } from '../../src/factory/workers/manager';
 import { createWorktreeManager } from '../../src/factory/worktrees/worktree';
@@ -2017,3 +2019,335 @@ describe('E10.3 PR branch / worktree branch aggregation namespace (#37)', () => 
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// E10.4 (#40) — control-plane API authentication
+// ---------------------------------------------------------------------------
+
+/**
+ * E10.4 (#40): the control-plane API accepts a shared bearer token. When
+ * `server.auth` is configured, every **mutating** route rejects a missing or
+ * invalid credential (401) and never touches state, while read-only (GET)
+ * routes stay public per the documented trust-boundary decision (§20: GET is
+ * safe to expose; writes travel the authenticated path).
+ *
+ * The human-action actor — approval answers, interaction answers, e-stop,
+ * pause/resume — comes from the **authenticated principal** (the configured
+ * `server.auth.actor`), never a self-asserted request-body field. Without auth
+ * configured (the loopback local-dev deployment) the historical body-actor
+ * behavior is preserved.
+ */
+
+const AUTH_TOKEN = 'e10-test-token-0123456789abcdef';
+const OPERATOR = 'operator-ada';
+
+interface AuthHarness {
+  store: ReturnType<typeof openStateStore>;
+  events: ReturnType<typeof openEventLog>;
+}
+
+function openAuthHarness(name: string): AuthHarness {
+  const store = openStateStore(join(workDir, `${name}.db`));
+  const events = openEventLog(store.db);
+  return { store, events };
+}
+
+function post(
+  handler: ApiHandler,
+  path: string,
+  body: unknown,
+  token?: string,
+): Promise<Response> {
+  return handler(
+    new Request(`http://factory.local/api${path}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(token !== undefined ? { authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+describe('E10.4 control-plane authentication (#40)', () => {
+  it('rejects an unauthenticated mutating request with 401 and no state change; accepts it through a valid bearer token', async () => {
+    const h = openAuthHarness('auth-basic');
+    const handler = createApiHandler({
+      store: h.store,
+      events: h.events,
+      evidence: createEmptyEvidenceReadPort(),
+      auth: { token: AUTH_TOKEN, actor: OPERATOR },
+    });
+    try {
+      const denied = await post(handler, '/work-orders', { intent: 'should not land' });
+      expect(denied.status).toBe(401);
+      expect(await denied.json()).toMatchObject({ error: { code: 'UNAUTHENTICATED' } });
+      // Fail-closed: no Work Order exists — the rejected write landed nowhere.
+      expect(h.store.list<WorkOrder>('work_orders')).toHaveLength(0);
+
+      const allowed = await post(handler, '/work-orders', { intent: 'authenticated subject' }, AUTH_TOKEN);
+      expect(allowed.status).toBe(201);
+      expect(await allowed.json()).toMatchObject({ workOrder: { intent: 'authenticated subject' } });
+      expect(h.store.list<WorkOrder>('work_orders')).toHaveLength(1);
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('rejects a wrong credential and a malformed authorization header', async () => {
+    const h = openAuthHarness('auth-wrong');
+    const handler = createApiHandler({
+      store: h.store,
+      events: h.events,
+      evidence: createEmptyEvidenceReadPort(),
+      auth: { token: AUTH_TOKEN, actor: OPERATOR },
+    });
+    try {
+      expect((await post(handler, '/work-orders', { intent: 'x' }, 'wrong-token-0000000000000000')).status).toBe(401);
+      // A non-bearer scheme is not a credential.
+      const wrongScheme = await handler(
+        new Request('http://factory.local/api/work-orders', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: `Basic ${AUTH_TOKEN}` },
+          body: JSON.stringify({ intent: 'x' }),
+        }),
+      );
+      expect(wrongScheme.status).toBe(401);
+      expect(h.store.list<WorkOrder>('work_orders')).toHaveLength(0);
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('keeps read-only (GET) routes public per the documented decision, even without a credential', async () => {
+    const h = openAuthHarness('auth-read');
+    const handler = createApiHandler({
+      store: h.store,
+      events: h.events,
+      evidence: createEmptyEvidenceReadPort(),
+      auth: { token: AUTH_TOKEN, actor: OPERATOR },
+    });
+    try {
+      for (const path of ['/health', '/handshake', '/work-orders', '/approvals', '/factory/controls']) {
+        const response = await handler(new Request(`http://factory.local/api${path}`));
+        expect(response.status).toBe(200);
+      }
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('e-stop and pause/reuse the authenticated principal, ignoring a forged body actor', async () => {
+    const h = openAuthHarness('auth-controls');
+    const handler = createApiHandler({
+      store: h.store,
+      events: h.events,
+      evidence: createEmptyEvidenceReadPort(),
+      auth: { token: AUTH_TOKEN, actor: OPERATOR },
+    });
+    try {
+      const stopped = await post(handler, '/factory/emergency-stop', { actor: 'forge:hacker' }, AUTH_TOKEN);
+      expect(stopped.status).toBe(200);
+      const eStopEvent = h.events
+        .readEvents({ aggregateType: 'factory', aggregateId: 'factory' })
+        .find((event) => event.type === 'factory.emergency_stopped');
+      // The durable receipt names the authenticated operator — never the body actor.
+      expect((eStopEvent!.payload as { actor?: string }).actor).toBe(OPERATOR);
+
+      // Resume works the same way (recovery needs a human; the receipt is theirs).
+      const resumed = await post(handler, '/factory/resume', {}, AUTH_TOKEN);
+      expect(resumed.status).toBe(200);
+      const resumedEvent = h.events
+        .readEvents({ aggregateType: 'factory', aggregateId: 'factory' })
+        .find((event) => event.type === 'factory.resumed');
+      expect((resumedEvent!.payload as { actor?: string }).actor).toBe(OPERATOR);
+
+      // And unauthenticated control mutation is still rejected.
+      const denied = await post(handler, '/factory/pause', { actor: 'forge:hacker' });
+      expect(denied.status).toBe(401);
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('records the authenticated principal on the durable approval receipt, ignoring a forged body actor', async () => {
+    const h = openAuthHarness('auth-approval');
+    const handler = createApiHandler({
+      store: h.store,
+      events: h.events,
+      evidence: createEmptyEvidenceReadPort(),
+      auth: { token: AUTH_TOKEN, actor: OPERATOR },
+    });
+    const at = '2026-10-01T00:00:00.000Z';
+    const approval: ApprovalRecord = {
+      id: 'appr_auth_1',
+      type: 'APPROVAL',
+      workOrderId: 'wo_auth_1',
+      taskId: null,
+      attemptId: null,
+      binding: { capability: 'repo.write' },
+      question: 'Approve repo.write for work order wo_auth_1',
+      workerId: null,
+      status: 'PENDING',
+      response: null,
+      createdAt: at,
+      updatedAt: at,
+    };
+    h.store.set('interactions', approval.id, approval);
+    try {
+      const answered = await post(
+        handler,
+        `/approvals/${approval.id}/answer`,
+        { decision: 'APPROVAL', actor: 'forge:hacker' },
+        AUTH_TOKEN,
+      );
+      expect(answered.status).toBe(200);
+      const body = (await answered.json()) as { approval: ApprovalRecord };
+      // The receipt is durable and attributable to the principal, not the body.
+      expect(body.approval.response!.actor).toBe(OPERATOR);
+      expect(body.approval.response!.decision).toBe('APPROVAL');
+
+      // Every later answer is refused (an answer is final) — receipts cannot be
+      // silently rewritten by a second call.
+      const again = await post(handler, `/approvals/${approval.id}/answer`, { decision: 'DENY', actor: OPERATOR }, AUTH_TOKEN);
+      expect(again.status).toBe(409);
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('records the authenticated principal on a §12 interaction answer, ignoring a forged body actor', async () => {
+    const h = openAuthHarness('auth-interaction');
+    const handler = createApiHandler({
+      store: h.store,
+      events: h.events,
+      evidence: createEmptyEvidenceReadPort(),
+      auth: { token: AUTH_TOKEN, actor: OPERATOR },
+    });
+    try {
+      const core = { store: h.store, events: h.events };
+      const wo = createWorkOrder(core, { intent: 'E10.4 subject', acceptanceCriteria: ['accepted'] });
+      transitionWorkOrder(core, wo.id, { to: 'READY' });
+      transitionWorkOrder(core, wo.id, { to: 'PLANNING' });
+      const dag = commitDAG(core, wo.id, { nodes: [{ nodeId: 'a', title: 'A' }] });
+      transitionWorkOrder(core, wo.id, { to: 'EXECUTING' });
+      const task = h.store.get<Task>('tasks', dag.nodes[0]!.taskId)!;
+      for (const to of ['READY', 'ASSIGNED', 'RUNNING', 'WAITING_INPUT'] as const) {
+        transitionTask(core, task.id, { to });
+      }
+      const interaction: InteractionDto = {
+        id: 'int_auth_1',
+        type: 'QUESTION',
+        taskId: task.id,
+        attemptId: 'attempt_auth_1',
+        workerId: 'worker_auth_1',
+        recipient: 'human',
+        question: 'Proceed without the fixture file?',
+        status: 'PENDING',
+        response: null,
+        createdAt: at(),
+        updatedAt: at(),
+      };
+      h.store.set('interactions', interaction.id, interaction);
+
+      const answered = await post(
+        handler,
+        `/interactions/${interaction.id}/answer`,
+        { response: 'yes', actor: 'forge:hacker' },
+        AUTH_TOKEN,
+      );
+      expect(answered.status).toBe(200);
+      const body = (await answered.json()) as AnswerResultDto;
+      expect(body.interaction.answeredBy).toBe(OPERATOR);
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('preserves the historical body-actor behavior when auth is unconfigured (loopback local dev)', async () => {
+    const h = openAuthHarness('auth-open-mode');
+    const handler = createApiHandler({
+      store: h.store,
+      events: h.events,
+      evidence: createEmptyEvidenceReadPort(),
+    });
+    try {
+      const paused = await post(handler, '/factory/pause', { actor: 'local-operator' });
+      expect(paused.status).toBe(200);
+      const event = h.events
+        .readEvents({ aggregateType: 'factory', aggregateId: 'factory' })
+        .find((e) => e.type === 'factory.paused');
+      expect((event!.payload as { actor?: string }).actor).toBe('local-operator');
+
+      const created = await post(handler, '/work-orders', { intent: 'open-mode subject' });
+      expect(created.status).toBe(201);
+    } finally {
+      h.store.close();
+    }
+  });
+
+  it('the API client sends the bearer credential and surfaces 401 as a FactoryApiError', async () => {
+    const h = openAuthHarness('auth-client');
+    const server = startFactoryServer(
+      {
+        store: h.store,
+        events: h.events,
+        evidence: createEmptyEvidenceReadPort(),
+        auth: { token: AUTH_TOKEN, actor: OPERATOR },
+      },
+      { port: 0, hostname: '127.0.0.1' },
+    );
+    try {
+      const anonymous = createFactoryClient({ baseUrl: server.url });
+      await expect(anonymous.submitWorkOrder({ intent: 'x' })).rejects.toMatchObject({
+        name: 'FactoryApiError',
+        status: 401,
+        code: 'UNAUTHENTICATED',
+      });
+
+      const authenticated = createFactoryClient({ baseUrl: server.url, token: AUTH_TOKEN });
+      const wo = await authenticated.submitWorkOrder({ intent: 'client subject' });
+      expect(wo.intent).toBe('client subject');
+    } finally {
+      server.stop();
+      h.store.close();
+    }
+  });
+
+  it('validates the server.auth config: a short token or missing actor is a hard failure, and a non-loopback bind requires auth', () => {
+    const text = (server: Record<string, unknown>): string =>
+      serializeFactoryConfig(JSON.parse(JSON.stringify({ ...DEFAULT_FACTORY_CONFIG, server })) as never);
+
+    // Round-trips when well-formed.
+    const good = parseFactoryConfig(
+      text({ hostname: '0.0.0.0', port: 8787, auth: { token: AUTH_TOKEN, actor: OPERATOR } }),
+    );
+    expect(good.ok).toBe(true);
+    if (good.ok) expect(good.config.server.auth).toEqual({ token: AUTH_TOKEN, actor: OPERATOR });
+
+    // Widen the bind without auth: fail closed at config load.
+    const nonLoopback = parseFactoryConfig(text({ hostname: '0.0.0.0', port: 8787 }));
+    expect(nonLoopback.ok).toBe(false);
+    if (!nonLoopback.ok) {
+      expect(nonLoopback.issues.some((issue) => issue.path === 'server.auth')).toBe(true);
+    }
+
+    // Auth present but weak/incomplete: fail closed rather than silently open.
+    const weak = parseFactoryConfig(text({ hostname: '0.0.0.0', port: 8787, auth: { token: 'hunter2', actor: '' } }));
+    expect(weak.ok).toBe(false);
+    if (!weak.ok) {
+      const paths = weak.issues.map((issue) => issue.path);
+      expect(paths).toContain('server.auth.token');
+      expect(paths).toContain('server.auth.actor');
+    }
+
+    // The loopback default needs no auth.
+    const loopback = parseFactoryConfig(text({ hostname: '127.0.0.1', port: 8787 }));
+    expect(loopback.ok).toBe(true);
+  });
+});
+
+function at(): string {
+  return '2026-10-01T00:00:00.000Z';
+}

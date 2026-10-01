@@ -90,6 +90,16 @@ function resolveDir(args: ParsedArgs, io: CliIO): string {
 const configPath = (dir: string): string => join(dir, 'factory.yaml');
 const runtimeFilePath = (dir: string): string => join(dir, '.factory', 'runtime.json');
 
+/**
+ * E10.4 (#40): the control-plane bearer credential for client commands —
+ * `--token <token>` or the `FACTORY_TOKEN` environment variable. The secret
+ * flows into the Authorization header and is never logged.
+ */
+function credentialOptions(args: ParsedArgs): { token?: string } {
+  const token = flag(args, 'token') ?? process.env.FACTORY_TOKEN;
+  return token ? { token } : {};
+}
+
 interface RuntimeFile {
   pid: number;
   url: string;
@@ -347,6 +357,7 @@ export function buildServerDeps(
         transport: options.github.transport,
         client: createFactoryClient({
           baseUrl: options.github.apiBaseUrl ?? runtime.server.url,
+          ...(runtime.server.auth ? { token: runtime.server.auth.token } : {}),
         }),
         factoryBaseUrl: options.github.factoryBaseUrl ?? runtime.server.url,
         store,
@@ -403,6 +414,9 @@ export function buildServerDeps(
     evidence,
     scheduler,
     ...(github ? { github } : {}),
+    // E10.4 (#40): carry the resolved bearer credential + principal into the
+    // API surface so authenticated deployments gate mutating routes.
+    ...(runtime.server.auth ? { auth: { ...runtime.server.auth } } : {}),
     version: runtime.factoryVersion,
     schemaVersion: runtime.schemaVersion,
   };
@@ -668,7 +682,12 @@ async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
     io.err('no server URL; pass --url or start the server first');
     return 1;
   }
-  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+  const client = createFactoryClient({
+    baseUrl: url,
+    fetch: io.fetch,
+    // E10.4 (#40): the bearer credential for authenticated deployments.
+    ...credentialOptions(args),
+  });
 
   if (sub === 'submit') {
     const intent = flag(args, 'intent');
@@ -756,7 +775,12 @@ async function cmdGithub(args: ParsedArgs, io: CliIO): Promise<number> {
     io.err('no server URL; pass --url or start the server first');
     return 1;
   }
-  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+  const client = createFactoryClient({
+    baseUrl: url,
+    fetch: io.fetch,
+    // E10.4 (#40): the bearer credential for authenticated deployments.
+    ...credentialOptions(args),
+  });
 
   if (sub === 'import') {
     const repository = flag(args, 'repo');
@@ -804,7 +828,12 @@ async function cmdObservatory(args: ParsedArgs, io: CliIO): Promise<number> {
     io.err('no server URL; pass --url or start the server first');
     return 1;
   }
-  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+  const client = createFactoryClient({
+    baseUrl: url,
+    fetch: io.fetch,
+    // E10.4 (#40): the bearer credential for authenticated deployments.
+    ...credentialOptions(args),
+  });
   io.out(JSON.stringify(await client.observatory()));
   return 0;
 }
@@ -822,7 +851,12 @@ async function cmdControl(args: ParsedArgs, io: CliIO): Promise<number> {
     io.err('no server URL; pass --url or start the server first');
     return 1;
   }
-  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+  const client = createFactoryClient({
+    baseUrl: url,
+    fetch: io.fetch,
+    // E10.4 (#40): the bearer credential for authenticated deployments.
+    ...credentialOptions(args),
+  });
 
   if (sub === 'status') {
     io.out(JSON.stringify(await client.factoryControls()));
@@ -855,7 +889,12 @@ async function cmdApprovals(args: ParsedArgs, io: CliIO): Promise<number> {
     io.err('no server URL; pass --url or start the server first');
     return 1;
   }
-  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+  const client = createFactoryClient({
+    baseUrl: url,
+    fetch: io.fetch,
+    // E10.4 (#40): the bearer credential for authenticated deployments.
+    ...credentialOptions(args),
+  });
 
   if (sub === 'list') {
     const status = flag(args, 'status') as 'PENDING' | 'ANSWERED' | 'SPENT' | undefined;
@@ -906,6 +945,9 @@ const HELP = [
   '  github pr --bundle <evidenceBundleId>  open a PR linking the Evidence Bundle',
   '  control status [--url]                 read pause/e-stop controls',
   '  control <pause|resume|emergency-stop> --actor <id>  set a factory control',
+  '',
+  "  Client commands accept --token <tok> (or $FACTORY_TOKEN) when the server",
+  '  requires a bearer credential (E10.4).',
 ].join('\n');
 
 export async function runCli(argv: string[], io: CliIO): Promise<number> {
