@@ -1,6 +1,9 @@
 import { join, resolve } from 'node:path';
 
 import { CHECK_KINDS, type CheckCategory } from '../verification/engine';
+import { loadPolicyDocumentFile, parsePolicyDocument } from '../policy/policyLoader';
+import { findDuplicateYamlKeys, parseYamlText } from './yaml';
+import type { PolicyDocument, PolicyLevel, PolicyScope } from '../policy/policy';
 
 /**
  * E2 desired → runtime configuration (spec §20). `factory.yaml` describes the
@@ -36,11 +39,32 @@ export interface VerificationCheckDesired {
 }
 
 export interface VerificationDesired {
-  /** The judge identity — must differ from the writing model (writer ≠ verifier). */
-  judge: { provider: string; model: string; family?: string; version?: string };
+  /**
+   * The judge identity — must differ from the writing model (writer ≠ verifier).
+   * `harness` names the coding-agent harness the judge's fresh pane runs
+   * (E11.2, #42); it defaults to `opencode` at resolve time.
+   */
+  judge: { provider: string; model: string; family?: string; version?: string; harness?: string };
   prompt: { id: string; version: string };
   rubric: string[];
   checks: VerificationCheckDesired[];
+}
+
+/**
+ * E11.3 (#43) outbound GitHub configuration. The file carries a **reference**
+ * to the token — an environment-variable name — never the token itself, so no
+ * secret is ever persisted or logged (spec §20, §28). The token's value is read
+ * from the environment only at serve time and consumed by the transport.
+ */
+export interface GitHubDesiredConfig {
+  /** `owner/name` the Factory imports issues from and opens change sets on. */
+  repository: string;
+  /** The token as an `{ env: VARIABLE_NAME }` reference; a raw token is refused. */
+  token: { env: string };
+  /** GitHub (Enterprise) REST API base; defaults to the public GitHub REST API. */
+  apiBaseUrl?: string;
+  /** The default base branch a Factory change-set PR targets. Defaults to `main`. */
+  baseBranch?: string;
 }
 
 export interface FactoryDesiredConfig {
@@ -73,9 +97,38 @@ export interface FactoryDesiredConfig {
     };
   };
   worktrees: { rootDir: string; baseBranch: string };
-  workers: { profiles: string[] };
+  /**
+   * E11.1 (#44) worker runtime configuration. `profiles` stays the E11 baseline
+   * (`herdr`); `harness` names the coding-agent harness a tab runs
+   * (`opencode`), `workspaceLabel` the dedicated herdr workspace the Factory
+   * owns ("factory", never the user's focused panes), and `models` maps E9.3's
+   * generic capability ids to concrete harness models.
+   */
+  workers: {
+    profiles: string[];
+    harness?: string;
+    workspaceLabel?: string;
+    models?: Record<string, string>;
+  };
   /** Optional production verification surface (E10.1, #39); absent → fail closed. */
   verification?: VerificationDesired;
+  /** Optional outbound GitHub config (E11.3, #43); absent → no adapter, routes 404. */
+  github?: GitHubDesiredConfig;
+  /**
+   * E11.4 (#41): the policy source of truth (ADR 14 §11 shape), validated into
+   * E7's `PolicyDocument`. Present, it is the deployment's override of the
+   * embedded defaults and lands via `buildServerDeps` in the scheduler
+   * (`canAssign`), the write-time `repoWriteGate`, and every `check`/`checkDe-
+   * tailed` call the server composes. Absent, the embedded default stays
+   * authoritative — fail closed, unchanged.
+   */
+  policy?: PolicyDocument;
+  /**
+   * E11.4 (#41): a referenced policy file, resolved against the config
+   * directory at resolve time. Parse stays fs-free: the reference is validated
+   * here, the file's *content* at resolve (both loudly, fail closed).
+   */
+  policyFile?: string;
   image: { repository: string; tag: string };
   compose: {
     healthcheck: { intervalSeconds: number; timeoutSeconds: number; retries: number };
@@ -95,9 +148,25 @@ export interface FactoryRuntimeConfig {
     provisioning: FactoryDesiredConfig['scheduler']['provisioning'];
   };
   worktrees: { rootDir: string; baseBranch: string };
-  workers: { profiles: string[] };
+  /** E11.1 (#44): worker runtime config, resolved (harness/label defaulted). */
+  workers: {
+    profiles: string[];
+    harness: string;
+    workspaceLabel: string;
+    models: Record<string, string>;
+  };
   /** Optional production verification surface, carried through resolution. */
   verification?: VerificationDesired;
+  /**
+   * The resolved GitHub config (E11.3, #43). Only the token's env **name** is
+   * carried — never the token's value — so a persisted runtime file or a log
+   * line can never expose the secret. `apiBaseUrl` is carried as configured;
+   * the transport defaults it to the public GitHub REST API (the literal stays
+   * only in the adapter module).
+   */
+  github?: { repository: string; tokenEnv: string; apiBaseUrl?: string; baseBranch: string };
+  /** E11.4 (#41): the loaded policy document; absent when no `policy:` source is configured. */
+  policy?: PolicyDocument;
   image: { repository: string; tag: string; ref: string };
 }
 
@@ -134,18 +203,18 @@ export const DEFAULT_FACTORY_CONFIG: FactoryDesiredConfig = {
     },
   },
   worktrees: { rootDir: '.factory/worktrees', baseBranch: 'main' },
-  workers: { profiles: ['herdr'] },
+  workers: {
+    profiles: ['herdr'],
+    harness: 'opencode',
+    workspaceLabel: 'factory',
+    models: {},
+  },
   image: { repository: 'ghcr.io/coderhd/factory', tag: FACTORY_VERSION },
   compose: { healthcheck: { intervalSeconds: 10, timeoutSeconds: 5, retries: 3 } },
 };
 
 function parseYaml(text: string): { value: unknown } | { error: string } {
-  try {
-    const yaml = (Bun as unknown as { YAML: { parse(input: string): unknown } }).YAML;
-    return { value: yaml.parse(text) };
-  } catch (error) {
-    return { error: error instanceof Error ? error.message : String(error) };
-  }
+  return parseYamlText(text);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -308,6 +377,52 @@ export function parseFactoryConfig(text: string): ConfigParse {
     root.workers.profiles.some((profile) => !isNonEmptyString(profile))
   ) {
     issue('workers.profiles', 'profiles must be a non-empty list of strings');
+  } else {
+    // E11.1 (#44): the optional worker-runtime fields. Absent ones default at
+    // resolve time (`opencode` / `factory`); present ones must be well-formed
+    // so an adapter is never composed from a typo'd harness or model map.
+    if (root.workers.harness !== undefined && !isNonEmptyString(root.workers.harness)) {
+      issue('workers.harness', 'harness must be a non-empty string when present');
+    }
+    if (root.workers.workspaceLabel !== undefined && !isNonEmptyString(root.workers.workspaceLabel)) {
+      issue('workers.workspaceLabel', 'workspaceLabel must be a non-empty string when present');
+    }
+    if (root.workers.models !== undefined) {
+      if (!isPlainObject(root.workers.models)) {
+        issue('workers.models', 'models must be a mapping of capability id → concrete model');
+      } else {
+        for (const [capability, model] of Object.entries(root.workers.models)) {
+          if (!isNonEmptyString(model)) {
+            issue(`workers.models.${capability}`, 'each model must be a non-empty string');
+          }
+        }
+      }
+    }
+  }
+
+  // E11.4 (#41): the optional policy source of truth (ADR 14 §11). Absent, the
+  // embedded defaults stay authoritative — fail closed, unchanged. Present, the
+  // document must be well-formed: an invalid policy is rejected loudly here
+  // (never silently degraded toward a permissive default). An inline `policy:`
+  // and a `policyFile:` reference are mutually exclusive; a referenced file's
+  // *content* is validated at resolve time (parse is fs-free), still loudly,
+  // before anything boots.
+  if (root.policy !== undefined || root.policyFile !== undefined) {
+    if (root.policy !== undefined && root.policyFile !== undefined) {
+      issue('policy', 'set either an inline policy or a policyFile reference, never both');
+    } else if (root.policy !== undefined) {
+      const parsedPolicy = parsePolicyDocument(root.policy);
+      if (!parsedPolicy.ok) {
+        for (const policyIssue of parsedPolicy.issues) {
+          issue(
+            policyIssue.path ? `policy.${policyIssue.path}` : 'policy',
+            policyIssue.message,
+          );
+        }
+      }
+    } else if (!isNonEmptyString(root.policyFile)) {
+      issue('policyFile', 'policyFile must be a non-empty path string when configured');
+    }
   }
 
   // E10.1 (#39): the optional verification section. Absent is valid (the server
@@ -338,6 +453,11 @@ export function parseFactoryConfig(text: string): ConfigParse {
           !isNonEmptyString(verification.judge.version)
         ) {
           issue('verification.judge.version', 'judge.version must be a non-empty string when present');
+        }
+        // E11.2 (#42): the judge's harness kind. Absent it defaults to `opencode`
+        // at resolve time; present it must be a real harness name.
+        if (verification.judge.harness !== undefined && !isNonEmptyString(verification.judge.harness)) {
+          issue('verification.judge.harness', 'judge.harness must be a non-empty string when present');
         }
       }
       if (!isPlainObject(verification.prompt)) {
@@ -391,6 +511,45 @@ export function parseFactoryConfig(text: string): ConfigParse {
     }
   }
 
+  // E11.3 (#43): the optional outbound `github:` section. Absent is valid (no
+  // adapter is composed and the GitHub routes 404 — fail closed); present, the
+  // token must be an env-var *reference* — a raw token in the file is refused.
+  if (root.github !== undefined) {
+    if (!isPlainObject(root.github)) {
+      issue('github', 'github must be a mapping');
+    } else {
+      const github = root.github;
+      if (
+        !isNonEmptyString(github.repository) ||
+        !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(github.repository.trim())
+      ) {
+        issue('github.repository', 'repository must be "owner/name"');
+      }
+      if (typeof github.token === 'string') {
+        issue(
+          'github.token',
+          'token must be an { env: VARIABLE_NAME } reference — never a raw token in the file',
+        );
+      } else if (!isPlainObject(github.token)) {
+        issue('github.token', 'token must be a mapping with an env reference (e.g. env: GITHUB_TOKEN)');
+      } else if (
+        !isNonEmptyString(github.token.env) ||
+        !/^[A-Za-z_][A-Za-z0-9_]*$/.test(github.token.env)
+      ) {
+        issue('github.token.env', 'token.env must name an environment variable (never the token itself)');
+      }
+      if (
+        github.apiBaseUrl !== undefined &&
+        (!isNonEmptyString(github.apiBaseUrl) || !/^https?:\/\//.test(github.apiBaseUrl))
+      ) {
+        issue('github.apiBaseUrl', 'apiBaseUrl must be an http(s) URL when present');
+      }
+      if (github.baseBranch !== undefined && !isNonEmptyString(github.baseBranch)) {
+        issue('github.baseBranch', 'baseBranch must be a non-empty string when present');
+      }
+    }
+  }
+
   if (!isPlainObject(root.image)) {
     issue('image', 'image is required');
   } else {
@@ -412,6 +571,19 @@ export function parseFactoryConfig(text: string): ConfigParse {
     }
   }
 
+  // E11.4 (#41): a duplicated key inside the policy section is rejected *before
+  // decode* — Bun YAML (like most) lets a duplicate key last-win, so a written
+  // `deny` could otherwise be silently dropped in favor of a later `allow`
+  // (an authority widening against the operator's intent). Only the policy
+  // configuration's own keys are scanned here: elsewhere in factory.yaml the
+  // last-win semantics stay a documented YAML behavior.
+  for (const duplicate of findDuplicateYamlKeys(text, 'policy')) {
+    issue(
+      duplicate.path,
+      'duplicate key in the policy configuration — YAML would silently keep the last value; list each key once',
+    );
+  }
+
   if (issues.length > 0) return { ok: false, issues };
   return { ok: true, config: root as unknown as FactoryDesiredConfig };
 }
@@ -423,6 +595,15 @@ export function resolveFactoryConfig(
 ): FactoryRuntimeConfig {
   const root = resolve(options.baseDir ?? process.cwd());
   const state = resolve(root, config.storage.state);
+  // E11.4 (#41): resolve the policy source of truth. An inline document is
+  // deep-copied (the runtime config is its own copy); a `policyFile:` reference
+  // is read + validated here — an unreadable file or an invalid document throws
+  // a loud `FactoryError` (fail closed), never a permissive fallback.
+  const policy = config.policy
+    ? (JSON.parse(JSON.stringify(config.policy)) as PolicyDocument)
+    : config.policyFile
+      ? loadPolicyDocumentFile(resolve(root, config.policyFile))
+      : undefined;
   return {
     apiVersion: config.apiVersion,
     factoryVersion: config.factoryVersion,
@@ -450,23 +631,107 @@ export function resolveFactoryConfig(
       rootDir: resolve(root, config.worktrees.rootDir),
       baseBranch: config.worktrees.baseBranch,
     },
-    workers: { profiles: [...config.workers.profiles] },
+    workers: {
+      profiles: [...config.workers.profiles],
+      harness: config.workers.harness ?? 'opencode',
+      workspaceLabel: config.workers.workspaceLabel ?? 'factory',
+      models: { ...(config.workers.models ?? {}) },
+    },
     ...(config.verification
       ? {
           verification: {
-            judge: { ...config.verification.judge },
+            judge: {
+              ...config.verification.judge,
+              // E11.2 (#42): the judge's harness kind, defaulted to `opencode`.
+              harness: config.verification.judge.harness ?? 'opencode',
+            },
             prompt: { ...config.verification.prompt },
             rubric: [...config.verification.rubric],
             checks: config.verification.checks.map((check) => ({ ...check })),
           },
         }
       : {}),
+    ...(config.github
+      ? {
+          github: {
+            repository: config.github.repository.trim(),
+            // Only the env var *name* is carried; the value is read from the
+            // environment at serve time and never logged or persisted (#43).
+            tokenEnv: config.github.token.env,
+            apiBaseUrl: config.github.apiBaseUrl,
+            // Trimmed like `repository` (and like the route trims caller
+            // input), so stray whitespace can't silently block the configured
+            // PR base during the policy gate.
+            baseBranch: (config.github.baseBranch ?? 'main').trim(),
+          },
+        }
+      : {}),
+    ...(policy ? { policy } : {}),
     image: {
       repository: config.image.repository,
       tag: config.image.tag,
       ref: `${config.image.repository}:${config.image.tag}`,
     },
   };
+}
+
+const policyQuoted = (value: string): string => JSON.stringify(value);
+
+function serializePolicyScope(indent: string, scope: PolicyScope): string[] {
+  const lines = [`${indent}scope:`];
+  for (const key of ['paths', 'excludePaths'] as const) {
+    if (scope[key] !== undefined) {
+      lines.push(`${indent}  ${key}:`);
+      for (const pattern of scope[key]!) lines.push(`${indent}    - ${policyQuoted(pattern)}`);
+    }
+  }
+  if (scope.branchPattern !== undefined) lines.push(`${indent}  branchPattern: ${policyQuoted(scope.branchPattern)}`);
+  if (scope.env !== undefined) lines.push(`${indent}  env: ${policyQuoted(scope.env)}`);
+  if (scope.dataClass !== undefined) lines.push(`${indent}  dataClass: ${policyQuoted(scope.dataClass)}`);
+  return lines;
+}
+
+function serializePolicyLevel(key: string, indent: string, level: PolicyLevel): string[] {
+  const lines = [`${indent}${key}:`, `${indent}  capabilities:`];
+  for (const [capability, rules] of Object.entries(level.capabilities)) {
+    if (!rules || rules.length === 0) continue;
+    lines.push(`${indent}    ${policyQuoted(capability)}:`);
+    for (const rule of rules) {
+      lines.push(`${indent}      - decision: ${policyQuoted(rule.decision)}`);
+      if (rule.ruleId !== undefined) lines.push(`${indent}        ruleId: ${policyQuoted(rule.ruleId)}`);
+      if (rule.scope !== undefined) lines.push(...serializePolicyScope(`${indent}        `, rule.scope));
+    }
+  }
+  return lines;
+}
+
+/**
+ * The optional `policy:` section (E11.4, #41; ADR 14 §11) — an inline validated
+ * `PolicyDocument` or a `policyFile:` reference. Absent, nothing is emitted
+ * (the embedded default stays authoritative). Strings are emitted quoted (JSON
+ * scalars are YAML scalars) so capability ids, globs and rule ids containing
+ * `:`/`#` cannot break the document.
+ */
+function serializePolicySection(config: FactoryDesiredConfig): string[] {
+  if (config.policyFile !== undefined) return [`policyFile: ${policyQuoted(config.policyFile)}`];
+  const policy = config.policy;
+  if (!policy) return [];
+  const lines = ['policy:', `  version: ${policyQuoted(policy.version)}`];
+  lines.push(...serializePolicyLevel('organization', '  ', policy.organization));
+  if (policy.projects !== undefined) {
+    // An empty projects map is emitted inline — a childless `projects:` line
+    // would re-parse as null and brick a valid config on a `factory init`
+    // rewrite.
+    if (Object.keys(policy.projects).length === 0) {
+      lines.push('  projects: {}');
+    } else {
+      lines.push('  projects:');
+      for (const [repository, level] of Object.entries(policy.projects)) {
+        lines.push(...serializePolicyLevel(repository, '    ', level));
+      }
+    }
+  }
+  return lines;
 }
 
 /** Render a desired config as the canonical `factory.yaml` text `init` writes. */
@@ -507,6 +772,36 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
     'workers:',
     '  profiles:',
     ...config.workers.profiles.map((profile) => `    - ${profile}`),
+    // E11.1 (#44): the worker runtime section. `models` maps E9.3's generic
+    // capability ids (implementer, explorer, …) to the concrete harness models.
+    `  harness: ${JSON.stringify(config.workers.harness ?? 'opencode')}`,
+    `  workspaceLabel: ${JSON.stringify(config.workers.workspaceLabel ?? 'factory')}`,
+    ...(config.workers.models && Object.keys(config.workers.models).length > 0
+      ? [
+          '  models:',
+          ...Object.entries(config.workers.models).map(
+            ([capability, model]) => `    ${JSON.stringify(capability)}: ${JSON.stringify(model)}`,
+          ),
+        ]
+      : []),
+    // E11.3 (#43): only the token's env *name* is written — never the token.
+    ...(config.github
+      ? [
+          'github:',
+          `  repository: ${JSON.stringify(config.github.repository)}`,
+          '  token:',
+          `    env: ${JSON.stringify(config.github.token.env)}`,
+          ...(config.github.apiBaseUrl
+            ? [`  apiBaseUrl: ${JSON.stringify(config.github.apiBaseUrl)}`]
+            : []),
+          ...(config.github.baseBranch
+            ? [`  baseBranch: ${JSON.stringify(config.github.baseBranch)}`]
+            : []),
+        ]
+      : []),
+    // E11.4 (#41): the optional policy source of truth rides here, before the
+    // verification section.
+    ...serializePolicySection(config),
     ...(config.verification
       ? [
           'verification:',
@@ -518,6 +813,9 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
             : []),
           ...(config.verification.judge.version
             ? [`    version: ${JSON.stringify(config.verification.judge.version)}`]
+            : []),
+          ...(config.verification.judge.harness !== undefined
+            ? [`    harness: ${JSON.stringify(config.verification.judge.harness)}`]
             : []),
           '  prompt:',
           `    id: ${JSON.stringify(config.verification.prompt.id)}`,

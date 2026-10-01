@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -32,6 +32,7 @@ import { createScheduler, INTERACTION_CREATED, ASSIGNMENT_START_FAILED, type Int
 import { createArtifactStore, openStateStore } from '../../src/factory/state/store';
 import {
   createHerdrWorker,
+  createHerdrWorkspaceManager,
   type ExecutionEnvelope,
   type WorkerAdapter,
   type WorkerResult,
@@ -1300,11 +1301,80 @@ describe('E3 assignment + completion rules', () => {
 // T9b — real-adapter boot race + scheduler compensation (final-review fixes)
 // ---------------------------------------------------------------------------
 
-/** Write a tiny executable stub runtime and return its path. */
-function stubScript(name: string, body: string): string {
-  const scriptPath = join(workDir, name);
-  writeFileSync(scriptPath, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
-  return scriptPath;
+// ---------------------------------------------------------------------------
+// T9b — real-adapter boot race + scheduler compensation (final-review fixes)
+// E11.1 (#44): the "real adapter" is the herdr-CLI-driven one. These tests
+// inject a fake herdr CLI (never a real herdr/opencode).
+// ---------------------------------------------------------------------------
+
+/**
+ * An in-process fake `herdr` CLI. It pretends the server exists, tracks tabs,
+ * and answers like the real CLI does: the parsed document nests payloads under
+ * `.result`. Reports are produced by a test-provided `onPrompt`.
+ */
+class RecordingHerdrCli {
+  calls: string[][] = [];
+  tabs = new Map<string, { id: string; pane: string; cwd: string; closed: boolean }>();
+  agentState = 'idle';
+  /** Test hook: runs when the adapter prompts the harness. */
+  onPrompt: ((prompt: string, cwd: string) => void) | null = null;
+
+  constructor(private readonly workspaceId = 'ws_factory') {}
+
+  async run(args: readonly string[]): Promise<{ result?: unknown }> {
+    const argv = [...args];
+    this.calls.push(argv);
+    const value = (key: string): string => {
+      const index = argv.indexOf(`--${key}`);
+      if (index < 0) throw new Error(`missing --${key}`);
+      return argv[index + 1]!;
+    };
+    const sub = argv[1];
+    if (argv[0] === 'workspace' && sub === 'list') {
+      return { result: [{ id: this.workspaceId, label: 'factory' }] };
+    }
+    if (argv[0] === 'tab' && sub === 'create') {
+      expect(value('workspace')).toBe(this.workspaceId);
+      const tab = { id: `tab_${this.tabs.size}`, pane: `pane_${this.tabs.size}`, cwd: value('cwd'), closed: false };
+      this.tabs.set(tab.id, tab);
+      return { result: { tab: tab.id, root_pane: tab.pane } };
+    }
+    if (argv[0] === 'agent' && sub === 'start') {
+      expect(argv[3]).toBe('--kind');
+      expect(argv[4]).toBe('opencode');
+      return { result: { agent: argv[2] } };
+    }
+    if (argv[0] === 'agent' && sub === 'prompt') {
+      const tab = [...this.tabs.values()].filter((t) => !t.closed).at(-1);
+      if (tab) this.onPrompt?.(argv[2] ?? '', tab.cwd);
+      return { result: { ok: true } };
+    }
+    if (argv[0] === 'agent' && sub === 'get') {
+      return { result: { state: this.agentState } };
+    }
+    if (argv[0] === 'agent' && sub === 'read') {
+      return { result: { text: 'Which approach should I take here?' } };
+    }
+    if (argv[0] === 'tab' && sub === 'close') {
+      const tab = this.tabs.get(argv[2] ?? '');
+      if (tab) tab.closed = true;
+      return { result: {} };
+    }
+    throw new Error(`unexpected herdr invocation: ${argv.join(' ')}`);
+  }
+
+  openTabs(): number {
+    return [...this.tabs.values()].filter((tab) => !tab.closed).length;
+  }
+}
+
+/** Write a `.factory/report.json` under a worktree root. */
+function seedReport(worktree: string, patch: Record<string, unknown> = {}): void {
+  mkdirSync(join(worktree, '.factory'), { recursive: true });
+  writeFileSync(
+    join(worktree, '.factory', 'report.json'),
+    JSON.stringify({ status: 'completed', observations: [], verificationRequests: [], failure: null, ...patch }),
+  );
 }
 
 describe('E3 real Herdr same-tick provision→assign→execute', () => {
@@ -1312,23 +1382,6 @@ describe('E3 real Herdr same-tick provision→assign→execute', () => {
     const store = openStateStore(dbPath);
     const events = openEventLog(store.db);
     const d = { store, events };
-    const report: WorkerResult = {
-      status: 'completed',
-      commits: [{ sha: 'boot', message: 'delivered' }],
-      artifacts: [],
-      interactions: [],
-      observations: [],
-      verificationRequests: [],
-      diff: 'diff:boot',
-      failure: null,
-    };
-    // The stub reads one envelope line, then emits a report.
-    const script = stubScript('herdr-boot.sh', `read -r line\necho '${JSON.stringify(report)}'`);
-    const workers = createWorkerManager({
-      store,
-      events,
-      spawn: () => createHerdrWorker({ command: script }),
-    });
     try {
       const wo = createWorkOrder(d, { intent: 'boot race', acceptanceCriteria: ['ok'] });
       transitionWorkOrder(d, wo.id, { to: 'READY' });
@@ -1338,6 +1391,25 @@ describe('E3 real Herdr same-tick provision→assign→execute', () => {
       const taskId = dag.nodes[0].taskId;
       transitionTask(d, taskId, { to: 'READY' });
 
+      // The worktree the assignment names must exist for the harness cwd.
+      const worktreePath = join(worktreeRoot, taskId);
+      mkdirSync(worktreePath, { recursive: true });
+
+      const cli = new RecordingHerdrCli();
+      // The "harness" writes its own run-specific report when prompted (the
+      // file must be produced by this turn, not seeded beforehand).
+      cli.onPrompt = () => seedReport(worktreePath, { observations: ['run report from prompt'] });
+      const workers = createWorkerManager({
+        store,
+        events,
+        spawn: () =>
+          createHerdrWorker({
+            cli,
+            workspace: createHerdrWorkspaceManager(cli, { label: 'factory', repoPath }),
+            pollIntervalMs: 5,
+            waitTimeoutMs: 500,
+          }),
+      });
       // Provision and assign + start in the SAME synchronous block — the exact
       // same-tick race the real adapter hit.
       const worker = workers.provisionWorker('herdr');
@@ -1347,7 +1419,7 @@ describe('E3 real Herdr same-tick provision→assign→execute', () => {
         worktree: {
           taskId,
           branch: taskWorktreeBranch(taskId, wo.id),
-          worktreePath: join(worktreeRoot, taskId),
+          worktreePath,
           baseCommit,
         },
       });
@@ -1365,8 +1437,11 @@ describe('E3 real Herdr same-tick provision→assign→execute', () => {
       // The envelope must reach the runtime and its report must come back.
       const result = await workers.collectArtifacts(worker.id);
       expect(result.status).toBe('completed');
-      expect(result.commits).toEqual([{ sha: 'boot', message: 'delivered' }]);
       expect(result.failure).toBeNull();
+      expect(result.observations).toContain('run report from prompt');
+      // The tab was created for this Attempt's worktree — and closed after.
+      expect([...cli.tabs.values()].filter((tab) => tab.cwd === worktreePath)).toHaveLength(1);
+      expect(cli.openTabs()).toBe(0);
     } finally {
       store.close();
     }
@@ -1374,151 +1449,144 @@ describe('E3 real Herdr same-tick provision→assign→execute', () => {
 });
 
 // ---------------------------------------------------------------------------
-// T10 — Herdr adapter wire protocol (NDJSON read-back)
+// T10 — Herdr adapter run lifecycle (E11.1 #44: harness spawn/kill on demand)
 // ---------------------------------------------------------------------------
 
-describe('E3 Herdr adapter wire protocol', () => {
-  const envelope: ExecutionEnvelope = {
-    workOrderId: 'wo',
-    taskId: 'task',
-    attemptId: 'attempt',
-    repository: repoPath,
-    baseCommit,
-    branch: 'b',
-    worktree: worktreeRoot,
-    authorizationCapabilities: [],
-    initialContext: 'x',
-    retrievalEndpoint: null,
-    skills: [],
-    requiredVerification: [],
-  };
+const envelopeFor = (): ExecutionEnvelope => ({
+  workOrderId: 'wo',
+  taskId: 'task',
+  attemptId: 'attempt',
+  repository: repoPath,
+  baseCommit,
+  branch: 'b',
+  worktree: repoPath,
+  authorizationCapabilities: [],
+  initialContext: 'x',
+  retrievalEndpoint: null,
+  skills: [],
+  requiredVerification: [],
+});
 
-  it('reads the NDJSON WorkerResult report back from the runtime stdout', async () => {
-    const report: WorkerResult = {
-      status: 'completed',
-      commits: [{ sha: 'abc123', message: 'via stub' }],
-      artifacts: [],
-      interactions: [],
-      observations: ['one observation'],
-      verificationRequests: ['typecheck'],
-      diff: 'diff --git a/x b/x',
-      failure: null,
-    };
-    const script = stubScript(
-      'herdr-report.sh',
-      `read -r line\necho '${JSON.stringify(report)}'`,
-    );
-    const adapter = createHerdrWorker({ command: script });
+function seedAdapter(): { adapter: WorkerAdapter; cli: RecordingHerdrCli } {
+  const cli = new RecordingHerdrCli();
+  const adapter = createHerdrWorker({
+    cli,
+    workspace: createHerdrWorkspaceManager(cli, { label: 'factory', repoPath }),
+    pollIntervalMs: 5,
+    waitTimeoutMs: 500,
+  });
+  return { adapter, cli };
+}
+
+describe('E3 Herdr adapter lifecycle', () => {
+  it('collects the completed WorkerResult from the report file and closes the tab', async () => {
+    const { adapter, cli } = seedAdapter();
     try {
+      // The harness writes the report during its turn (after the adapter's
+      // per-turn reset), so the collected report is this turn's own.
+      cli.onPrompt = () =>
+        seedReport(repoPath, { observations: ['one observation'], verificationRequests: ['typecheck'] });
       await adapter.provision();
       await adapter.start();
-      await adapter.execute(envelope);
+      await adapter.execute(envelopeFor());
 
       const result = await adapter.collectArtifacts();
       expect(result.status).toBe('completed');
-      expect(result.commits).toEqual([{ sha: 'abc123', message: 'via stub' }]);
       expect(result.verificationRequests).toEqual(['typecheck']);
       expect(result.observations).toEqual(['one observation']);
       expect((await adapter.status()).state).toBe('completed');
+      expect(cli.openTabs()).toBe(0);
     } finally {
       await adapter.destroy();
     }
   });
 
-  it('ignores non-JSON stdout noise and ingests the next valid report line', async () => {
-    const script = stubScript(
-      'herdr-noise.sh',
-      `read -r line\necho 'not a report'\necho '{"status":"failed","failure":"boom"}'`,
-    );
-    const adapter = createHerdrWorker({ command: script });
+  it('fails loudly when the harness does not write a report within the deadline', async () => {
+    const { adapter, cli } = seedAdapter();
     try {
+      await adapter.provision();
       await adapter.start();
-      await adapter.execute(envelope);
-
+      await adapter.execute(envelopeFor());
       const result = await adapter.collectArtifacts();
       expect(result.status).toBe('failed');
-      expect(result.failure).toBe('boom');
-    } finally {
-      await adapter.destroy();
-    }
-  });
-
-  it('fails loudly when the runtime exits without emitting a report', async () => {
-    const script = stubScript('herdr-silent.sh', `read -r line\nexit 3`);
-    const adapter = createHerdrWorker({ command: script });
-    try {
-      await adapter.start();
-      await adapter.execute(envelope);
-
-      const result = await adapter.collectArtifacts();
-      expect(result.status).toBe('failed');
-      expect(result.failure).toContain('without emitting a report');
+      expect(result.failure).toContain('report.json');
       expect((await adapter.status()).state).toBe('failed');
+      expect(cli.openTabs()).toBe(0);
+    } finally {
+      await adapter.destroy();
+    }
+  });
+
+  it('maps a blocked harness to waiting_input, keeps its tab, and resumes on a delivered answer', async () => {
+    const { adapter, cli } = seedAdapter();
+    try {
+      cli.agentState = 'blocked';
+      await adapter.provision();
+      await adapter.start();
+      await adapter.execute(envelopeFor());
+      const waiting = await adapter.collectArtifacts();
+      expect(waiting.status).toBe('waiting_input');
+      expect(waiting.interactions.length).toBeGreaterThan(0);
+
+      cli.agentState = 'idle';
+      cli.onPrompt = () => seedReport(repoPath);
+      await adapter.deliverAnswer({ interactionId: 'i', question: '?', response: 'do it' });
+      const resumed = await adapter.collectArtifacts();
+      expect(resumed.status).toBe('completed');
+      expect(cli.openTabs()).toBe(0);
     } finally {
       await adapter.destroy();
     }
   });
 
   it('drops the previous run when a reused adapter executes again', async () => {
-    const report = (sha: string): WorkerResult => ({
-      status: 'completed',
-      commits: [{ sha, message: sha }],
-      artifacts: [],
-      interactions: [],
-      observations: [],
-      verificationRequests: [],
-      diff: `diff:${sha}`,
-      failure: null,
-    });
-    const script = stubScript(
-      'herdr-reuse.sh',
-      [
-        'read -r line',
-        `echo '${JSON.stringify(report('first'))}'`,
-        'read -r line',
-        'sleep 0.2',
-        `echo '${JSON.stringify(report('second'))}'`,
-      ].join('\n'),
-    );
-    const adapter = createHerdrWorker({ command: script });
+    const { adapter, cli } = seedAdapter();
     try {
+      await adapter.provision();
       await adapter.start();
 
-      await adapter.execute(envelope);
+      // Each run writes its own report when prompted (run-specific markers).
+      let run = 0;
+      cli.onPrompt = () => {
+        run += 1;
+        seedReport(repoPath, { observations: [`run ${run} report`] });
+      };
+      await adapter.execute(envelopeFor());
       const first = await adapter.collectArtifacts();
-      expect(first.commits).toEqual([{ sha: 'first', message: 'first' }]);
-      expect((await adapter.status()).state).toBe('completed');
+      expect(first.status).toBe('completed');
+      expect(first.observations).toEqual(['run 1 report']);
 
-      // The release rule keeps the adapter alive across assignments, so a
-      // second run reuses it. The first run's settled report must not leak.
-      await adapter.execute(envelope);
-      expect((await adapter.status()).state).toBe('running');
+      // A second run must not observe the first run's settled report — it gets
+      // its own (a stale re-collection would carry `run 1` here).
+      await adapter.execute(envelopeFor());
       const second = await adapter.collectArtifacts();
-      expect(second.commits).toEqual([{ sha: 'second', message: 'second' }]);
-      expect(second.diff).toBe('diff:second');
+      expect(second.status).toBe('completed');
+      expect(second.observations).toEqual(['run 2 report']);
+      expect(cli.openTabs()).toBe(0);
     } finally {
       await adapter.destroy();
     }
   });
 
-  it('resolves every concurrent collect with the next report instead of orphaning one', async () => {
-    const script = stubScript(
-      'herdr-waiters.sh',
-      `read -r line\nsleep 0.1\necho '{"status":"completed","commits":[{"sha":"only","message":"m"}],"diff":"d"}'`,
-    );
-    const adapter = createHerdrWorker({ command: script });
+  it('resolves every concurrent collect with the same settled report', async () => {
+    const { adapter, cli } = seedAdapter();
     try {
+      cli.agentState = 'running';
+      cli.onPrompt = (() => {
+        // The first poll after the prompt has no report; a later poll finds it.
+        seedReport(repoPath);
+        cli.onPrompt = null;
+      }) as RecordingHerdrCli['onPrompt'];
+      await adapter.provision();
       await adapter.start();
-      await adapter.execute(envelope);
+      await adapter.execute(envelopeFor());
 
-      const [a, b] = await Promise.all([
-        adapter.collectArtifacts(),
-        adapter.collectArtifacts(),
-      ]);
-      expect(a.commits).toEqual([{ sha: 'only', message: 'm' }]);
-      expect(b.commits).toEqual(a.commits);
+      const [a, b] = await Promise.all([adapter.collectArtifacts(), adapter.collectArtifacts()]);
+      expect(a.status).toBe('completed');
+      expect(b.status).toBe('completed');
     } finally {
       await adapter.destroy();
     }
   });
 });
+

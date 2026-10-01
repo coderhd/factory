@@ -51,6 +51,61 @@ worktrees:
 workers:
   profiles:
     - herdr
+  # E11.1 (#44): the worker runtime. `harness` is the coding agent started in
+  # each Attempt's tab; `workspaceLabel` is the dedicated herdr workspace the
+  # Factory owns (your focused panes/workspaces are never touched).
+  harness: opencode
+  workspaceLabel: factory
+  # Capability → model map (#44): keys are E9.3's generic capability ids
+  # (explorer, generalist, implementer, …), values the concrete opencode
+  # models your deployment runs. Unmapped routed ids fail loud at dispatch.
+  # models:
+  #   implementer: opencode/sonnet
+  #   explorer: opencode/haiku
+# Outbound GitHub configuration (E11.3, #43). Optional: when present, `factory
+# start` composes the GitHub adapter (import issues, open change-set PRs) from
+# this section; absent, the GitHub routes 404 (fail closed). The token is a
+# *reference* to an environment variable — never the token itself — so no
+# secret is ever written to this file or logged; export the variable before
+# starting (the server refuses to start without it).
+# github:
+#   repository: owner/name
+#   token:
+#     env: FACTORY_GITHUB_TOKEN
+#   # apiBaseUrl: https://github.example.com/api/v3   # GitHub Enterprise, optional
+#   # baseBranch: main                                 # PR base branch, optional (default main)
+# Policy/rules configuration (E11.4, #41; ADR 14 §11). Optional: when present,
+# this section is the deployment's policy source of truth and overrides the
+# embedded defaults everywhere (scheduler assignment, the write-time repo.write
+# path gate, every check). Absent, the embedded defaults stay authoritative —
+# fail closed, unchanged. An invalid policy is rejected loudly at load and the
+# server refuses to start; it is never silently degraded to a permissive
+# default. Levels fold Org → Project → WO → Task with monotonic narrowing: a
+# child can never widen a parent, and the deployment-fixed capability ceilings
+# (production.write/secrets.read, production customer-data reads, production
+# deploys) are engine-owned, not configurable in v0.1.
+# policy:
+#   version: v-deploy-1        # your own version string; '<embedded>' is reserved
+#   organization:
+#     capabilities:
+#       repo.write:
+#         - decision: allow
+#           scope: { branchPattern: "wo-*/**", excludePaths: ["infra/**"] }
+#       repo.read:
+#         - decision: allow
+#       secrets.read:
+#         - decision: deny
+#   projects:                    # keyed by the Work Order repository name
+#     client-portal:
+#       capabilities:
+#         repo.write:
+#           - decision: allow
+#             scope: { paths: ["src/**", "docs/**"] }
+# Each rule: `decision: allow|deny|require_human`, optional `scope` (paths /
+# excludePaths globs, branchPattern, env: staging|production, dataClass:
+# synthetic|customer-data), optional `ruleId`. Prefer a separate file:
+# policyFile: ./policy.yaml    # either a policy section OR policyFile, never both
+
 # Production verification (E10.1, #39). Optional: when present, the server
 # composes the real E5 verifier (engine + independent semantic judge) from this
 # section, so a SUCCESS Task is verified and driven to HUMAN_GATE. Absent, the
@@ -62,6 +117,8 @@ workers:
 #     provider: judge-co
 #     model: judge-1
 #     family: judge-family
+#     # E11.2 (#42): the harness kind the judge's fresh pane runs (default opencode).
+#     harness: opencode
 #   prompt:
 #     id: factory-verify
 #     version: "1"

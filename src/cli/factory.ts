@@ -16,12 +16,13 @@ import {
 import type { EvidenceBundle } from '../factory/evidence/bundle';
 import {
   createGitHubAdapter,
+  createGitHubRestTransport,
   type GitHubAdapter,
   type GitHubTransport,
 } from '../factory/github/adapter';
 import { openEventLog, type EventLog } from '../factory/events/log';
 import { createEvidenceReadPort } from '../factory/observatory/observatory';
-import { check, checkDetailed, repoWriteGate } from '../factory/policy/policy';
+import { check, checkDetailed, repoWriteGate, type PolicyDocument } from '../factory/policy/policy';
 import type { DAGProposalPayload } from '../factory/planning/dag';
 import { reconcileAfterRestart } from '../factory/recovery/recovery';
 import type { CircuitConfig } from '../factory/recovery/circuitBreaker';
@@ -33,7 +34,13 @@ import {
 } from '../factory/verification/production';
 import type { SemanticJudge } from '../factory/verification/semantic';
 import type { WorkVerifier } from '../factory/verification/orchestrator';
-import { createHerdrWorker } from '../factory/workers/herdr';
+import {
+  createProcessHerdrCli,
+  createHerdrWorker,
+  createHerdrWorkspaceManager,
+  type HerdrCli,
+} from '../factory/workers/herdr';
+import { createHarnessSemanticJudge } from '../factory/verification/judgeHarness';
 import { createWorkerManager, type SpawnWorker, type WorkerProfile } from '../factory/workers/manager';
 import { createWorktreeManager, taskWorktreeBranch } from '../factory/worktrees/worktree';
 
@@ -159,7 +166,17 @@ function loadConfig(dir: string, io: CliIO): LoadedConfig | null {
     for (const issue of parsed.issues) io.err(`${issue.path || 'factory.yaml'}: ${issue.message}`);
     return null;
   }
-  return { text, runtime: resolveFactoryConfig(parsed.config, { baseDir: dir }) };
+  // E11.4 (#41): resolving a referenced `policyFile:` may fail closed (unread-
+  // able file, invalid document). Same contract as a malformed YAML: one
+  // actionable line, exit 1 — never a boot with a degraded policy.
+  let runtime: FactoryRuntimeConfig;
+  try {
+    runtime = resolveFactoryConfig(parsed.config, { baseDir: dir });
+  } catch (error) {
+    io.err(`${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+  return { text, runtime };
 }
 
 function ensureStorageDirs(runtime: FactoryRuntimeConfig): void {
@@ -185,6 +202,12 @@ function ensureStorageDirs(runtime: FactoryRuntimeConfig): void {
 export function createSchedulerPolicy(deps: {
   store: StateStore;
   events: EventLog;
+  /**
+   * E11.4 (#41): the deployment policy (the loaded `policy:` config). Absent,
+   * the E7 engine falls back to the embedded defaults — byte-identical to the
+   * pre-loader behavior.
+   */
+  policy?: PolicyDocument;
 }): SchedulerPolicy {
   return {
     canAssign: (task, workOrder) =>
@@ -257,6 +280,28 @@ export interface ServerDepsOptions {
     /** Factory base URL used to render the PR body's links. Defaults to `server.url`. */
     factoryBaseUrl?: string;
   };
+  /**
+   * E11.3 (#43) hermetic transport seam for a config-composed adapter. When the
+   * resolved config carries a `github:` section, `buildServerDeps` composes the
+   * adapter from it (env token + REST transport); tests inject a mock here so
+   * nothing ever reaches live GitHub (R6). Ignored when `github` is supplied.
+   */
+  githubTransport?: GitHubTransport;
+  /**
+   * E11.3 (#43) the *effective* bind (`--hostname`/`--port` overrides, E10.4).
+   * When the adapter is composed from config, its E2 `apiBaseUrl` and PR-link
+   * `factoryBaseUrl` resolve from this — not from the YAML `server.*` — so a
+   * server started with overrides advertises the URL it actually serves.
+   * Absent, the effective bind is the resolved `server.hostname`/`port`.
+   */
+  serverBind?: { hostname: string; port: number };
+  /**
+   * E11.1 (#44) hermetic seam for the worker runtime: an in-process fake
+   * `herdr` CLI. When supplied, the production `spawn` composes every worker
+   * adapter against it — no real `herdr`/`opencode` is ever spawned. Ignored
+   * when `spawn` is supplied.
+   */
+  herdrCli?: HerdrCli;
 }
 
 /**
@@ -294,15 +339,19 @@ function resolveDefaultWorkerProfile(runtime: FactoryRuntimeConfig): WorkerProfi
  * Resolve the production `WorkVerifier` for this boot (E10.1, #39). An explicit
  * `verifier` option wins (the injectable test seam). Otherwise, when the
  * resolved config carries a `verification:` section, compose the real E5-backed
- * verifier from it. Composition is fail-closed: a misconfiguration is logged
- * loudly and **no** verifier is wired, so a SUCCESS Task parks rather than being
- * promoted on a half-built verifier. When the section is absent, this returns
- * `undefined` — exactly the pre-#39 behaviour.
+ * verifier from it. The `judge` argument is the `SemanticJudge` implementation
+ * the composition binds (E11.2, #42): production passes the harness-backed
+ * judge when none was injected; tests may inject a hermetic fake judge seam.
+ * Composition is fail-closed: a misconfiguration is logged loudly and **no**
+ * verifier is wired, so a SUCCESS Task parks rather than being promoted on a
+ * half-built verifier. When the section is absent, this returns `undefined` —
+ * exactly the pre-#39 behaviour.
  */
 function resolveVerifier(
   runtime: FactoryRuntimeConfig,
   options: ServerDepsOptions,
   store: StateStore,
+  judge?: SemanticJudge,
 ): WorkVerifier | undefined {
   if (options.verifier) return options.verifier;
   if (!runtime.verification) return undefined;
@@ -311,7 +360,7 @@ function resolveVerifier(
       config: runtime.verification,
       store,
       workingDirectory: runtime.repository.path,
-      ...(options.verification?.judge ? { judge: options.verification.judge } : {}),
+      ...(judge ? { judge } : {}),
       ...(options.verification?.runCommand ? { runCommand: options.verification.runCommand } : {}),
       ...(options.now ? { now: options.now } : {}),
     });
@@ -323,6 +372,96 @@ function resolveVerifier(
   }
 }
 
+/**
+ * The fail-closed token gate (E11.3, #43): when the resolved config carries a
+ * `github:` section, the token's env variable must hold a value at boot, or the
+ * serve path refuses to start. The error names the env var, never any secret.
+ * Returns `null` when the section is absent (nothing to fail closed about).
+ */
+export function githubTokenMissingError(runtime: FactoryRuntimeConfig): string | null {
+  if (!runtime.github) return null;
+  const token = process.env[runtime.github.tokenEnv];
+  if (token !== undefined && token.trim().length > 0) return null;
+  return (
+    `refusing to start: the github: config names token env variable "${runtime.github.tokenEnv}", ` +
+    'which is not set — export it (the token itself is never configured in factory.yaml) or remove the github: section (fails closed)'
+  );
+}
+
+/** The GitHub seam inputs the adapter composition consumes (E11.3, #43). */
+interface GitHubCompositionInputs {
+  transport: GitHubTransport;
+  apiBaseUrl: string;
+  factoryBaseUrl: string;
+  baseBranch: string;
+}
+
+/**
+ * The GitHub seam composition source (E11.3, #43), resolved as an ordered
+ * preference: an explicit `options.github` seam (tests) wins; then a resolved
+ * `github:` config section (token read from the env var it names, REST
+ * transport, base URLs from the effective bind); otherwise `null` — no adapter
+ * is composed and the GitHub routes 404 (fail closed).
+ */
+function resolveGitHubInputs(
+  runtime: FactoryRuntimeConfig,
+  options: ServerDepsOptions,
+): GitHubCompositionInputs | null {
+  const failClosed = (): never => {
+    // Unreachable when `runtime.github` is absent: callers check the section
+    // first, so the token error is always present here.
+    throw new Error(githubTokenMissingError(runtime) ?? 'github adapter is unconfigured');
+  };
+
+  if (options.github) {
+    // Explicit seam (tests): the caller owns apiBaseUrl/factoryBaseUrl defaults
+    // against the resolved server URL; baseBranch stays the worktrees default.
+    return {
+      transport: options.github.transport,
+      apiBaseUrl: options.github.apiBaseUrl ?? runtime.server.url,
+      factoryBaseUrl: options.github.factoryBaseUrl ?? runtime.server.url,
+      baseBranch: runtime.worktrees.baseBranch,
+    };
+  }
+  if (!runtime.github) return null;
+  {
+    const token = process.env[runtime.github.tokenEnv] ?? failClosed();
+    if (token.trim().length === 0) failClosed();
+    const hostname = options.serverBind?.hostname ?? runtime.server.hostname;
+    const port = options.serverBind?.port ?? runtime.server.port;
+    const effectiveUrl = `http://${bindLinkHostname(hostname, runtime.server.hostname)}:${port}`;
+    return {
+      transport:
+        options.githubTransport ??
+        createGitHubRestTransport({
+          token,
+          apiBaseUrl: runtime.github.apiBaseUrl,
+        }),
+      apiBaseUrl: effectiveUrl,
+      factoryBaseUrl: effectiveUrl,
+      baseBranch: runtime.github.baseBranch,
+    };
+  }
+}
+
+function isWildcardHostname(hostname: string): boolean {
+  return hostname === '0.0.0.0' || hostname === '::' || hostname.trim().length === 0;
+}
+
+/**
+ * The hostname that is safe to embed in *outbound* links (E11.3, #43). The
+ * effective bind wins for a concrete host, but a deployment that binds
+ * `0.0.0.0`/`::` (e.g. the container path, `--hostname 0.0.0.0` per compose.yaml)
+ * would advertise `http://0.0.0.0:<port>` in PR bodies — the bind is correct,
+ * the link is unclickable. A wildcard bind therefore falls back to the YAML
+ * `server.hostname` when it is routable, else the loopback; the effective port
+ * is kept (the bound port is what the deployment exposes).
+ */
+function bindLinkHostname(hostname: string, configuredHostname: string): string {
+  if (hostname !== '0.0.0.0' && hostname !== '::') return hostname;
+  return isWildcardHostname(configuredHostname) ? '127.0.0.1' : configuredHostname;
+}
+
 export function buildServerDeps(
   runtime: FactoryRuntimeConfig,
   options: ServerDepsOptions = {},
@@ -330,14 +469,57 @@ export function buildServerDeps(
   // Validate the provisioning profile before opening any resource, so a
   // misconfiguration fails fast without leaving a half-built store behind.
   const defaultProfile = resolveDefaultWorkerProfile(runtime);
+  // E11.3 (#43): resolve the GitHub seam *before* any resource is opened — a
+  // configured `github:` section without its token env var aborts boot (fail
+  // closed) instead of leaving a half-built server behind.
+  const githubInputs = resolveGitHubInputs(runtime, options);
   ensureStorageDirs(runtime);
   const store = openStateStore(runtime.paths.db);
   const events = openEventLog(store.db);
-  const verifier = resolveVerifier(runtime, options, store);
+  // E11.1 (#44)/E11.2 (#42): the herdr CLI runner and the dedicated `factory`
+  // workspace manager are server-scoped, shared by every worker adapter AND the
+  // semantic judge's harness — the environment is ensured once and reused;
+  // harnesses spawn/kill on demand, zero at rest.
+  const herdrCli = options.herdrCli ?? createProcessHerdrCli('herdr');
+  const herdrWorkspace = createHerdrWorkspaceManager(herdrCli, {
+    label: runtime.workers.workspaceLabel ?? 'factory',
+    repoPath: runtime.repository.path,
+  });
+  // E11.2 (#42): the model-calling judge seam. An explicitly injected judge
+  // (tests) wins; otherwise, when a `verification:` section is configured, the
+  // production judge is the harness-backed one — an opencode harness in a fresh
+  // pane, driven over the same shared herdr CLI. A `verification:` section
+  // without a config-composable judge is refused by `createProductionVerifier`
+  // (fail closed, inside `resolveVerifier`).
+  const judge =
+    options.verification?.judge ??
+    (runtime.verification
+      ? createHarnessSemanticJudge({
+          cli: herdrCli,
+          workspace: herdrWorkspace,
+          identity: {
+            provider: runtime.verification.judge.provider,
+            model: runtime.verification.judge.model,
+            ...(runtime.verification.judge.family ? { family: runtime.verification.judge.family } : {}),
+            ...(runtime.verification.judge.version ? { version: runtime.verification.judge.version } : {}),
+          },
+          harness: runtime.verification.judge.harness,
+        })
+      : undefined);
+  const verifier = resolveVerifier(runtime, options, store, judge);
   const workers = createWorkerManager({
     store,
     events,
-    spawn: options.spawn ?? (() => createHerdrWorker()),
+    spawn:
+      options.spawn ??
+      (() =>
+        createHerdrWorker({
+          cli: herdrCli,
+          workspace: herdrWorkspace,
+          harness: runtime.workers.harness ?? 'opencode',
+          models: runtime.workers.models ?? {},
+          repoPath: runtime.repository.path,
+        })),
     ...(options.now ? { now: options.now } : {}),
   });
   const worktrees = createWorktreeManager({
@@ -348,22 +530,26 @@ export function buildServerDeps(
   // One store-backed evidence reader serves both the Observatory projection and
   // E9.7's per-Attempt telemetry (human-leverage layer) — a single read seam.
   const evidence = createEvidenceReadPort(store);
-  // E10.3 (#37): compose the E6 GitHub adapter into the running process when a
-  // transport is supplied. Its client speaks the E2 API (the sole mutation
-  // authority), its policy gate is the real E7 `checkDetailed`, and its evidence
-  // read-back is the durable `evidence_bundles` receipt — the same sources the
-  // server itself uses. Absent a transport, none is built (routes 404).
-  const github = options.github
+  // E10.3 (#37): compose the E6 GitHub adapter into the running process. Its
+  // client speaks the E2 API (the sole mutation authority), its policy gate is
+  // the real E7 `checkDetailed`, and its evidence read-back is the durable
+  // `evidence_bundles` receipt — the same sources the server itself uses.
+  // E11.3 (#43): the inputs come from the resolved `github:` config (env token,
+  // REST transport, effective-bind URLs) when no explicit seam is supplied;
+  // absent both, nothing is built (routes 404).
+  const github = githubInputs
     ? buildGitHubAdapter({
-        transport: options.github.transport,
+        transport: githubInputs.transport,
         client: createFactoryClient({
-          baseUrl: options.github.apiBaseUrl ?? runtime.server.url,
+          baseUrl: githubInputs.apiBaseUrl,
           ...(runtime.server.auth ? { token: runtime.server.auth.token } : {}),
         }),
-        factoryBaseUrl: options.github.factoryBaseUrl ?? runtime.server.url,
+        factoryBaseUrl: githubInputs.factoryBaseUrl,
         store,
         events,
-        baseBranch: runtime.worktrees.baseBranch,
+        // E11.4 (#41): the E6 gates run against the loaded deployment policy.
+        ...(runtime.policy ? { policy: runtime.policy } : {}),
+        baseBranch: githubInputs.baseBranch,
       })
     : undefined;
   // E9.6 boot reconciliation (spec §18.3): walk durable state → event history →
@@ -394,7 +580,13 @@ export function buildServerDeps(
       worktrees,
       repoPath: runtime.repository.path,
       artifacts,
-      policy: createSchedulerPolicy({ store, events }),
+      policy: createSchedulerPolicy({
+        store,
+        events,
+        // E11.4 (#41): the loaded `policy:` config (or referenced file) drives
+        // assignment and the write-time path gate; absent → embedded default.
+        ...(runtime.policy ? { policy: runtime.policy } : {}),
+      }),
       telemetry: { evidence },
       ...(options.now ? { now: options.now } : {}),
       ...(verifier ? { verifier } : {}),
@@ -440,6 +632,12 @@ export function buildGitHubAdapter(input: {
   factoryBaseUrl: string;
   store: StateStore;
   events: EventLog;
+  /**
+   * E11.4 (#41): the loaded deployment policy. When configured, the E6 gates
+   * (`branch.create`/`pr.create`/merge) evaluate against it; absent, they
+   * evaluate against the embedded default.
+   */
+  policy?: PolicyDocument;
   baseBranch?: string;
 }): GitHubAdapter {
   return createGitHubAdapter({
@@ -448,7 +646,11 @@ export function buildGitHubAdapter(input: {
     factoryBaseUrl: input.factoryBaseUrl,
     ...(input.baseBranch ? { baseBranch: input.baseBranch } : {}),
     checkPolicy: (subject, action) =>
-      checkDetailed({ store: input.store, events: input.events }, subject, action),
+      checkDetailed(
+        { store: input.store, events: input.events, ...(input.policy ? { policy: input.policy } : {}) },
+        subject,
+        action,
+      ),
     readEvidence: (id) => input.store.get<EvidenceBundle>('evidence_bundles', id),
   });
 }
@@ -516,6 +718,22 @@ function effectiveBindAuthError(hostname: string, runtime: FactoryRuntimeConfig)
   );
 }
 
+/**
+ * E11.3 (#43): the serve path wraps `buildServerDeps` so a fail-closed abort
+ * (e.g. `github:` configured without its token env var) prints a single
+ * actionable line and exits 1 — the message names the env var, never a secret.
+ */
+function buildServerDepsGuarded(
+  runtime: FactoryRuntimeConfig,
+  options: ServerDepsOptions,
+): { deps: ReturnType<typeof buildServerDeps> } | { error: string } {
+  try {
+    return { deps: buildServerDeps(runtime, options) };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   const dir = resolveDir(args, io);
   const loaded = loadConfig(dir, io);
@@ -531,7 +749,14 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
     return 1;
   }
 
-  const deps = buildServerDeps(loaded.runtime);
+  const depsOrError = buildServerDepsGuarded(loaded.runtime, {
+    serverBind: { hostname, port },
+  });
+  if ('error' in depsOrError) {
+    io.err(depsOrError.error);
+    return 1;
+  }
+  const deps = depsOrError.deps;
   const handle = startFactoryServer(deps, { port, hostname });
   // Actually run the E3 scheduler loop for the life of the server (spec §7.2).
   deps.scheduler?.start();
@@ -567,6 +792,13 @@ async function cmdStart(args: ParsedArgs, io: CliIO): Promise<number> {
   const bindError = effectiveBindAuthError(hostname, loaded.runtime);
   if (bindError) {
     io.err(bindError);
+    return 1;
+  }
+  // E11.3 (#43): same fail-fast for a configured `github:` section whose token
+  // env var is unset — the detached child's error is not visible to the caller.
+  const tokenError = githubTokenMissingError(loaded.runtime);
+  if (tokenError) {
+    io.err(tokenError);
     return 1;
   }
 

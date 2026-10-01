@@ -404,6 +404,9 @@ export function startTask(deps: SchedulerDeps, assignment: AssignmentRecord): Ex
     retrievalEndpoint: null,
     skills: [],
     requiredVerification: workOrder.requiredVerification,
+    // E11.1 (#44): the Attempt's generic routed id; the adapter resolves the
+    // concrete model from `workers.models` at dispatch. The Attempt keeps it.
+    model: assignment.model,
   };
 
   void deps.workers.execute(assignment.workerId, envelope);
@@ -504,6 +507,7 @@ export function dispatchReopenedAttempt(deps: SchedulerDeps, assignment: Assignm
   if (!attemptId) {
     throw new FactoryError('LEASE_NOT_FOUND', `worker ${assignment.workerId} has no lease to dispatch`);
   }
+  const attempt = deps.store.get<Attempt>('attempts', attemptId);
 
   const envelope: ExecutionEnvelope = {
     workOrderId: workOrder.id,
@@ -518,6 +522,8 @@ export function dispatchReopenedAttempt(deps: SchedulerDeps, assignment: Assignm
     retrievalEndpoint: null,
     skills: [],
     requiredVerification: workOrder.requiredVerification,
+    // E11.1 (#44): the re-opened Attempt's generic routed id (same contract).
+    model: attempt?.model ?? null,
   };
 
   void deps.workers.execute(assignment.workerId, envelope);

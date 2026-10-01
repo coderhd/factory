@@ -11,7 +11,7 @@ import {
   type WorkOrderState,
 } from '../domain/workOrder';
 import type { EventLog } from '../events/log';
-import { PolicyBlockedError, type EvidenceReceipt, type GitHubAdapter } from '../github/adapter';
+import { PolicyBlockedError, PrBaseBlockedError, type EvidenceReceipt, type GitHubAdapter } from '../github/adapter';
 import type { EvidenceBundle } from '../evidence/bundle';
 import type { EvidenceReadPort } from '../observatory/observatory';
 import { commitDAG, getActiveDAG, proposeDAG, type DAGProposalPayload } from '../planning/dag';
@@ -653,7 +653,7 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
           const pr: GitHubPullRequestDto = await adapter.openPR(receipt, openOptions);
           return json(pr, 201);
         } catch (error) {
-          if (error instanceof PolicyBlockedError) {
+          if (error instanceof PolicyBlockedError || error instanceof PrBaseBlockedError) {
             return apiError('GITHUB_POLICY_BLOCKED', error.message, 403);
           }
           return apiError(

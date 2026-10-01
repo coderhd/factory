@@ -463,7 +463,7 @@ describe('E9.1 factory.yaml — repository/worktrees/provisioning keys', () => {
     // Declared in `workers.profiles` but not one the runtime supports.
     const unsupported = {
       ...runtime,
-      workers: { profiles: ['herdr', 'ghost'] },
+      workers: { ...runtime.workers, profiles: ['herdr', 'ghost'] },
       scheduler: {
         ...runtime.scheduler,
         provisioning: { ...runtime.scheduler.provisioning, defaultProfile: 'ghost' },

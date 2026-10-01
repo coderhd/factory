@@ -16,6 +16,11 @@
 # factory.yaml carries `server.auth { token, actor }` — a deployment without
 # auth fails at boot, never serves mutating routes unauthenticated. See
 # factory-docs/implementation/control-plane-auth.md.
+#
+# E11.3 (#43): when factory.yaml carries a `github:` section, the deployment
+# must export the token env variable it names (e.g. `FACTORY_GITHUB_TOKEN`,
+# pass with `docker compose run -e FACTORY_GITHUB_TOKEN`) — the serve path
+# refuses to start without it (fail closed); the token is never in this file.
 services:
   factory:
     image: ghcr.io/coderhd/factory:0.1.0
