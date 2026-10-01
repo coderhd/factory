@@ -43,6 +43,23 @@ export interface VerificationDesired {
   checks: VerificationCheckDesired[];
 }
 
+/**
+ * E11.3 (#43) outbound GitHub configuration. The file carries a **reference**
+ * to the token — an environment-variable name — never the token itself, so no
+ * secret is ever persisted or logged (spec §20, §28). The token's value is read
+ * from the environment only at serve time and consumed by the transport.
+ */
+export interface GitHubDesiredConfig {
+  /** `owner/name` the Factory imports issues from and opens change sets on. */
+  repository: string;
+  /** The token as an `{ env: VARIABLE_NAME }` reference; a raw token is refused. */
+  token: { env: string };
+  /** GitHub (Enterprise) REST API base; defaults to the public GitHub REST API. */
+  apiBaseUrl?: string;
+  /** The default base branch a Factory change-set PR targets. Defaults to `main`. */
+  baseBranch?: string;
+}
+
 export interface FactoryDesiredConfig {
   apiVersion: string;
   factoryVersion: string;
@@ -76,6 +93,8 @@ export interface FactoryDesiredConfig {
   workers: { profiles: string[] };
   /** Optional production verification surface (E10.1, #39); absent → fail closed. */
   verification?: VerificationDesired;
+  /** Optional outbound GitHub config (E11.3, #43); absent → no adapter, routes 404. */
+  github?: GitHubDesiredConfig;
   image: { repository: string; tag: string };
   compose: {
     healthcheck: { intervalSeconds: number; timeoutSeconds: number; retries: number };
@@ -98,6 +117,14 @@ export interface FactoryRuntimeConfig {
   workers: { profiles: string[] };
   /** Optional production verification surface, carried through resolution. */
   verification?: VerificationDesired;
+  /**
+   * The resolved GitHub config (E11.3, #43). Only the token's env **name** is
+   * carried — never the token's value — so a persisted runtime file or a log
+   * line can never expose the secret. `apiBaseUrl` is carried as configured;
+   * the transport defaults it to the public GitHub REST API (the literal stays
+   * only in the adapter module).
+   */
+  github?: { repository: string; tokenEnv: string; apiBaseUrl?: string; baseBranch: string };
   image: { repository: string; tag: string; ref: string };
 }
 
@@ -391,6 +418,45 @@ export function parseFactoryConfig(text: string): ConfigParse {
     }
   }
 
+  // E11.3 (#43): the optional outbound `github:` section. Absent is valid (no
+  // adapter is composed and the GitHub routes 404 — fail closed); present, the
+  // token must be an env-var *reference* — a raw token in the file is refused.
+  if (root.github !== undefined) {
+    if (!isPlainObject(root.github)) {
+      issue('github', 'github must be a mapping');
+    } else {
+      const github = root.github;
+      if (
+        !isNonEmptyString(github.repository) ||
+        !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(github.repository.trim())
+      ) {
+        issue('github.repository', 'repository must be "owner/name"');
+      }
+      if (typeof github.token === 'string') {
+        issue(
+          'github.token',
+          'token must be an { env: VARIABLE_NAME } reference — never a raw token in the file',
+        );
+      } else if (!isPlainObject(github.token)) {
+        issue('github.token', 'token must be a mapping with an env reference (e.g. env: GITHUB_TOKEN)');
+      } else if (
+        !isNonEmptyString(github.token.env) ||
+        !/^[A-Za-z_][A-Za-z0-9_]*$/.test(github.token.env)
+      ) {
+        issue('github.token.env', 'token.env must name an environment variable (never the token itself)');
+      }
+      if (
+        github.apiBaseUrl !== undefined &&
+        (!isNonEmptyString(github.apiBaseUrl) || !/^https?:\/\//.test(github.apiBaseUrl))
+      ) {
+        issue('github.apiBaseUrl', 'apiBaseUrl must be an http(s) URL when present');
+      }
+      if (github.baseBranch !== undefined && !isNonEmptyString(github.baseBranch)) {
+        issue('github.baseBranch', 'baseBranch must be a non-empty string when present');
+      }
+    }
+  }
+
   if (!isPlainObject(root.image)) {
     issue('image', 'image is required');
   } else {
@@ -461,6 +527,18 @@ export function resolveFactoryConfig(
           },
         }
       : {}),
+    ...(config.github
+      ? {
+          github: {
+            repository: config.github.repository.trim(),
+            // Only the env var *name* is carried; the value is read from the
+            // environment at serve time and never logged or persisted (#43).
+            tokenEnv: config.github.token.env,
+            apiBaseUrl: config.github.apiBaseUrl,
+            baseBranch: config.github.baseBranch ?? 'main',
+          },
+        }
+      : {}),
     image: {
       repository: config.image.repository,
       tag: config.image.tag,
@@ -507,6 +585,21 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
     'workers:',
     '  profiles:',
     ...config.workers.profiles.map((profile) => `    - ${profile}`),
+    // E11.3 (#43): only the token's env *name* is written — never the token.
+    ...(config.github
+      ? [
+          'github:',
+          `  repository: ${JSON.stringify(config.github.repository)}`,
+          '  token:',
+          `    env: ${JSON.stringify(config.github.token.env)}`,
+          ...(config.github.apiBaseUrl
+            ? [`  apiBaseUrl: ${JSON.stringify(config.github.apiBaseUrl)}`]
+            : []),
+          ...(config.github.baseBranch
+            ? [`  baseBranch: ${JSON.stringify(config.github.baseBranch)}`]
+            : []),
+        ]
+      : []),
     ...(config.verification
       ? [
           'verification:',

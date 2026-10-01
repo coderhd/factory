@@ -51,6 +51,18 @@ worktrees:
 workers:
   profiles:
     - herdr
+# Outbound GitHub configuration (E11.3, #43). Optional: when present, `factory
+# start` composes the GitHub adapter (import issues, open change-set PRs) from
+# this section; absent, the GitHub routes 404 (fail closed). The token is a
+# *reference* to an environment variable — never the token itself — so no
+# secret is ever written to this file or logged; export the variable before
+# starting (the server refuses to start without it).
+# github:
+#   repository: owner/name
+#   token:
+#     env: FACTORY_GITHUB_TOKEN
+#   # apiBaseUrl: https://github.example.com/api/v3   # GitHub Enterprise, optional
+#   # baseBranch: main                                 # PR base branch, optional (default main)
 # Production verification (E10.1, #39). Optional: when present, the server
 # composes the real E5 verifier (engine + independent semantic judge) from this
 # section, so a SUCCESS Task is verified and driven to HUMAN_GATE. Absent, the

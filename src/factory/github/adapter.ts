@@ -443,6 +443,26 @@ export class PolicyBlockedError extends Error {
   }
 }
 
+/**
+ * E11.3 (#43): the PR `base` is policy-gated like the head branch is. A caller
+ * may target only the configured base; anything else is refused before any
+ * GitHub I/O, so a caller cannot point a Factory change set at a branch the
+ * change was never gated against (and the merge gate's base hygiene could
+ * never see).
+ */
+export class PrBaseBlockedError extends Error {
+  constructor(
+    readonly requested: string,
+    readonly configured: string,
+  ) {
+    super(
+      `pr.create blocked: caller-requested base "${requested}" is outside policy; ` +
+        `the Factory change set must target the configured base "${configured}"`,
+    );
+    this.name = 'PrBaseBlockedError';
+  }
+}
+
 /** The Evidence Bundle receipt + model provenance the merge gate consumes. */
 export type MergeEvidence = Pick<
   EvidenceBundle,
@@ -658,6 +678,12 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
     const repository = requireRepository(workOrder);
     // E7 §8-1: opening a PR is a `pr.create` check before any GitHub I/O.
     requirePolicy('pr.create', workOrder.id, { branch: branchName(workOrder) });
+    // E11.3 (#43): the caller-chosen *base* is policy-gated too — only the
+    // configured base may be targeted (the default base always passes).
+    const base = openOptions.baseBranch ?? baseBranch;
+    if (openOptions.baseBranch !== undefined && openOptions.baseBranch !== baseBranch) {
+      throw new PrBaseBlockedError(openOptions.baseBranch, baseBranch);
+    }
 
     return transport.createPullRequest({
       repository,
@@ -668,7 +694,7 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
         factoryBaseUrl,
       }),
       head: branchName(workOrder),
-      base: openOptions.baseBranch ?? baseBranch,
+      base,
     });
   }
 

@@ -16,6 +16,7 @@ import {
 import type { EvidenceBundle } from '../factory/evidence/bundle';
 import {
   createGitHubAdapter,
+  createGitHubRestTransport,
   type GitHubAdapter,
   type GitHubTransport,
 } from '../factory/github/adapter';
@@ -257,6 +258,21 @@ export interface ServerDepsOptions {
     /** Factory base URL used to render the PR body's links. Defaults to `server.url`. */
     factoryBaseUrl?: string;
   };
+  /**
+   * E11.3 (#43) hermetic transport seam for a config-composed adapter. When the
+   * resolved config carries a `github:` section, `buildServerDeps` composes the
+   * adapter from it (env token + REST transport); tests inject a mock here so
+   * nothing ever reaches live GitHub (R6). Ignored when `github` is supplied.
+   */
+  githubTransport?: GitHubTransport;
+  /**
+   * E11.3 (#43) the *effective* bind (`--hostname`/`--port` overrides, E10.4).
+   * When the adapter is composed from config, its E2 `apiBaseUrl` and PR-link
+   * `factoryBaseUrl` resolve from this — not from the YAML `server.*` — so a
+   * server started with overrides advertises the URL it actually serves.
+   * Absent, the effective bind is the resolved `server.hostname`/`port`.
+   */
+  serverBind?: { hostname: string; port: number };
 }
 
 /**
@@ -323,6 +339,78 @@ function resolveVerifier(
   }
 }
 
+/**
+ * The fail-closed token gate (E11.3, #43): when the resolved config carries a
+ * `github:` section, the token's env variable must hold a value at boot, or the
+ * serve path refuses to start. The error names the env var, never any secret.
+ * Returns `null` when the section is absent (nothing to fail closed about).
+ */
+export function githubTokenMissingError(runtime: FactoryRuntimeConfig): string | null {
+  if (!runtime.github) return null;
+  const token = process.env[runtime.github.tokenEnv];
+  if (token !== undefined && token.trim().length > 0) return null;
+  return (
+    `refusing to start: the github: config names token env variable "${runtime.github.tokenEnv}", ` +
+    'which is not set — export it (the token itself is never configured in factory.yaml) or remove the github: section (fails closed)'
+  );
+}
+
+/** The GitHub seam inputs the adapter composition consumes (E11.3, #43). */
+interface GitHubCompositionInputs {
+  transport: GitHubTransport;
+  apiBaseUrl: string;
+  factoryBaseUrl: string;
+  baseBranch: string;
+}
+
+/**
+ * The GitHub seam composition source (E11.3, #43), resolved as an ordered
+ * preference: an explicit `options.github` seam (tests) wins; then a resolved
+ * `github:` config section (token read from the env var it names, REST
+ * transport, base URLs from the effective bind); otherwise `null` — no adapter
+ * is composed and the GitHub routes 404 (fail closed).
+ */
+function resolveGitHubInputs(
+  runtime: FactoryRuntimeConfig,
+  options: ServerDepsOptions,
+): GitHubCompositionInputs | null {
+  const failClosed = (): never => {
+    const error = githubTokenMissingError(runtime);
+    if (error) throw new Error(error);
+    throw new Error('github adapter is unconfigured');
+  };
+
+  if (options.github) {
+    // Explicit seam (tests): the caller owns apiBaseUrl/factoryBaseUrl defaults
+    // against the resolved server URL; baseBranch stays the worktrees default.
+    return {
+      transport: options.github.transport,
+      apiBaseUrl: options.github.apiBaseUrl ?? runtime.server.url,
+      factoryBaseUrl: options.github.factoryBaseUrl ?? runtime.server.url,
+      baseBranch: runtime.worktrees.baseBranch,
+    };
+  }
+  if (!runtime.github) return null;
+  {
+    const token = process.env[runtime.github.tokenEnv] ?? failClosed();
+    if (token.trim().length === 0) failClosed();
+    const hostname = options.serverBind?.hostname ?? runtime.server.hostname;
+    const port = options.serverBind?.port ?? runtime.server.port;
+    const effectiveUrl = `http://${hostname}:${port}`;
+    return {
+      transport:
+        options.githubTransport ??
+        createGitHubRestTransport({
+          token,
+          apiBaseUrl: runtime.github.apiBaseUrl,
+        }),
+      apiBaseUrl: effectiveUrl,
+      factoryBaseUrl: effectiveUrl,
+      baseBranch: runtime.github.baseBranch,
+    };
+  }
+}
+
 export function buildServerDeps(
   runtime: FactoryRuntimeConfig,
   options: ServerDepsOptions = {},
@@ -330,6 +418,10 @@ export function buildServerDeps(
   // Validate the provisioning profile before opening any resource, so a
   // misconfiguration fails fast without leaving a half-built store behind.
   const defaultProfile = resolveDefaultWorkerProfile(runtime);
+  // E11.3 (#43): resolve the GitHub seam *before* any resource is opened — a
+  // configured `github:` section without its token env var aborts boot (fail
+  // closed) instead of leaving a half-built server behind.
+  const githubInputs = resolveGitHubInputs(runtime, options);
   ensureStorageDirs(runtime);
   const store = openStateStore(runtime.paths.db);
   const events = openEventLog(store.db);
@@ -348,22 +440,24 @@ export function buildServerDeps(
   // One store-backed evidence reader serves both the Observatory projection and
   // E9.7's per-Attempt telemetry (human-leverage layer) — a single read seam.
   const evidence = createEvidenceReadPort(store);
-  // E10.3 (#37): compose the E6 GitHub adapter into the running process when a
-  // transport is supplied. Its client speaks the E2 API (the sole mutation
-  // authority), its policy gate is the real E7 `checkDetailed`, and its evidence
-  // read-back is the durable `evidence_bundles` receipt — the same sources the
-  // server itself uses. Absent a transport, none is built (routes 404).
-  const github = options.github
+  // E10.3 (#37): compose the E6 GitHub adapter into the running process. Its
+  // client speaks the E2 API (the sole mutation authority), its policy gate is
+  // the real E7 `checkDetailed`, and its evidence read-back is the durable
+  // `evidence_bundles` receipt — the same sources the server itself uses.
+  // E11.3 (#43): the inputs come from the resolved `github:` config (env token,
+  // REST transport, effective-bind URLs) when no explicit seam is supplied;
+  // absent both, nothing is built (routes 404).
+  const github = githubInputs
     ? buildGitHubAdapter({
-        transport: options.github.transport,
+        transport: githubInputs.transport,
         client: createFactoryClient({
-          baseUrl: options.github.apiBaseUrl ?? runtime.server.url,
+          baseUrl: githubInputs.apiBaseUrl,
           ...(runtime.server.auth ? { token: runtime.server.auth.token } : {}),
         }),
-        factoryBaseUrl: options.github.factoryBaseUrl ?? runtime.server.url,
+        factoryBaseUrl: githubInputs.factoryBaseUrl,
         store,
         events,
-        baseBranch: runtime.worktrees.baseBranch,
+        baseBranch: githubInputs.baseBranch,
       })
     : undefined;
   // E9.6 boot reconciliation (spec §18.3): walk durable state → event history →
@@ -516,6 +610,22 @@ function effectiveBindAuthError(hostname: string, runtime: FactoryRuntimeConfig)
   );
 }
 
+/**
+ * E11.3 (#43): the serve path wraps `buildServerDeps` so a fail-closed abort
+ * (e.g. `github:` configured without its token env var) prints a single
+ * actionable line and exits 1 — the message names the env var, never a secret.
+ */
+function buildServerDepsGuarded(
+  runtime: FactoryRuntimeConfig,
+  options: ServerDepsOptions,
+): { deps: ReturnType<typeof buildServerDeps> } | { error: string } {
+  try {
+    return { deps: buildServerDeps(runtime, options) };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   const dir = resolveDir(args, io);
   const loaded = loadConfig(dir, io);
@@ -531,7 +641,14 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
     return 1;
   }
 
-  const deps = buildServerDeps(loaded.runtime);
+  const depsOrError = buildServerDepsGuarded(loaded.runtime, {
+    serverBind: { hostname, port },
+  });
+  if ('error' in depsOrError) {
+    io.err(depsOrError.error);
+    return 1;
+  }
+  const deps = depsOrError.deps;
   const handle = startFactoryServer(deps, { port, hostname });
   // Actually run the E3 scheduler loop for the life of the server (spec §7.2).
   deps.scheduler?.start();
@@ -567,6 +684,13 @@ async function cmdStart(args: ParsedArgs, io: CliIO): Promise<number> {
   const bindError = effectiveBindAuthError(hostname, loaded.runtime);
   if (bindError) {
     io.err(bindError);
+    return 1;
+  }
+  // E11.3 (#43): same fail-fast for a configured `github:` section whose token
+  // env var is unset — the detached child's error is not visible to the caller.
+  const tokenError = githubTokenMissingError(loaded.runtime);
+  if (tokenError) {
+    io.err(tokenError);
     return 1;
   }
 
