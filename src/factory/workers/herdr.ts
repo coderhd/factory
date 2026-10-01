@@ -133,6 +133,11 @@ export interface HerdrCliOutput {
 /** The `herdr` CLI seam (RG6): every adapter command goes through it. */
 export interface HerdrCli {
   run(args: readonly string[]): Promise<HerdrCliOutput>;
+  /**
+   * Raw stdout for text-output commands (`agent read` prints terminal text, not
+   * JSON). Optional: a fake without it falls back to `run` + a `.text` field.
+   */
+  runText?(args: readonly string[]): Promise<string>;
 }
 
 /** The payload of a herdr document — `.result` when present, else the doc. */
@@ -140,11 +145,42 @@ function resultOf(doc: HerdrCliOutput): unknown {
   return doc && typeof doc === 'object' && 'result' in doc ? doc.result : doc;
 }
 
-/** Read a string field out of a parsed herdr payload. */
-function field(payload: unknown, key: string): string {
-  if (payload && typeof payload === 'object' && typeof (payload as Record<string, unknown>)[key] === 'string') {
-    return (payload as Record<string, unknown>)[key] as string;
+/** True for a non-null, non-array object. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * The list under `key` of a herdr payload. Real herdr wraps lists as
+ * `{ result: { type, <key>: [...] } }` (e.g. `workspaces`, `tabs`); the bare
+ * array is accepted for the legacy/test shape.
+ */
+function arrayOf(payload: unknown, key: string): unknown[] {
+  if (Array.isArray(payload)) return payload;
+  if (isPlainObject(payload) && Array.isArray(payload[key])) return payload[key] as unknown[];
+  return [];
+}
+
+/** The first non-empty string among `keys` on an object, else null. */
+function stringField(entry: unknown, ...keys: string[]): string | null {
+  if (!isPlainObject(entry)) return null;
+  for (const key of keys) {
+    const value = entry[key];
+    if (typeof value === 'string' && value.length > 0) return value;
   }
+  return null;
+}
+
+/**
+ * Resolve a reference id from a herdr create payload. Real herdr nests the
+ * created object (`{ result: { workspace: { workspace_id }, tab: { tab_id },
+ * root_pane: { pane_id } } }`); a bare string is accepted for the legacy shape.
+ */
+function refId(payload: unknown, key: string, idKey: string): string {
+  const value = isPlainObject(payload) ? payload[key] : undefined;
+  if (typeof value === 'string' && value.length > 0) return value;
+  const id = stringField(value, idKey, 'id');
+  if (id) return id;
   throw new Error(`herdr payload is missing "${key}"`);
 }
 
@@ -188,7 +224,28 @@ export function createProcessHerdrCli(command = 'herdr'): HerdrCli {
         },
       );
     });
-  return { run };
+
+  const runText = (args: readonly string[]): Promise<string> =>
+    new Promise((resolve, reject) => {
+      execFile(
+        command,
+        [...args],
+        { encoding: 'utf8' },
+        (error: (Error & { code?: number | string }) | null, stdout: string | Buffer, stderr: string | Buffer) => {
+          if (error) {
+            reject(
+              new Error(
+                `herdr ${argvPreview(args)} failed (exit ${error.code ?? 'unknown'}): ${String(stderr).trim() || error.message}`,
+              ),
+            );
+            return;
+          }
+          resolve(String(stdout));
+        },
+      );
+    });
+
+  return { run, runText };
 }
 
 // ---------------------------------------------------------------------------
@@ -228,17 +285,11 @@ export function createHerdrWorkspaceManager(cli: HerdrCli, options: HerdrWorkspa
   const sweepPreviousLifeTabs = async (workspaceId: string): Promise<void> => {
     try {
       const listing = resultOf(await cli.run(['tab', 'list', '--workspace', workspaceId]));
-      const entries = Array.isArray(listing) ? listing : [];
+      const entries = arrayOf(listing, 'tabs');
       for (const entry of entries) {
-        if (!entry || typeof entry !== 'object') continue;
-        const label = (entry as Record<string, unknown>).label;
-        const id = (entry as Record<string, unknown>).id;
-        if (
-          typeof id === 'string' &&
-          id.length > 0 &&
-          typeof label === 'string' &&
-          label.startsWith('factory-')
-        ) {
+        const label = stringField(entry, 'label');
+        const id = stringField(entry, 'tab_id', 'id');
+        if (id && label && label.startsWith('factory-')) {
           try {
             await cli.run(['tab', 'close', id]);
           } catch {
@@ -261,12 +312,14 @@ export function createHerdrWorkspaceManager(cli: HerdrCli, options: HerdrWorkspa
       if (!ensured) {
         const attempt = (async () => {
           const listing = resultOf(await cli.run(['workspace', 'list']));
-          const entries = Array.isArray(listing) ? listing : [];
+          const entries = arrayOf(listing, 'workspaces');
           for (const entry of entries) {
-            if (entry && typeof entry === 'object' && (entry as Record<string, unknown>).label === options.label) {
-              const workspace = field(entry, 'id');
-              await sweepPreviousLifeTabs(workspace);
-              return { workspace, rootPane: '' };
+            if (stringField(entry, 'label') === options.label) {
+              const workspace = stringField(entry, 'workspace_id', 'id');
+              if (workspace) {
+                await sweepPreviousLifeTabs(workspace);
+                return { workspace, rootPane: '' };
+              }
             }
           }
           const created = resultOf(
@@ -280,7 +333,7 @@ export function createHerdrWorkspaceManager(cli: HerdrCli, options: HerdrWorkspa
               '--no-focus',
             ]),
           );
-          return { workspace: field(created, 'workspace'), rootPane: field(created, 'root_pane') };
+          return { workspace: refId(created, 'workspace', 'workspace_id'), rootPane: refId(created, 'root_pane', 'pane_id') };
         })();
         const guard = attempt.catch((error: unknown) => {
           if (ensured === guard) ensured = null;
@@ -609,7 +662,9 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
       // keep polling to the deadline; the next probe usually succeeds.
       let state: string | null = null;
       try {
-        state = field(resultOf(await cli.run(['agent', 'get', runState.agentName])), 'state');
+        const agentDoc = resultOf(await cli.run(['agent', 'get', runState.agentName]));
+        const agent = isPlainObject(agentDoc) && isPlainObject(agentDoc.agent) ? agentDoc.agent : agentDoc;
+        state = stringField(agent, 'agent_status', 'state');
       } catch {
         if (Date.now() >= deadline) {
           await releaseRun();
@@ -625,21 +680,14 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
       if (state === 'blocked') {
         // The approval/question UI is up. Read the recent pane text as the live
         // question; the tap into the harness stays open for `deliverAnswer`.
-        const readOutput = resultOf(
-          await cli.run([
-            'agent',
-            'read',
-            runState.agentName,
-            '--source',
-            'recent-unwrapped',
-            '--lines',
-            '50',
-          ]),
-        );
+        const readArgs = ['agent', 'read', runState.agentName, '--source', 'recent-unwrapped', '--lines', '50'];
+        const readOutput = cli.runText ? await cli.runText(readArgs) : resultOf(await cli.run(readArgs));
         const text =
-          readOutput && typeof readOutput === 'object' && isNonEmptyString((readOutput as Record<string, unknown>).text)
-            ? (readOutput as Record<string, unknown>).text as string
-            : 'the harness is blocked and its pane text could not be read';
+          typeof readOutput === 'string' && readOutput.trim().length > 0
+            ? readOutput
+            : isPlainObject(readOutput) && isNonEmptyString(readOutput.text)
+              ? (readOutput.text as string)
+              : 'the harness is blocked and its pane text could not be read';
         heartbeat();
         settle({
           status: 'waiting_input',
@@ -730,8 +778,8 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
         // Register the live run immediately after the tab exists, so a later
         // failure (e.g. missing `root_pane` in a malformed create payload)
         // tears the pane down in `releaseRun` instead of leaking the tab.
-        const tabId = field(tabResult, 'tab');
-        const rootPane = field(tabResult, 'root_pane');
+        const tabId = refId(tabResult, 'tab', 'tab_id');
+        const rootPane = refId(tabResult, 'root_pane', 'pane_id');
         runState = { envelope, agentName: `factory-${envelope.attemptId}`, tab: tabId };
         run = runState;
         const agentArgs = [

@@ -53,9 +53,11 @@ workers:
     - herdr
   # E11.1 (#44): the worker runtime. `harness` is the coding agent started in
   # each Attempt's tab; `workspaceLabel` is the dedicated herdr workspace the
-  # Factory owns (your focused panes/workspaces are never touched).
+  # Factory owns (your focused panes/workspaces are never touched). Keep this
+  # label unique — a label that matches an existing workspace (e.g. your own
+  # session) would make the Factory reuse it.
   harness: opencode
-  workspaceLabel: factory
+  workspaceLabel: factory-workers
   # Capability → model map (#44): keys are E9.3's generic capability ids
   # (explorer, generalist, implementer, …), values the concrete opencode
   # models your deployment runs. Unmapped routed ids fail loud at dispatch.
