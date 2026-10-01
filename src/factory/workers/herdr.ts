@@ -18,7 +18,7 @@ import { join } from 'node:path';
  *     human answer is delivered back via `agent prompt` and the task converges;
  *   - when a run settles, the tab is closed — zero harnesses at rest.
  *
- * Every my-herdr invocation goes through the injectable {@link HerdrCli} seam
+ * Every herdr invocation goes through the injectable {@link HerdrCli} seam
  * (Ruling R5/RG6): tests inject an in-process fake and never spawn a real
  * `herdr` or `opencode`. The `WorkerAdapter`/`WorkerResult` contracts are
  * unchanged — only the runtime underneath them is new.
@@ -611,6 +611,9 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
           ]),
         );
         runState = { envelope, agentName: `factory-${envelope.attemptId}`, tab: field(tabResult, 'tab') };
+        // Register the live run immediately after the tab exists, so a later
+        // failure (e.g. agent start) tears the pane down in `releaseRun`.
+        run = runState;
         const agentArgs = [
           'agent',
           'start',
@@ -623,7 +626,6 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
         ];
         if (concrete) agentArgs.push('--model', concrete);
         await cli.run(agentArgs);
-        run = runState;
         polling = true;
         await turn(runState, renderTaskPrompt(envelope));
       } catch (error) {
@@ -652,10 +654,12 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
       result = null;
       heartbeat();
       polling = true;
+      let answerError: unknown = null;
       try {
         await turn(run, answer.response);
-      } catch {
-        // Fall through: surface the failure rather than leave the task wedged.
+      } catch (error) {
+        // Surface the underlying cause rather than leave the task wedged.
+        answerError = error;
       } finally {
         polling = false;
       }
@@ -663,7 +667,15 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
       if (settled === null) {
         await releaseRun();
         heartbeat();
-        settle(emptyResult('harness did not resume after the delivered answer'));
+        settle(
+          emptyResult(
+            answerError !== null
+              ? `harness did not resume after the delivered answer: ${
+                  answerError instanceof Error ? answerError.message : String(answerError)
+                }`
+              : 'harness did not resume after the delivered answer',
+          ),
+        );
       } else if (settled.status !== 'waiting_input') {
         // Terminal after the answer: converge — kill the harness.
         await releaseRun();

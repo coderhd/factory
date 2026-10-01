@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -510,7 +510,6 @@ class FakeHerdrCli implements HerdrCli {
   onPrompt: ((prompt: string, cwd: string) => void) | null = null;
   /** Extra text a `--wait` prompt reports back; drives nothing but gets recorded. */
   onAnswer = true;
-  onCreateTabHook: ((cwd: string) => void) | null = null;
 
   callsMatching(prefix: string): string[][] {
     return this.calls.filter((args) => args[0] === prefix);
@@ -547,7 +546,6 @@ class FakeHerdrCli implements HerdrCli {
       if (!ws) throw new Error(`no such workspace: ${wsId}`);
       const cwd = value('cwd');
       if (!existsSync(cwd)) throw new Error(`cwd does not exist: ${cwd}`);
-      this.onCreateTabHook?.(cwd);
       const tab: FakeTab = {
         id: `tab_${ws.tabs.length}`,
         pane: `pane_${ws.tabs.length}`,
