@@ -8,6 +8,7 @@ import { buildServerDeps, type ServerDepsOptions } from '../../src/cli/factory';
 import {
   createHerdrWorker,
   createHerdrWorkspaceManager,
+  createProcessHerdrCli,
   renderTaskPrompt,
   type ExecutionEnvelope,
   type HerdrCli,
@@ -53,6 +54,13 @@ let repoPath: string;
 
 function git(args: string[], cwd: string): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+}
+
+/** Write a tiny executable stub command and return its path (R5-permitted). */
+function stubScript(name: string, body: string): string {
+  const scriptPath = join(workDir, name);
+  writeFileSync(scriptPath, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  return scriptPath;
 }
 
 function initRepo(root: string): string {
@@ -749,7 +757,7 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
 
     const resumed = await adapter.collectArtifacts();
     expect(resumed.status).toBe('completed');
-    expect(resumed.observations).toEqual(['answered']);
+    expect(resumed.observations).toContain('answered');
     expect(cli.openTabs()).toHaveLength(0); // converged → harness killed
     expect((await adapter.status()).state).toBe('completed');
   });
@@ -809,5 +817,108 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
     expect(prompt).toContain('bun test');
     expect(prompt).toContain(TEST_ENVELOPE.initialContext);
     expect(prompt).toContain('commit');
+  });
+
+  it('does not re-settle a stale report across turns: an answered turn that blocks again surfaces the live blocked state', async () => {
+    const cli = new FakeHerdrCli();
+    // Turn 1 converges via the report file itself (a report-based
+    // waiting_input — the file, not the pane state, is the settled question).
+    let prompts = 0;
+    cli.agentState = 'running';
+    cli.onPrompt = () => {
+      prompts += 1;
+      if (prompts === 1) writeReport(repoPath, {
+        status: 'waiting_input',
+        interactions: [{ question: 'STALE QUESTION from report.json' }],
+      });
+      // Turn 2's harness blocks again and does NOT rewrite the report.
+    };
+    const adapter = makeAdapter(cli);
+    await adapter.provision();
+    await adapter.start();
+    await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath });
+    const first = await adapter.collectArtifacts();
+    expect(first.status).toBe('waiting_input');
+    expect(first.interactions[0]!.question).toContain('STALE QUESTION');
+
+    // Turn 2: the harness blocks without rewriting the report; the adapter
+    // must surface the live blocked state (agent read), never the stale file.
+    cli.agentState = 'blocked';
+    await adapter.deliverAnswer({ interactionId: 'i', question: 'STALE', response: 'answer 1' });
+    const second = await adapter.collectArtifacts();
+    expect(second.status).toBe('waiting_input');
+    expect(second.interactions[0]!.question).toContain('ambiguous'); // agent-read text
+    expect(second.interactions[0]!.question).not.toContain('STALE QUESTION');
+  });
+
+  it('clears a rejected workspace ensure so provisioning retries (transient herdr outage)', async () => {
+    const underlying = new FakeHerdrCli();
+    // First workspace list transiently fails (socket not yet up).
+    const realList = underlying.run.bind(underlying);
+    let lists = 0;
+    underlying.run = async (args: readonly string[]): Promise<HerdrDoc> => {
+      if (args[0] === 'workspace' && args[1] === 'list') {
+        lists += 1;
+        if (lists === 1) throw new Error('herdr socket not ready');
+      }
+      return realList(args);
+    };
+
+    const workspace = createHerdrWorkspaceManager(underlying, { label: 'factory', repoPath });
+    let firstError: unknown;
+    try {
+      await workspace.ensure();
+    } catch (error) {
+      firstError = error;
+    }
+    expect((firstError as Error).message).toContain('socket not ready');
+
+    await workspace.ensure(); // retries — not poisoned by the cached rejection
+    await workspace.ensure(); // memoized success
+    expect(lists).toBe(2);
+    expect(
+      underlying.calls.filter((argv) => argv.join(' ').startsWith('workspace create')),
+    ).toHaveLength(1);
+  });
+
+  it('surfaces a git evidence read failure as an observation instead of silently empty evidence', async () => {
+    const cli = new FakeHerdrCli();
+    cli.onPrompt = () => {
+      writeReport(repoPath, { status: 'completed', observations: ['work done'] });
+    };
+    const adapter = makeAdapter(cli);
+    await adapter.provision();
+    await adapter.start();
+    await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath, baseCommit: 'does-not-exist' });
+    const result = await adapter.collectArtifacts();
+    expect(result.status).toBe('completed');
+    expect(result.observations).toContain('work done');
+    expect(result.observations.some((entry) => entry.includes('git evidence read failed'))).toBe(true);
+  });
+
+  it('createProcessHerdrCli: parses JSON, and fails loud on a non-zero exit and on non-JSON output', async () => {
+    const herdr = createProcessHerdrCli(
+      stubScript('herdr-cli-good.sh', 'echo \'{"result":{"state":"idle"}}\''),
+    );
+    expect((await herdr.run(['agent', 'get', 'x'])).result).toEqual({ state: 'idle' });
+
+    const failing = createProcessHerdrCli(stubScript('herdr-cli-exit.sh', 'echo "boom" >&2\nexit 3'));
+    let exitError: unknown;
+    try {
+      await failing.run(['agent', 'get', 'x']);
+    } catch (error) {
+      exitError = error;
+    }
+    expect((exitError as Error).message).toContain('exit 3');
+    expect((exitError as Error).message).toContain('boom');
+
+    const noisy = createProcessHerdrCli(stubScript('herdr-cli-noise.sh', 'echo "not json"'));
+    let noiseError: unknown;
+    try {
+      await noisy.run(['agent', 'get', 'x']);
+    } catch (error) {
+      noiseError = error;
+    }
+    expect((noiseError as Error).message).toContain('non-JSON');
   });
 });

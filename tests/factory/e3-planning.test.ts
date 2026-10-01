@@ -1394,9 +1394,11 @@ describe('E3 real Herdr same-tick provision→assign→execute', () => {
       // The worktree the assignment names must exist for the harness cwd.
       const worktreePath = join(worktreeRoot, taskId);
       mkdirSync(worktreePath, { recursive: true });
-      seedReport(worktreePath);
 
       const cli = new RecordingHerdrCli();
+      // The "harness" writes its own run-specific report when prompted (the
+      // file must be produced by this turn, not seeded beforehand).
+      cli.onPrompt = () => seedReport(worktreePath, { observations: ['run report from prompt'] });
       const workers = createWorkerManager({
         store,
         events,
@@ -1436,6 +1438,7 @@ describe('E3 real Herdr same-tick provision→assign→execute', () => {
       const result = await workers.collectArtifacts(worker.id);
       expect(result.status).toBe('completed');
       expect(result.failure).toBeNull();
+      expect(result.observations).toContain('run report from prompt');
       // The tab was created for this Attempt's worktree — and closed after.
       expect([...cli.tabs.values()].filter((tab) => tab.cwd === worktreePath)).toHaveLength(1);
       expect(cli.openTabs()).toBe(0);
@@ -1479,7 +1482,10 @@ describe('E3 Herdr adapter lifecycle', () => {
   it('collects the completed WorkerResult from the report file and closes the tab', async () => {
     const { adapter, cli } = seedAdapter();
     try {
-      seedReport(repoPath, { observations: ['one observation'], verificationRequests: ['typecheck'] });
+      // The harness writes the report during its turn (after the adapter's
+      // per-turn reset), so the collected report is this turn's own.
+      cli.onPrompt = () =>
+        seedReport(repoPath, { observations: ['one observation'], verificationRequests: ['typecheck'] });
       await adapter.provision();
       await adapter.start();
       await adapter.execute(envelopeFor());
@@ -1536,20 +1542,26 @@ describe('E3 Herdr adapter lifecycle', () => {
   it('drops the previous run when a reused adapter executes again', async () => {
     const { adapter, cli } = seedAdapter();
     try {
-      seedReport(repoPath);
       await adapter.provision();
       await adapter.start();
 
+      // Each run writes its own report when prompted (run-specific markers).
+      let run = 0;
+      cli.onPrompt = () => {
+        run += 1;
+        seedReport(repoPath, { observations: [`run ${run} report`] });
+      };
       await adapter.execute(envelopeFor());
       const first = await adapter.collectArtifacts();
       expect(first.status).toBe('completed');
-      expect((await adapter.status()).state).toBe('completed');
+      expect(first.observations).toEqual(['run 1 report']);
 
-      // A second run must not observe the first run's settled report and must
-      // end with the tab closed again.
+      // A second run must not observe the first run's settled report — it gets
+      // its own (a stale re-collection would carry `run 1` here).
       await adapter.execute(envelopeFor());
       const second = await adapter.collectArtifacts();
       expect(second.status).toBe('completed');
+      expect(second.observations).toEqual(['run 2 report']);
       expect(cli.openTabs()).toBe(0);
     } finally {
       await adapter.destroy();

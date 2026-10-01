@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { rm as rmFile } from 'node:fs/promises';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -205,27 +206,39 @@ export function createHerdrWorkspaceManager(cli: HerdrCli, options: HerdrWorkspa
   let ensured: Promise<{ workspace: string; rootPane: string }> | null = null;
   return {
     ensure(): Promise<{ workspace: string; rootPane: string }> {
-      ensured ??= (async () => {
-        const listing = resultOf(await cli.run(['workspace', 'list']));
-        const entries = Array.isArray(listing) ? listing : [];
-        for (const entry of entries) {
-          if (entry && typeof entry === 'object' && (entry as Record<string, unknown>).label === options.label) {
-            return { workspace: field(entry, 'id'), rootPane: '' };
+      // A rejected ensure must not be memoized forever: one transient failure
+      // (e.g. herdr's socket not yet up) would poison every later provision
+      // until restart. Reject → drop the memo so the next provision retries
+      // (recovery stays bounded). The drop is checked against this call's own
+      // guard promise, so a concurrent successful ensure is never cleared.
+      if (!ensured) {
+        const attempt = (async () => {
+          const listing = resultOf(await cli.run(['workspace', 'list']));
+          const entries = Array.isArray(listing) ? listing : [];
+          for (const entry of entries) {
+            if (entry && typeof entry === 'object' && (entry as Record<string, unknown>).label === options.label) {
+              return { workspace: field(entry, 'id'), rootPane: '' };
+            }
           }
-        }
-        const created = resultOf(
-          await cli.run([
-            'workspace',
-            'create',
-            '--label',
-            options.label,
-            '--cwd',
-            options.repoPath,
-            '--no-focus',
-          ]),
-        );
-        return { workspace: field(created, 'workspace'), rootPane: field(created, 'root_pane') };
-      })();
+          const created = resultOf(
+            await cli.run([
+              'workspace',
+              'create',
+              '--label',
+              options.label,
+              '--cwd',
+              options.repoPath,
+              '--no-focus',
+            ]),
+          );
+          return { workspace: field(created, 'workspace'), rootPane: field(created, 'root_pane') };
+        })();
+        const guard = attempt.catch((error: unknown) => {
+          if (ensured === guard) ensured = null;
+          throw error;
+        });
+        ensured = guard;
+      }
       return ensured;
     },
   };
@@ -317,15 +330,21 @@ function parseHarnessReport(text: string): HarnessReport | null {
 
 const REPORT_RELATIVE = join('.factory', 'report.json');
 
-/** Non-fatal git evidence read (§17): commits since base + the base diff. */
+/** Git evidence read (§17): commits since base + the base diff. */
 async function gitEvidence(
   worktree: string,
   baseCommit: string,
-): Promise<{ commits: WorkerCommit[]; diff: string | null }> {
+): Promise<{ commits: WorkerCommit[]; diff: string | null; gitError: string | null }> {
   const run = (args: readonly string[]): Promise<string> =>
     new Promise((resolve, reject) => {
-      execFile('git', [...args], { cwd: worktree, encoding: 'utf8' }, (error: Error | null, stdout: string | Buffer) =>
-        error ? reject(error) : resolve(String(stdout)),
+      // A change set's diff can exceed the default 1 MB child-process buffer,
+      // which would silently truncate valid work into "no evidence"; 50 MB is
+      // well past any real review diff.
+      execFile(
+        'git',
+        [...args],
+        { cwd: worktree, encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 },
+        (error: Error | null, stdout: string | Buffer) => (error ? reject(error) : resolve(String(stdout))),
       );
     });
   try {
@@ -339,10 +358,16 @@ async function gitEvidence(
         return { sha: line.slice(0, nul < 0 ? line.length : nul), message: line.slice(nul + 1) };
       });
     const diff = (await run(['diff', baseCommit])).trim();
-    return { commits, diff: diff.length > 0 ? diff : null };
-  } catch {
+    return { commits, diff: diff.length > 0 ? diff : null, gitError: null };
+  } catch (error) {
     // Git evidence is enrichment; the report file is the loud completion gate.
-    return { commits: [], diff: null };
+    // But a read failure is not silently "no evidence": it is surfaced as an
+    // observation so the collected report says so.
+    return {
+      commits: [],
+      diff: null,
+      gitError: `git evidence read failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
 }
 
@@ -460,6 +485,10 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
    * the harness state. Resolves when a terminal/waiting report is settled.
    */
   const turn = async (runState: { envelope: ExecutionEnvelope; agentName: string }, prompt: string): Promise<void> => {
+    // Each turn collects its own report: the previous turn's file would be
+    // re-settled verbatim (stale question loop) if the harness blocks again
+    // without rewriting it. Remove it before prompting.
+    await rmFile(join(runState.envelope.worktree, REPORT_RELATIVE)).catch(() => undefined);
     await cli.run([
       'agent',
       'prompt',
@@ -477,7 +506,9 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
       const parsed = reportText === null ? null : parseHarnessReport(reportText);
       if (parsed) {
         const git = await gitEvidence(runState.envelope.worktree, runState.envelope.baseCommit);
-        if (parsed.status === 'waiting_input') {
+      const gitObservations =
+        git.gitError !== null ? [...parsed.observations, git.gitError] : parsed.observations;
+      if (parsed.status === 'waiting_input') {
           // A worker question is not a completion: settle waiting and keep the
           // harness alive so `deliverAnswer` can resume this exact one.
           heartbeat();
@@ -486,7 +517,7 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
             commits: git.commits,
             artifacts: parsed.artifacts,
             interactions: parsed.interactions,
-            observations: parsed.observations,
+            observations: gitObservations,
             verificationRequests: parsed.verificationRequests,
             diff: git.diff,
             failure: null,
@@ -499,7 +530,7 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
           commits: git.commits,
           artifacts: parsed.artifacts,
           interactions: parsed.interactions,
-          observations: parsed.observations,
+          observations: gitObservations,
           verificationRequests: parsed.verificationRequests,
           diff: git.diff,
           failure: parsed.failure ?? (parsed.status === 'failed' ? 'worker reported failure without a detail' : null),
@@ -589,6 +620,9 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
     },
 
     async execute(envelope): Promise<void> {
+      // Zero-at-rest is local: a caller dispatching again before releasing
+      // must not orphan the prior harness.
+      if (run) await releaseRun();
       // A fresh run on a possibly-reused adapter must not observe the previous
       // run's report or parked collectors.
       resetRunState();
@@ -622,9 +656,12 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
           harness,
           '--pane',
           field(tabResult, 'root_pane'),
-          '--',
         ];
-        if (concrete) agentArgs.push('--model', concrete);
+        if (concrete) {
+          // The model rides the harness argv after the `--` separator; no
+          // dangling separator when the run is unrouted.
+          agentArgs.push('--', '--model', concrete);
+        }
         await cli.run(agentArgs);
         polling = true;
         await turn(runState, renderTaskPrompt(envelope));
