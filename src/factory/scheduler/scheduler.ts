@@ -153,7 +153,7 @@ export interface SchedulerStatus {
     blockedRouting: Array<{ taskId: string; candidates: ModelId[]; unavailable: ModelId[] }>;
     /**
      * E10.2 (#38, RF7): Tasks parked on a recovery action the live scheduler
-     * cannot execute (`REASSIGN`/`REPLAN`), or on a recovery error — surfaced
+     * cannot execute (`ESCALATE_HUMAN`/`REASSIGN`/`REPLAN`), or on a recovery error — surfaced
      * loudly so a RUNNING Task is never a silent dead-end. Durable-derived.
      */
     parkedRecovery: Array<{
@@ -187,16 +187,16 @@ export interface Scheduler {
 
 /**
  * E10.2 (#38, RF7): recovery actions the live scheduler can carry out.
- * `RETRY_NEW_ATTEMPT` is re-dispatched by `redispatchPass`; `ESCALATE_HUMAN` and
- * `WAITING_RESOURCE` are terminal/parked dispositions E7 already recorded;
- * `HOLD` is an e-stop/pause (the tick gate owns it) and `NO_OP_DUPLICATE` is a
- * replayed delivery. Any other action — the ladder rungs `REASSIGN`/`REPLAN` —
- * has no live executor, so the scheduler must park the Task **loudly** rather
- * than stall it silently.
+ * `RETRY_NEW_ATTEMPT` is re-dispatched by `redispatchPass`; `WAITING_RESOURCE`
+ * is a parked disposition E7 already recorded; `HOLD` is an e-stop/pause (the
+ * tick gate owns it) and `NO_OP_DUPLICATE` is a replayed delivery. Any other
+ * action — the ladder rungs `REASSIGN`/`REPLAN` *and* `ESCALATE_HUMAN` — has no
+ * live executor, so the scheduler must park the Task **loudly** rather than
+ * stall it silently (ESCALATE_HUMAN is a park so a human can see it; leaving it
+ * in the live set would leave the Task RUNNING with no visible reason, RF7).
  */
 const LIVE_EXECUTABLE_RECOVERY_KINDS: ReadonlySet<RecoveryAction['kind']> = new Set([
   'RETRY_NEW_ATTEMPT',
-  'ESCALATE_HUMAN',
   'WAITING_RESOURCE',
   'NO_OP_DUPLICATE',
   'HOLD',
@@ -850,8 +850,18 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     // The old diff is preserved as immutable evidence (§18.4). Written *after*
     // the settle transaction commits: a rolled-back transaction (a failed
     // `completeAttempt`/`release`) must not leave an orphaned artifact behind.
+    // Fail-soft (RF7): the artifact write is best-effort evidence — an IO fault
+    // here must not abort the tick before recovery runs and leave the settled
+    // Attempt parked as a silent stall.
     if (result?.diff && result.diff.trim().length > 0 && deps.artifacts) {
-      deps.artifacts.put(`${attemptId}/diff.patch`, result.diff);
+      try {
+        deps.artifacts.put(`${attemptId}/diff.patch`, result.diff);
+      } catch (error) {
+        console.error(
+          `scheduler: artifact write failed for attempt ${attemptId} (recovery continues):`,
+          error instanceof Error ? error.message : error,
+        );
+      }
     }
     recordTelemetry(attemptId);
     recoverWorkerFailure(task, attemptId, classified);

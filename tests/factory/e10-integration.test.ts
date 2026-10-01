@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -17,6 +17,7 @@ import type { AnswerResultDto, InteractionDto } from '../../src/factory/api/cont
 import type { ApprovalRecord } from '../../src/factory/policy/policy';
 import { createScheduler, type Scheduler } from '../../src/factory/scheduler/scheduler';
 import { createWorkerManager, type WorkerProfile } from '../../src/factory/workers/manager';
+import type { AssignmentRecord, WorkerRecord } from '../../src/factory/workers/manager';
 import { createWorktreeManager } from '../../src/factory/worktrees/worktree';
 import {
   DEFAULT_FACTORY_CONFIG,
@@ -256,7 +257,7 @@ function seedAssignment(
     model: 'writer-xl',
     createdAt: at,
     updatedAt: at,
-  });
+  } satisfies AssignmentRecord);
 }
 
 /** Run a tick, let the async verification settle, then route it on the next tick. */
@@ -760,7 +761,6 @@ describe('E10.2 worker-failure re-dispatch producer', () => {
       // The failed Attempt is settled, never a success, and keeps its diff.
       const failed = h.deps.store.get<Attempt>('attempts', attemptA.id)!;
       expect(failed.outcome).toBe('failed');
-      expect(failed.outcome).not.toBe('success');
       expect(failed.diff).toContain('partial work');
 
       // The old diff is preserved as an immutable evidence artifact (§18.4).
@@ -850,6 +850,9 @@ describe('E10.2 worker-failure re-dispatch producer', () => {
 
   it('is bounded: with the Work-Order recovery ceiling exhausted, a live worker failure escalates and mints no new Attempt', async () => {
     const h = producerHarness();
+    // A budget-exhausted ESCALATE_HUMAN park is loud by design (console.error);
+    // capture it so the run stays pristine.
+    const cap = captureErrors();
     try {
       const { wo, task } = seedExecuting(h.deps);
       await h.until('running', () => taskById(h.deps.store, task.id).state === 'RUNNING');
@@ -865,6 +868,11 @@ describe('E10.2 worker-failure re-dispatch producer', () => {
         });
       }
 
+      // The failed worker holds the lease on attemptA; `release()` must clear it.
+      const failedWorker = h.deps.store
+        .list<WorkerRecord>('workers')
+        .find((w) => w.lease?.attemptId === attemptA.id)!;
+
       h.adapterForAttempt(attemptA.id).release(failedResult('worker blew up'));
 
       await h.until('escalated', () =>
@@ -876,13 +884,53 @@ describe('E10.2 worker-failure re-dispatch producer', () => {
       expect(attemptsFor(h.deps.store, task.id)).toHaveLength(1);
       expect(openAssignmentForTask(h.deps.store, task.id)).toBeUndefined();
       expect(recoveryActions(h.deps, wo.id).filter((a) => a.kind === 'ESCALATE_HUMAN')).toHaveLength(1);
+      // The escalated park is visible in `status()` (RF7 — not a silent stall).
+      const parked = h.scheduler().status().queue.parkedRecovery;
+      expect(parked.some((e) => e.taskId === task.id && e.kind === 'ESCALATE_HUMAN')).toBe(true);
       // Invariant 9: the Task is parked RUNNING (never silently failed), awaiting
       // the human escalation path — not looping.
       expect(taskById(h.deps.store, task.id).state).toBe('RUNNING');
+      // The settle path released the failed worker: IDLE, lease cleared (a stale
+      // BUSY worker with a dead lease would wedge the pool below capacity).
+      const released = h.deps.store.get<WorkerRecord>('workers', failedWorker.id)!;
+      expect(released.runtimeState).toBe('IDLE');
+      expect(released.lease).toBeNull();
       await h.tickAndSettle();
       await h.tickAndSettle();
       expect(attemptsFor(h.deps.store, task.id)).toHaveLength(1);
     } finally {
+      cap.restore();
+      h.deps.store.close();
+    }
+  });
+
+  it('writes the failed diff fail-soft (RF7): an IO fault on the artifact put does not abort the tick before recovery runs', async () => {
+    const h = producerHarness();
+    // A read-only artifact root makes the real store's `put` fault with EACCES —
+    // a genuine IO fault on the evidence write, not an injected seam.
+    const artifactRoot = h.runtime.paths.artifacts;
+    chmodSync(artifactRoot, 0o555);
+    const cap = captureErrors();
+    try {
+      const { wo, task } = seedExecuting(h.deps);
+      await h.until('running', () => taskById(h.deps.store, task.id).state === 'RUNNING');
+      const attemptA = attemptsFor(h.deps.store, task.id)[0]!;
+
+      // The live failure carries a diff whose artifact write faults — yet
+      // recovery must still run: the failed Attempt settles and E7 re-dispatches.
+      h.adapterForAttempt(attemptA.id).release(
+        failedResult('worker blew up', 'diff --git a/x b/x\n+partial'),
+      );
+
+      await h.until('re-dispatched', () => attemptsFor(h.deps.store, task.id).length === 2);
+      // The fault surfaced to the operator…
+      expect(cap.errors.some((line) => /artifact write failed/.test(line))).toBe(true);
+      // …and recovery ran after the failed artifact write.
+      expect(recoveryActions(h.deps, wo.id).map((a) => a.kind)).toContain('RETRY_NEW_ATTEMPT');
+      expect(taskById(h.deps.store, task.id).state).toBe('RUNNING');
+    } finally {
+      chmodSync(artifactRoot, 0o755);
+      cap.restore();
       h.deps.store.close();
     }
   });
@@ -1676,6 +1724,9 @@ describe('E10.3 GitHub adapter composed into a running process (#37)', () => {
     const transport = new MockGitHub();
     const runtime = runtimeFrom(configText(VERIFICATION));
     // No github override: the adapter must NOT be constructed.
+    // No verification seam either: the composition fails closed and logs the
+    // loud "no verifier wired" line; capture it so the run is pristine.
+    const bareCap = captureErrors();
     const bare = buildServerDeps(runtime, {
       spawn: () => new FakeHerdr(),
       reconcileOnBoot: false,
@@ -1683,10 +1734,14 @@ describe('E10.3 GitHub adapter composed into a running process (#37)', () => {
     try {
       expect(bare.github).toBeUndefined();
     } finally {
+      bareCap.restore();
       bare.store.close();
     }
 
     const runtimeWithGitHub = runtimeFrom(configText(VERIFICATION));
+    // No verification seam: the production-judge composition fails closed and
+    // logs the loud "no verifier wired" line; capture it so the run is pristine.
+    const cap = captureErrors();
     const deps = buildServerDeps(runtimeWithGitHub, {
       spawn: () => new FakeHerdr(),
       reconcileOnBoot: false,
@@ -1698,10 +1753,20 @@ describe('E10.3 GitHub adapter composed into a running process (#37)', () => {
       // durable evidence reader — the same store/events the server owns. An
       // import against a repository-less issue still routes through the live
       // policy path: proving the composition, not a detached adapter.
-      expect(typeof deps.github!.importIssue).toBe('function');
       expect(typeof deps.github!.openPR).toBe('function');
       expect(typeof deps.github!.merge).toBe('function');
+      // Actually invoke the composed adapter against a mocked transport: a
+      // repository-less issue must fail closed through the live policy path.
+      let rejected = false;
+      try {
+        await deps.github!.importIssue({ repository: 'acme/widgets', number: 1 });
+      } catch {
+        // Fail-closed (no work order created) is the composed behavior.
+        rejected = true;
+      }
+      expect(rejected).toBe(true);
     } finally {
+      cap.restore();
       deps.store.close();
     }
   });
@@ -1890,17 +1955,20 @@ describe('E10.3 GitHub adapter composed into a running process (#37)', () => {
     }
   });
   it('serves the routes through the adapter composed by buildServerDeps (apiBaseUrl / factoryBaseUrl / baseBranch defaults)', async () => {
-    // Reserve a loopback port up front so the runtime's advertised `server.url`
-    // matches the port the server actually binds — exercising the composition's
-    // defaults rather than a hand-built twin.
-    const boot = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('') });
-    const port = boot.port ?? 0;
-    boot.stop(true);
-
+    // Bind once on port 0 and let the SAME listener serve the composed deps:
+    // no reserve-stop-rebind race, and the runtime's advertised `server.url`
+    // (from the bound port) is exactly the URL the client talks to — the
+    // composition's apiBaseUrl/factoryBaseUrl defaults are exercised for real.
+    const listener = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: () => new Response(''),
+    });
+    const boundPort = listener.port ?? 0;
     const text = serializeFactoryConfig({
       ...DEFAULT_FACTORY_CONFIG,
       repository: { path: repoPath },
-      server: { hostname: '127.0.0.1', port },
+      server: { hostname: '127.0.0.1', port: boundPort },
       verification: VERIFICATION,
     });
     const transport = new MockGitHub();
@@ -1920,7 +1988,14 @@ describe('E10.3 GitHub adapter composed into a running process (#37)', () => {
       // `baseBranch` all default from the resolved runtime config.
       github: { transport },
     });
-    const server = startFactoryServer(deps, { port, hostname: '127.0.0.1' });
+    // The reserved listener is never released: the composed handler takes it
+    // over in place. (Identical surface to `startFactoryServer`, which wires
+    // `fetch: createApiHandler(deps)`.)
+    listener.reload({ fetch: createApiHandler(deps) });
+    const server = {
+      url: `http://127.0.0.1:${boundPort}`,
+      stop: () => listener.stop(true),
+    };
     try {
       const client = createFactoryClient({ baseUrl: server.url });
       const imported = await client.githubImportIssue({ repository: 'acme/widgets', number: 99 });
@@ -2114,7 +2189,19 @@ describe('E10.4 control-plane authentication (#40)', () => {
         }),
       );
       expect(wrongScheme.status).toBe(401);
+      // An empty credential supplies no entropy: even if auth were composed with
+      // a degenerate empty token, a headerless/empty-bearer request must not
+      // authenticate itself (`tokensEqual('', '')` would otherwise return true).
+      expect((await post(handler, '/work-orders', { intent: 'x' }, '')).status).toBe(401);
       expect(h.store.list<WorkOrder>('work_orders')).toHaveLength(0);
+      // Fail closed against a degenerate configured token, too.
+      const degenerate = createApiHandler({
+        store: h.store,
+        events: h.events,
+        evidence: createEmptyEvidenceReadPort(),
+        auth: { token: '', actor: OPERATOR },
+      });
+      expect((await post(degenerate, '/work-orders', { intent: 'x' })).status).toBe(401);
     } finally {
       h.store.close();
     }

@@ -348,7 +348,14 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
     // header are never logged. Absent auth, the loopback bind is the boundary
     // and the historical body-actor behavior holds.
     const authenticatedActor =
-      deps.auth !== undefined && tokensEqual(bearerToken(request) ?? '', deps.auth.token)
+      deps.auth !== undefined &&
+      // Gestalt check, not just token equality: an empty/short credential can't
+      // be a real token, and `tokensEqual('', '')` would otherwise authenticate
+      // headerless requests against a programmatically-configured empty token.
+      bearerToken(request) !== null &&
+      bearerToken(request)!.length >= 24 &&
+      deps.auth.token.length >= 24 &&
+      tokensEqual(bearerToken(request)!, deps.auth.token)
         ? deps.auth.actor
         : undefined;
     if (deps.auth !== undefined && authenticatedActor === undefined && method !== 'GET') {
