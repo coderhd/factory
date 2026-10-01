@@ -34,7 +34,12 @@ import {
 } from '../factory/verification/production';
 import type { SemanticJudge } from '../factory/verification/semantic';
 import type { WorkVerifier } from '../factory/verification/orchestrator';
-import { createHerdrWorker } from '../factory/workers/herdr';
+import {
+  createProcessHerdrCli,
+  createHerdrWorker,
+  createHerdrWorkspaceManager,
+  type HerdrCli,
+} from '../factory/workers/herdr';
 import { createWorkerManager, type SpawnWorker, type WorkerProfile } from '../factory/workers/manager';
 import { createWorktreeManager, taskWorktreeBranch } from '../factory/worktrees/worktree';
 
@@ -273,6 +278,13 @@ export interface ServerDepsOptions {
    * Absent, the effective bind is the resolved `server.hostname`/`port`.
    */
   serverBind?: { hostname: string; port: number };
+  /**
+   * E11.1 (#44) hermetic seam for the worker runtime: an in-process fake
+   * `herdr` CLI. When supplied, the production `spawn` composes every worker
+   * adapter against it — no real `herdr`/`opencode` is ever spawned. Ignored
+   * when `spawn` is supplied.
+   */
+  herdrCli?: HerdrCli;
 }
 
 /**
@@ -444,10 +456,27 @@ export function buildServerDeps(
   const store = openStateStore(runtime.paths.db);
   const events = openEventLog(store.db);
   const verifier = resolveVerifier(runtime, options, store);
+  // E11.1 (#44): the herdr CLI runner and the dedicated `factory` workspace
+  // manager are server-scoped and shared by every worker adapter — the herdr
+  // environment is ensured once and reused; harnesses spawn/kill on demand.
+  const herdrCli = options.herdrCli ?? createProcessHerdrCli('herdr');
+  const herdrWorkspace = createHerdrWorkspaceManager(herdrCli, {
+    label: runtime.workers.workspaceLabel ?? 'factory',
+    repoPath: runtime.repository.path,
+  });
   const workers = createWorkerManager({
     store,
     events,
-    spawn: options.spawn ?? (() => createHerdrWorker()),
+    spawn:
+      options.spawn ??
+      (() =>
+        createHerdrWorker({
+          cli: herdrCli,
+          workspace: herdrWorkspace,
+          harness: runtime.workers.harness ?? 'opencode',
+          models: runtime.workers.models ?? {},
+          repoPath: runtime.repository.path,
+        })),
     ...(options.now ? { now: options.now } : {}),
   });
   const worktrees = createWorktreeManager({

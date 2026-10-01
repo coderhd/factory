@@ -1,10 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { buildServerDeps, type ServerDepsOptions } from '../../src/cli/factory';
+import {
+  createHerdrWorker,
+  createHerdrWorkspaceManager,
+  renderTaskPrompt,
+  type ExecutionEnvelope,
+  type HerdrCli,
+  type WorkerAdapter,
+} from '../../src/factory/workers/herdr';
 import { createApiHandler } from '../../src/factory/api/server';
 import type { WorkOrder } from '../../src/factory/domain/workOrder';
 import type {
@@ -459,5 +467,349 @@ describe('E11.3 GitHub transport/token configuration (#43)', () => {
     } finally {
       listener.stop(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E11.1 (#44) — herdr-once worker environment + opencode harness lifecycle.
+// The adapter drives a dedicated `factory` herdr workspace (started once),
+// one opencode harness tab per Attempt, and collects results from a report
+// file + git. Hermetic throughout: the herdr CLI is an injected in-process
+// fake; real herdr/opencode are never spawned; git runs only on a temp repo.
+// ---------------------------------------------------------------------------
+
+/** A workspace the fake herdr server tracks. */
+interface FakeWorkspace {
+  id: string;
+  label: string;
+  tabs: FakeTab[];
+}
+
+/** A tab the fake herdr server tracks (so tests can assert zero tabs at rest). */
+interface FakeTab {
+  id: string;
+  pane: string;
+  cwd: string;
+  closed: boolean;
+}
+
+/** The parsed herdr CLI document shape the adapter consumes (`.result.*`). */
+type HerdrDoc = Record<string, unknown>;
+
+/**
+ * An in-process fake `herdr` CLI (the hermetic seam). It records every
+ * invocation, tracks a workspace + tabs, answers `agent get` with a
+ * configurable state, and lets a test decide what `agent prompt` does (e.g.
+ * "the harness wrote its report and committed").
+ */
+class FakeHerdrCli implements HerdrCli {
+  calls: string[][] = [];
+  workspaces = new Map<string, FakeWorkspace>();
+  agentState = 'running';
+  /** Set by the test: invoked on `agent prompt <name> <text>` before settling. */
+  onPrompt: ((prompt: string, cwd: string) => void) | null = null;
+  /** Extra text a `--wait` prompt reports back; drives nothing but gets recorded. */
+  onAnswer = true;
+  onCreateTabHook: ((cwd: string) => void) | null = null;
+
+  callsMatching(prefix: string): string[][] {
+    return this.calls.filter((args) => args[0] === prefix);
+  }
+
+  openTabs(): FakeTab[] {
+    const tabs: FakeTab[] = [];
+    for (const ws of this.workspaces.values()) tabs.push(...ws.tabs);
+    return tabs.filter((tab) => !tab.closed);
+  }
+
+  async run(args: readonly string[]): Promise<HerdrDoc> {
+    const argv = [...args];
+    this.calls.push(argv);
+    const value = (key: string): string => {
+      const index = argv.indexOf(`--${key}`);
+      if (index < 0 || argv[index + 1] === undefined) throw new Error(`missing --${key}`);
+      return argv[index + 1]!;
+    };
+    const sub = argv[1];
+    if (argv[0] === 'workspace' && sub === 'list') {
+      return { result: [...this.workspaces.values()].map((ws) => ({ id: ws.id, label: ws.label })) };
+    }
+    if (argv[0] === 'workspace' && sub === 'create') {
+      const label = value('label');
+      const id = `ws_${label}`;
+      if (this.workspaces.has(id)) throw new Error(`workspace already exists: ${label}`);
+      this.workspaces.set(id, { id, label, tabs: [] });
+      return { result: { workspace: id, tab: 't0', root_pane: 'p0' } };
+    }
+    if (argv[0] === 'tab' && sub === 'create') {
+      const wsId = value('workspace');
+      const ws = this.workspaces.get(wsId);
+      if (!ws) throw new Error(`no such workspace: ${wsId}`);
+      const cwd = value('cwd');
+      if (!existsSync(cwd)) throw new Error(`cwd does not exist: ${cwd}`);
+      this.onCreateTabHook?.(cwd);
+      const tab: FakeTab = {
+        id: `tab_${ws.tabs.length}`,
+        pane: `pane_${ws.tabs.length}`,
+        cwd,
+        closed: false,
+      };
+      ws.tabs.push(tab);
+      return { result: { tab: tab.id, root_pane: tab.pane } };
+    }
+    if (argv[0] === 'agent' && sub === 'start') {
+      return { result: { agent: argv[2] } };
+    }
+    if (argv[0] === 'agent' && (sub === 'prompt' || sub === 'send-keys')) {
+      const text = argv[2] ?? '';
+      const tab = this.openTabs().at(-1);
+      if (tab) this.onPrompt?.(text, tab.cwd);
+      return { result: { ok: true } };
+    }
+    if (argv[0] === 'agent' && sub === 'get') {
+      return { result: { state: this.agentState } };
+    }
+    if (argv[0] === 'agent' && sub === 'read') {
+      return { result: { text: 'How should I handle the ambiguous acceptance criterion?' } };
+    }
+    if (argv[0] === 'tab' && sub === 'close') {
+      const tabId = argv[2];
+      for (const ws of this.workspaces.values()) {
+        for (const tab of ws.tabs) if (tab.id === tabId) tab.closed = true;
+      }
+      return { result: {} };
+    }
+    throw new Error(`unexpected herdr invocation: ${argv.join(' ')}`);
+  }
+}
+
+const TEST_ENVELOPE: ExecutionEnvelope = {
+  workOrderId: 'wo_44',
+  taskId: 'task_44',
+  attemptId: 'attempt_44',
+  repository: '/tmp/repo',
+  baseCommit: 'base0',
+  branch: 'wo/task-44',
+  // `worktree` is replaced per test with the fixture repo/worktree path.
+  worktree: '/tmp/worktree',
+  authorizationCapabilities: [],
+  initialContext: 'Work Order: ship it\nAcceptance: tests green\nTask: implement',
+  retrievalEndpoint: null,
+  skills: [],
+  requiredVerification: ['bun test'],
+  model: null,
+};
+
+describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)', () => {
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), 'factory-e111-'));
+    repoPath = initRepo(workDir);
+  });
+
+  afterEach(() => {
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  function makeAdapter(cli: FakeHerdrCli, models: Record<string, string> = {}): WorkerAdapter {
+    const workspace = createHerdrWorkspaceManager(cli, { label: 'factory', repoPath });
+    return createHerdrWorker({
+      cli,
+      workspace,
+      harness: 'opencode',
+      models,
+      repoPath,
+      pollIntervalMs: 5,
+      waitTimeoutMs: 500,
+    });
+  }
+
+  function commitChange(worktree: string, message: string): string {
+    writeFileSync(join(worktree, 'task-44.txt'), `change: ${message}\n`);
+    execFileSync('git', ['add', 'task-44.txt'], { cwd: worktree });
+    execFileSync('git', ['commit', '-q', '-m', message], { cwd: worktree });
+    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: worktree, encoding: 'utf8' }).trim();
+  }
+
+  function writeReport(
+    worktree: string,
+    report: Partial<{
+      status: string;
+      commits: unknown[];
+      artifacts: unknown[];
+      interactions: unknown[];
+      observations: string[];
+      verificationRequests: string[];
+      failure: string | null;
+    }>,
+  ): void {
+    mkdirSync(join(worktree, '.factory'), { recursive: true });
+    writeFileSync(join(worktree, '.factory', 'report.json'), JSON.stringify(report));
+  }
+
+  it('runs one Attempt: create tab → agent start (with model) → prompt → report → tab close; zero tabs at rest', async () => {
+    const cli = new FakeHerdrCli();
+    const adapter = makeAdapter(cli, { implementer: 'opencode/sonnet-x' });
+    const envelope: ExecutionEnvelope = {
+      ...TEST_ENVELOPE,
+      repository: repoPath,
+      worktree: repoPath,
+      baseCommit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoPath, encoding: 'utf8' }).trim(),
+      model: 'implementer',
+    };
+    // The "harness" does the work: commit + report, like the prompt asks.
+    cli.onPrompt = () => {
+      commitChange(repoPath, 'implement task 44');
+      writeReport(repoPath, {
+        status: 'completed',
+        artifacts: [],
+        interactions: [],
+        observations: ['done'],
+        verificationRequests: ['bun test'],
+        failure: null,
+      });
+    };
+
+    await adapter.provision();
+    await adapter.start();
+    await adapter.execute(envelope);
+    const result = await adapter.collectArtifacts();
+
+    // Sequence: workspace ensured once, one tab for this Attempt, one agent.
+    expect(cli.callsMatching('workspace').map((argv) => argv.join(' '))).toEqual([
+      'workspace list',
+      `workspace create --label factory --cwd ${repoPath} --no-focus`,
+    ]);
+    const tabCreate = cli
+      .callsMatching('tab')
+      .find((argv) => argv[1] === 'create')!
+      .join(' ');
+    expect(tabCreate).toContain(`--workspace ws_factory`);
+    expect(tabCreate).toContain(`--cwd ${repoPath}`);
+    expect(tabCreate).toContain(`--no-focus`);
+    const agentStart = cli.callsMatching('agent').find((argv) => argv[1] === 'start')!.join(' ');
+    expect(agentStart).toContain('--kind opencode');
+    expect(agentStart).toContain('--pane pane_0');
+    expect(agentStart).toContain('-- --model opencode/sonnet-x');
+    const prompt = cli.callsMatching('agent').find((argv) => argv[1] === 'prompt')!.join(' ');
+    expect(prompt).toContain('--wait');
+    expect(prompt).toContain(envelope.branch);
+    expect(prompt).toContain('/.factory/report.json');
+
+    // The collected WorkerResult merges git evidence with the report file.
+    expect(result.status).toBe('completed');
+    expect(result.commits).toHaveLength(1);
+    expect(result.commits[0]!.message).toBe('implement task 44');
+    expect(result.diff).toContain('task-44.txt');
+    expect(result.observations).toEqual(['done']);
+    expect(result.verificationRequests).toEqual(['bun test']);
+    expect(result.failure).toBeNull();
+    // Terminal run: harness killed on demand — zero tabs at rest.
+    expect(cli.openTabs()).toHaveLength(0);
+    expect((await adapter.status()).state).toBe('completed');
+  });
+
+  it('fails loudly when the harness never writes a report (no silent success)', async () => {
+    const cli = new FakeHerdrCli();
+    cli.agentState = 'idle'; // turn ended, but nothing was reported
+    const adapter = makeAdapter(cli);
+    await adapter.provision();
+    await adapter.start();
+    await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath });
+    const result = await adapter.collectArtifacts();
+
+    expect(result.status).toBe('failed');
+    expect(result.failure ?? '').toContain('report');
+    expect(cli.openTabs()).toHaveLength(0); // the failed tab was closed too
+    expect((await adapter.status()).state).toBe('failed');
+  });
+
+  it('maps a blocked harness to WAITING_INPUT with a question, keeps the tab, and an answer resumes to completion', async () => {
+    const cli = new FakeHerdrCli();
+    cli.agentState = 'blocked'; // approval/question UI is up; no report yet
+    const adapter = makeAdapter(cli);
+    await adapter.provision();
+    await adapter.start();
+    await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath });
+    const waiting = await adapter.collectArtifacts();
+
+    expect(waiting.status).toBe('waiting_input');
+    expect(waiting.interactions.length).toBeGreaterThan(0);
+    // Blocked, not dead: the tab (harness) must still be alive.
+    expect(cli.openTabs()).toHaveLength(1);
+    expect((await adapter.status()).state).toBe('waiting_input');
+
+    // The human answers through the durable interaction; the delivered answer
+    // resumes the harness, which then completes and reports.
+    cli.agentState = 'idle';
+    cli.onPrompt = () => {
+      if (!cli.onAnswer) return;
+      commitChange(repoPath, 'post-answer work');
+      writeReport(repoPath, { status: 'completed', observations: ['answered'] });
+      cli.onAnswer = false;
+    };
+    await adapter.deliverAnswer({ interactionId: 'int_1', question: '?', response: 'use the existing helper' });
+
+    const resumed = await adapter.collectArtifacts();
+    expect(resumed.status).toBe('completed');
+    expect(resumed.observations).toEqual(['answered']);
+    expect(cli.openTabs()).toHaveLength(0); // converged → harness killed
+    expect((await adapter.status()).state).toBe('completed');
+  });
+
+  it('resolves the concrete model from the generic capability id at dispatch; unmapped id fails loud', async () => {
+    const cli = new FakeHerdrCli();
+    const adapter = makeAdapter(cli, { implementer: 'opencode/sonnet-x' });
+    await adapter.provision();
+    await adapter.start();
+    await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath, model: 'explorer' });
+    const result = await adapter.collectArtifacts();
+
+    // 'explorer' is not in the configured map → loud dispatch failure, no tab
+    // leaked, and no harness was ever started.
+    expect(result.status).toBe('failed');
+    expect(result.failure ?? '').toContain('explorer');
+    expect(cli.callsMatching('agent').find((argv) => argv[1] === 'start')).toBeUndefined();
+    expect(cli.openTabs()).toHaveLength(0);
+
+    // Mapped id: the --model flag carries the concrete model.
+    cli.calls = [];
+    cli.onPrompt = () => {
+      writeReport(repoPath, { status: 'completed' });
+    };
+    await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath, model: 'implementer' });
+    const agentStart = cli.callsMatching('agent').find((argv) => argv[1] === 'start')!.join(' ');
+    expect(agentStart).toContain('-- --model opencode/sonnet-x');
+  });
+
+  it('ensures the factory workspace once and reuses it across adapters, never touching other workspaces', async () => {
+    const cli = new FakeHerdrCli();
+    // A user workspace already exists in the server; the factory workspace does not.
+    cli.workspaces.set('ws_personal', { id: 'ws_personal', label: 'personal', tabs: [] });
+    const workspace = createHerdrWorkspaceManager(cli, { label: 'factory', repoPath });
+    const adapterA = createHerdrWorker({ cli, workspace, repoPath, pollIntervalMs: 5, waitTimeoutMs: 500 });
+    const adapterB = createHerdrWorker({ cli, workspace, repoPath, pollIntervalMs: 5, waitTimeoutMs: 500 });
+    await adapterA.provision();
+    await adapterA.provision(); // idempotent within/across adapters
+    await adapterB.provision();
+
+    const createCalls = cli.calls.filter((argv) => argv.join(' ').startsWith('workspace create'));
+    expect(createCalls).toHaveLength(1);
+    expect(createCalls[0]!.join(' ')).toContain('--label factory');
+    expect(createCalls[0]!.join(' ')).not.toContain('personal');
+    expect(cli.calls.every((argv) => !argv.join(' ').includes('personal'))).toBe(true);
+
+    // Without a factory workspace, the label exists check returns it next time.
+    expect(cli.openTabs()).toHaveLength(0);
+  });
+
+  it('renders the execution envelope as the task prompt (worktree, branch, base, report path)', () => {
+    const prompt = renderTaskPrompt(TEST_ENVELOPE);
+    expect(prompt).toContain(TEST_ENVELOPE.worktree);
+    expect(prompt).toContain(TEST_ENVELOPE.branch);
+    expect(prompt).toContain(TEST_ENVELOPE.baseCommit);
+    expect(prompt).toContain('.factory/report.json');
+    expect(prompt).toContain('bun test');
+    expect(prompt).toContain(TEST_ENVELOPE.initialContext);
+    expect(prompt).toContain('commit');
   });
 });

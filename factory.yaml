@@ -51,6 +51,17 @@ worktrees:
 workers:
   profiles:
     - herdr
+  # E11.1 (#44): the worker runtime. `harness` is the coding agent started in
+  # each Attempt's tab; `workspaceLabel` is the dedicated herdr workspace the
+  # Factory owns (your focused panes/workspaces are never touched).
+  harness: opencode
+  workspaceLabel: factory
+  # Capability → model map (#44): keys are E9.3's generic capability ids
+  # (explorer, generalist, implementer, …), values the concrete opencode
+  # models your deployment runs. Unmapped routed ids fail loud at dispatch.
+  # models:
+  #   implementer: opencode/sonnet
+  #   explorer: opencode/haiku
 # Outbound GitHub configuration (E11.3, #43). Optional: when present, `factory
 # start` composes the GitHub adapter (import issues, open change-set PRs) from
 # this section; absent, the GitHub routes 404 (fail closed). The token is a

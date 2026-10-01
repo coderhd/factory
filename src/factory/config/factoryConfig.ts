@@ -90,7 +90,19 @@ export interface FactoryDesiredConfig {
     };
   };
   worktrees: { rootDir: string; baseBranch: string };
-  workers: { profiles: string[] };
+  /**
+   * E11.1 (#44) worker runtime configuration. `profiles` stays the E11 baseline
+   * (`herdr`); `harness` names the coding-agent harness a tab runs
+   * (`opencode`), `workspaceLabel` the dedicated herdr workspace the Factory
+   * owns ("factory", never the user's focused panes), and `models` maps E9.3's
+   * generic capability ids to concrete harness models.
+   */
+  workers: {
+    profiles: string[];
+    harness?: string;
+    workspaceLabel?: string;
+    models?: Record<string, string>;
+  };
   /** Optional production verification surface (E10.1, #39); absent → fail closed. */
   verification?: VerificationDesired;
   /** Optional outbound GitHub config (E11.3, #43); absent → no adapter, routes 404. */
@@ -114,7 +126,13 @@ export interface FactoryRuntimeConfig {
     provisioning: FactoryDesiredConfig['scheduler']['provisioning'];
   };
   worktrees: { rootDir: string; baseBranch: string };
-  workers: { profiles: string[] };
+  /** E11.1 (#44): worker runtime config, resolved (harness/label defaulted). */
+  workers: {
+    profiles: string[];
+    harness: string;
+    workspaceLabel: string;
+    models: Record<string, string>;
+  };
   /** Optional production verification surface, carried through resolution. */
   verification?: VerificationDesired;
   /**
@@ -161,7 +179,12 @@ export const DEFAULT_FACTORY_CONFIG: FactoryDesiredConfig = {
     },
   },
   worktrees: { rootDir: '.factory/worktrees', baseBranch: 'main' },
-  workers: { profiles: ['herdr'] },
+  workers: {
+    profiles: ['herdr'],
+    harness: 'opencode',
+    workspaceLabel: 'factory',
+    models: {},
+  },
   image: { repository: 'ghcr.io/coderhd/factory', tag: FACTORY_VERSION },
   compose: { healthcheck: { intervalSeconds: 10, timeoutSeconds: 5, retries: 3 } },
 };
@@ -335,6 +358,27 @@ export function parseFactoryConfig(text: string): ConfigParse {
     root.workers.profiles.some((profile) => !isNonEmptyString(profile))
   ) {
     issue('workers.profiles', 'profiles must be a non-empty list of strings');
+  } else {
+    // E11.1 (#44): the optional worker-runtime fields. Absent ones default at
+    // resolve time (`opencode` / `factory`); present ones must be well-formed
+    // so an adapter is never composed from a typo'd harness or model map.
+    if (root.workers.harness !== undefined && !isNonEmptyString(root.workers.harness)) {
+      issue('workers.harness', 'harness must be a non-empty string when present');
+    }
+    if (root.workers.workspaceLabel !== undefined && !isNonEmptyString(root.workers.workspaceLabel)) {
+      issue('workers.workspaceLabel', 'workspaceLabel must be a non-empty string when present');
+    }
+    if (root.workers.models !== undefined) {
+      if (!isPlainObject(root.workers.models)) {
+        issue('workers.models', 'models must be a mapping of capability id → concrete model');
+      } else {
+        for (const [capability, model] of Object.entries(root.workers.models)) {
+          if (!isNonEmptyString(model)) {
+            issue(`workers.models.${capability}`, 'each model must be a non-empty string');
+          }
+        }
+      }
+    }
   }
 
   // E10.1 (#39): the optional verification section. Absent is valid (the server
@@ -516,7 +560,12 @@ export function resolveFactoryConfig(
       rootDir: resolve(root, config.worktrees.rootDir),
       baseBranch: config.worktrees.baseBranch,
     },
-    workers: { profiles: [...config.workers.profiles] },
+    workers: {
+      profiles: [...config.workers.profiles],
+      harness: config.workers.harness ?? 'opencode',
+      workspaceLabel: config.workers.workspaceLabel ?? 'factory',
+      models: { ...(config.workers.models ?? {}) },
+    },
     ...(config.verification
       ? {
           verification: {
@@ -588,6 +637,18 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
     'workers:',
     '  profiles:',
     ...config.workers.profiles.map((profile) => `    - ${profile}`),
+    // E11.1 (#44): the worker runtime section. `models` maps E9.3's generic
+    // capability ids (implementer, explorer, …) to the concrete harness models.
+    `  harness: ${JSON.stringify(config.workers.harness ?? 'opencode')}`,
+    `  workspaceLabel: ${JSON.stringify(config.workers.workspaceLabel ?? 'factory')}`,
+    ...(config.workers.models && Object.keys(config.workers.models).length > 0
+      ? [
+          '  models:',
+          ...Object.entries(config.workers.models).map(
+            ([capability, model]) => `    ${JSON.stringify(capability)}: ${JSON.stringify(model)}`,
+          ),
+        ]
+      : []),
     // E11.3 (#43): only the token's env *name* is written — never the token.
     ...(config.github
       ? [
