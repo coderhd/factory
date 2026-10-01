@@ -1023,23 +1023,35 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       events: ReturnType<typeof buildServerDeps>['events'];
     },
     model: string,
-  ): { wo: WorkOrder; task: Task } {
+    taskCount = 1,
+  ): { wo: WorkOrder; tasks: Task[] } {
     const wo = createWorkOrder(deps, {
       intent: 'E11.2 judge subject',
       acceptanceCriteria: ['the helper is exported'],
     });
     for (const to of ['READY', 'PLANNING'] as const) transitionWorkOrder(deps, wo.id, { to });
-    const dag = commitDAG(deps, wo.id, { nodes: [{ nodeId: 'a', title: 'A' }] });
+    const dag = commitDAG(
+      deps,
+      wo.id,
+      {
+        nodes: Array.from({ length: taskCount }, (_, index) => ({
+          nodeId: String.fromCharCode(97 + index),
+          title: `Node ${index + 1}`,
+        })),
+      },
+    );
     transitionWorkOrder(deps, wo.id, { to: 'EXECUTING' });
-    const task = deps.store.get<Task>('tasks', dag.nodes[0].taskId)!;
-    const attempt = createAttempt(deps, { taskId: task.id, model });
-    completeAttempt(deps, attempt.id, {
-      outcome: 'success',
-      diff: 'diff --git a/helper.ts b/helper.ts\n+export const helper = 1;',
-      artifactIds: [],
-    });
-    for (const to of ['READY', 'ASSIGNED', 'RUNNING', 'SUCCESS'] as const) transitionTask(deps, task.id, { to });
-    return { wo, task };
+    const tasks = dag.nodes.map((node) => deps.store.get<Task>('tasks', node.taskId)!);
+    for (const task of tasks) {
+      const attempt = createAttempt(deps, { taskId: task.id, model });
+      completeAttempt(deps, attempt.id, {
+        outcome: 'success',
+        diff: 'diff --git a/helper.ts b/helper.ts\n+export const helper = 1;',
+        artifactIds: [],
+      });
+      for (const to of ['READY', 'ASSIGNED', 'RUNNING', 'SUCCESS'] as const) transitionTask(deps, task.id, { to });
+    }
+    return { wo, tasks };
   }
 
   /** Tick until a predicate holds (verification is async; routing is on-tick). */
@@ -1101,7 +1113,7 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       herdrCli: cli,
     });
     try {
-      const { wo, task } = seedAndDriveToSuccess(deps, 'writer-xl');
+      const { wo, tasks } = seedAndDriveToSuccess(deps, 'writer-xl');
       await tickUntil(deps.scheduler!, deps, () =>
         deps.store.get<WorkOrder>('work_orders', wo.id)!.state === 'HUMAN_GATE', 'HUMAN_GATE');
 
@@ -1110,7 +1122,7 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       expect(bundles).toHaveLength(1);
       expect(bundles[0]!.complete).toBe(true);
       expect(bundles[0]!.workOrderId).toBe(wo.id);
-      expect(deps.store.get<Task>('tasks', task.id)!.state).toBe('VERIFIED');
+      expect(deps.store.get<Task>('tasks', tasks[0].id)!.state).toBe('VERIFIED');
 
       // The judge ran as an opencode harness in its own fresh tab with the
       // configured concrete model, and was torn down (zero tabs at rest).
@@ -1154,9 +1166,9 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       herdrCli: cli,
     });
     try {
-      const { wo, task } = seedAndDriveToSuccess(deps, 'writer-xl');
+      const { wo, tasks } = seedAndDriveToSuccess(deps, 'writer-xl');
       await tickUntil(deps.scheduler!, deps, () =>
-        deps.store.get<Task>('tasks', task.id)!.state === 'REWORK', 'REWORK');
+        deps.store.get<Task>('tasks', tasks[0].id)!.state === 'REWORK', 'REWORK');
 
       expect(deps.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
       const rejection = deps.events
@@ -1170,8 +1182,7 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
     }
   });
 
-  it('fails closed when the judge harness produces no verdict file: every criterion fails, REWORK, no bundle', async () => {
-    const cli = new FakeHerdrCli();
+  it('fails closed when the judge harness produces no verdict file: every criterion fails, REWORK, no bundle', async () => {    const cli = new FakeHerdrCli();
     cli.onPrompt = (prompt, cwd) => {
       void prompt;
       mkdirSync(join(cwd, '.factory'), { recursive: true });
@@ -1189,13 +1200,111 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       herdrCli: cli,
     });
     try {
-      const { wo, task } = seedAndDriveToSuccess(deps, 'writer-xl');
+      const { wo, tasks } = seedAndDriveToSuccess(deps, 'writer-xl');
       await tickUntil(deps.scheduler!, deps, () =>
-        deps.store.get<Task>('tasks', task.id)!.state === 'REWORK', 'REWORK');
+        deps.store.get<Task>('tasks', tasks[0].id)!.state === 'REWORK', 'REWORK');
 
       expect(deps.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
       expect(deps.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
       // Zero tabs at rest even on the failed judgment.
+      expect(cli.openTabs()).toHaveLength(0);
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('tears down a BLOCKED judge pane (no answer channel): REWORK, no bundle, zero tabs at rest', async () => {
+    const cli = new FakeHerdrCli();
+    // The judge harness blocks (approval UI) and writes nothing: the judge has
+    // no deliverAnswer channel, so the pane must be killed, not stranded.
+    cli.agentState = 'blocked';
+    const runtime = runtimeFromT(verificationText(JUDGE_VERIFICATION));
+    const deps = buildServerDeps(runtime, {
+      reconcileOnBoot: false,
+      spawn: () => new IdleFakeHerdr(),
+      verification: { runCommand: passingRunner },
+      herdrCli: cli,
+    });
+    try {
+      const { wo, tasks } = seedAndDriveToSuccess(deps, 'writer-xl');
+      await tickUntil(deps.scheduler!, deps, () =>
+        deps.store.get<Task>('tasks', tasks[0].id)!.state === 'REWORK', 'REWORK');
+
+      expect(deps.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      expect(deps.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      // The blocked pane is closed: zero harnesses at rest.
+      expect(cli.openTabs()).toHaveLength(0);
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('tears down a FAILED judge run: the failure is a loud structured semantic failure, zero tabs at rest', async () => {
+    const cli = new FakeHerdrCli();
+    cli.onPrompt = (prompt, cwd) => {
+      void prompt;
+      mkdirSync(join(cwd, '.factory'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.factory', 'report.json'),
+        JSON.stringify({ status: 'failed', failure: 'judge harness crashed mid-verdict', observations: [], artifacts: [], interactions: [], verificationRequests: [] }),
+      );
+    };
+    const runtime = runtimeFromT(verificationText(JUDGE_VERIFICATION));
+    const deps = buildServerDeps(runtime, {
+      reconcileOnBoot: false,
+      spawn: () => new IdleFakeHerdr(),
+      verification: { runCommand: passingRunner },
+      herdrCli: cli,
+    });
+    try {
+      const { wo, tasks } = seedAndDriveToSuccess(deps, 'writer-xl');
+      await tickUntil(deps.scheduler!, deps, () =>
+        deps.store.get<Task>('tasks', tasks[0].id)!.state === 'REWORK', 'REWORK');
+
+      expect(deps.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
+      expect(deps.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
+      expect(cli.openTabs()).toHaveLength(0);
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('serializes concurrent verifications: two SUCCESS tasks each get their own judged run, both reach HUMAN_GATE', async () => {
+    const cli = new FakeHerdrCli();
+    const verdict = {
+      rulings: [
+        {
+          criterion: 'the helper is exported',
+          falsified: false,
+          evidence: { summary: 'diff exports helper' },
+        },
+      ],
+    };
+    const { prompts } = fakeJudgeScenario(cli, verdict);
+    const runtime = runtimeFromT(verificationText(JUDGE_VERIFICATION));
+    const deps = buildServerDeps(runtime, {
+      reconcileOnBoot: false,
+      spawn: () => new IdleFakeHerdr(),
+      verification: { runCommand: passingRunner },
+      herdrCli: cli,
+    });
+    try {
+      // Two tasks reach SUCCESS in the same tick, so the scheduler kicks two
+      // verifications concurrently at the single shared judge.
+      const { wo } = seedAndDriveToSuccess(deps, 'writer-xl', 2);
+      await tickUntil(deps.scheduler!, deps, () =>
+        deps.store.get<WorkOrder>('work_orders', wo.id)!.state === 'HUMAN_GATE', 'HUMAN_GATE');
+
+      // Both tasks verified; two complete bundles; no spurious REWORK.
+      const bundles = deps.store.list<EvidenceBundle>('evidence_bundles');
+      expect(bundles).toHaveLength(2);
+      for (const bundle of bundles) expect(bundle.complete).toBe(true);
+      for (const task of deps.store.list<Task>('tasks')) {
+        expect(task.state).toBe('VERIFIED');
+      }
+      // Each verification ran its own judged run — and (with the judge's run
+      // mutex) no run was cross-killed into a failed/superseded judgment.
+      expect(prompts).toHaveLength(2);
       expect(cli.openTabs()).toHaveLength(0);
     } finally {
       deps.store.close();
@@ -1214,12 +1323,12 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
         herdrCli: new FakeHerdrCli(),
       });
       try {
-        const { wo, task } = seedAndDriveToSuccess(deps, 'writer-xl');
+        const { wo, tasks } = seedAndDriveToSuccess(deps, 'writer-xl');
         await tickUntil(deps.scheduler!, deps, () =>
           errors.some((line) => /verifier/i.test(line)), 'the missing-verifier diagnostic');
 
         expect(deps.store.list<EvidenceBundle>('evidence_bundles')).toHaveLength(0);
-        expect(deps.store.get<Task>('tasks', task.id)!.state).toBe('SUCCESS');
+        expect(deps.store.get<Task>('tasks', tasks[0].id)!.state).toBe('SUCCESS');
         expect(deps.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('EXECUTING');
       } finally {
         deps.store.close();

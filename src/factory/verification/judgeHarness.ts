@@ -85,7 +85,7 @@ export function renderJudgePrompt(context: SemanticContext): string {
     '   {"rulings":[{"criterion":"<exact criterion text>","falsified":true|false,',
     '     "evidence":{"summary":"<what you actually observed>","artifacts":["<path>", "..."(optional)]},',
     '     "diagnosis":"<why it failed, required when falsified>",',
-    '     "action":"<what to do about it, required when falsified"}]}',
+    '     "action":"<what to do about it, required when falsified>"}]}',
     '   One ruling per criterion, `criterion` verbatim from the list above.',
     '   `falsified=true` means you found the criterion NOT met. Every ruling needs a non-empty evidence.summary.',
     `2. \`.factory/report.json\` — the run report: {"status":"completed","observations":[ "..."],"artifacts":[],"interactions":[],"verificationRequests":[],"failure":null}`,
@@ -195,11 +195,14 @@ export function createHarnessSemanticJudge(options: HarnessSemanticJudgeOptions)
     waitTimeoutMs: options.waitTimeoutMs,
   });
 
-  return {
-    identity,
-    async falsify(context: SemanticContext): Promise<JudgeRuling[]> {
-      // A fresh directory per judgment: the pane's cwd, report and verdict live
-      // here, isolated from the repository and cleaned up afterwards.
+  /**
+   * One judged run: a fresh directory per judgment (the pane's cwd, isolated
+   * from the repository, removed either way), the envelope dispatch, the report
+   * collection with teardown, and the verdict read.
+   */
+  const runOnce =
+    (context: SemanticContext) =>
+    async (): Promise<JudgeRuling[]> => {
       const dir = mkdtempSync(join(tmpdir(), 'factory-judge-'));
       try {
         const envelope: ExecutionEnvelope = {
@@ -221,6 +224,11 @@ export function createHarnessSemanticJudge(options: HarnessSemanticJudgeOptions)
         await worker.start();
         await worker.execute(envelope);
         const result = await worker.collectArtifacts();
+        // The judge has no answer channel, so a `waiting_input` (blocked) pane
+        // has nothing to deliver: destroy releases the live pane — after a
+        // terminal settle this is a no-op, after a blocked/failed one it kills
+        // the stranded harness. Zero harnesses at rest, whatever happened.
+        await worker.destroy();
         if (result.status !== 'completed') {
           throw new Error(
             `semantic judge harness failed: ${result.failure ?? result.status}`,
@@ -237,6 +245,18 @@ export function createHarnessSemanticJudge(options: HarnessSemanticJudgeOptions)
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
+    };
+
+  // The serialized judgment queue. Both handlers run `runOnce` (the second only
+  // once its predecessor settled), so a rejected judgment is not a poison
+  // pill — the next one still runs, on the same fresh-pane guarantees.
+  let runQueue: Promise<unknown> = Promise.resolve();
+  return {
+    identity,
+    falsify(context: SemanticContext): Promise<JudgeRuling[]> {
+      const next = runQueue.then(runOnce(context));
+      runQueue = next.catch((error: unknown) => error);
+      return next;
     },
   };
 }
