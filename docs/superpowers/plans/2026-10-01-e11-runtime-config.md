@@ -20,7 +20,7 @@
 
 ## Order (ruling RG1)
 
-#43 → #41 → #44 → #42. Rationale: #43/#41 are independent config surfaces (quick, no harness dependency); #44 (herdr-once harness) and #42 (judge, which builds on #44) follow once the harness design is confirmed.
+#43 → #44 → #42 → #41. Rationale: #43 is in flight (independent config); #44 (herdr-once harness) is the real blocker and is now design-confirmed, #42 (judge) builds on it, #41 (policy config) is independent and last.
 
 ---
 
