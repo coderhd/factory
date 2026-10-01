@@ -7,6 +7,7 @@ import { startFactoryServer, type FactoryServerDeps } from '../factory/api/serve
 import { createBackup, restoreBackup } from '../factory/backup/archive';
 import {
   DEFAULT_FACTORY_CONFIG,
+  isLoopbackHostname,
   parseFactoryConfig,
   resolveFactoryConfig,
   serializeFactoryConfig,
@@ -499,6 +500,22 @@ async function cmdStatus(args: ParsedArgs, io: CliIO): Promise<number> {
   return 0;
 }
 
+/**
+ * E10.4 (#40), serve-time fail-closed re-check: config validation sees only the
+ * YAML `server.hostname`, but `--hostname` (the container path) can widen the
+ * *effective* bind past it. A non-loopback effective bind without
+ * `server.auth` is refused here too — mutating routes must not be reachable
+ * off-loopback unauthenticated.
+ */
+function effectiveBindAuthError(hostname: string, runtime: FactoryRuntimeConfig): string | null {
+  if (isLoopbackHostname(hostname) || runtime.server.auth) return null;
+  return (
+    `refusing to bind ${hostname}: the control plane requires a bearer credential when the ` +
+    'effective bind is not loopback — configure server.auth { token, actor } in factory.yaml ' +
+    '(see factory-docs/implementation/control-plane-auth.md)'
+  );
+}
+
 async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   const dir = resolveDir(args, io);
   const loaded = loadConfig(dir, io);
@@ -506,8 +523,13 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   const port = flag(args, 'port') !== undefined ? Number(flag(args, 'port')) : loaded.runtime.server.port;
   // The bind address is the resolved `server.hostname` (spec §20); `--hostname`
   // overrides it for a container, where the loopback default is unreachable
-  // through a mapped port.
+  // through a mapped port. A non-loopback effective bind requires auth (E10.4).
   const hostname = flag(args, 'hostname') ?? loaded.runtime.server.hostname;
+  const bindError = effectiveBindAuthError(hostname, loaded.runtime);
+  if (bindError) {
+    io.err(bindError);
+    return 1;
+  }
 
   const deps = buildServerDeps(loaded.runtime);
   const handle = startFactoryServer(deps, { port, hostname });
@@ -540,6 +562,13 @@ async function cmdStart(args: ParsedArgs, io: CliIO): Promise<number> {
   if (!loaded) return 1;
   const port = flag(args, 'port') ?? String(loaded.runtime.server.port);
   const hostname = flag(args, 'hostname') ?? loaded.runtime.server.hostname;
+  // Fail fast on an unauthenticated wide bind **before** spawning the child
+  // (E10.4): the serve child's error output is not visible to the caller.
+  const bindError = effectiveBindAuthError(hostname, loaded.runtime);
+  if (bindError) {
+    io.err(bindError);
+    return 1;
+  }
 
   if (!hasFlag(args, 'detached')) {
     const withPort = { ...args, flags: withFlag(args, 'port', port) };
@@ -865,7 +894,7 @@ async function cmdControl(args: ParsedArgs, io: CliIO): Promise<number> {
   if (sub === 'pause' || sub === 'resume' || sub === 'emergency-stop') {
     const actor = flag(args, 'actor');
     if (!actor) {
-      io.err(`usage: factory control ${sub} --actor <id> [--url <url>]`);
+      io.err(`usage: factory control ${sub} --actor <id> [--token <tok>] [--url <url>]`);
       return 1;
     }
     const controls =
@@ -937,14 +966,14 @@ const HELP = [
   '  wo submit --intent <text> [--url]      create a Work Order (DRAFT)',
   '  wo status <workOrderId> [--url]        read Work Order status',
   '  wo plan <workOrderId> --dag <file>     commit a planner DAG proposal',
-  '  wo answer <interactionId> <response> [--actor <id>]  answer a QUESTION',
+  '  wo answer <interactionId> <response> [--actor <id>]  answer a QUESTION (--actor is overridden when the server requires a credential)',
   '  approvals list [--status <state>]      list policy approvals',
   '  approvals answer <approvalId> --decision APPROVAL|DENY --actor <id>  answer an approval',
   '  observatory [--url]                    read Observatory projections',
   '  github import --repo <owner/name> --issue <n>  import a GitHub issue into a Work Order',
   '  github pr --bundle <evidenceBundleId>  open a PR linking the Evidence Bundle',
   '  control status [--url]                 read pause/e-stop controls',
-  '  control <pause|resume|emergency-stop> --actor <id>  set a factory control',
+  '  control <pause|resume|emergency-stop> --actor <id>  set a factory control (--actor is overridden when the server requires a credential)',
   '',
   "  Client commands accept --token <tok> (or $FACTORY_TOKEN) when the server",
   '  requires a bearer credential (E10.4).',

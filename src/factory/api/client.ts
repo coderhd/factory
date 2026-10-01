@@ -88,10 +88,12 @@ export function createFactoryClient(options: FactoryClientOptions): FactoryClien
   const fetchImpl = options.fetch ?? fetch;
 
   async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const authorization: Record<string, string> = {};
-    if (options.token) authorization.authorization = `Bearer ${options.token}`;
-    const headers: Record<string, string> =
-      body === undefined ? authorization : { ...authorization, 'content-type': 'application/json' };
+    // GET routes are the declared-public read boundary (E10.4), so the bearer
+    // credential is attached to non-GET requests only — it never rides along
+    // on reads, and it is never logged.
+    const headers: Record<string, string> = {};
+    if (options.token && method !== 'GET') headers.authorization = `Bearer ${options.token}`;
+    if (body !== undefined) headers['content-type'] = 'application/json';
     const response = await fetchImpl(`${base}/api${path}`, {
       method,
       headers,

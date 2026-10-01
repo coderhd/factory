@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -2345,6 +2345,50 @@ describe('E10.4 control-plane authentication (#40)', () => {
     // The loopback default needs no auth.
     const loopback = parseFactoryConfig(text({ hostname: '127.0.0.1', port: 8787 }));
     expect(loopback.ok).toBe(true);
+  });
+
+  it('refuses a non-loopback EFFECTIVE bind (--hostname override) without server.auth, at serve time', async () => {
+    // Config validation only sees the YAML (loopback = valid, no auth) —
+    // `--hostname` can still widen the effective bind past it. The serve path
+    // must re-check the effective bind (fail-closed).
+    const dir = join(workDir, 'auth-serve-refusal');
+    mkdirSync(dir, { recursive: true });
+    expect(await runCli(['init', '--dir', dir], { out: () => {}, err: () => {} })).toBe(0);
+
+    const err: string[] = [];
+    const code = await runCli(['start', '--dir', dir, '--hostname', '0.0.0.0'], {
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+    expect(code).toBe(1);
+    expect(err.join('\n')).toContain('server.auth');
+    // Nothing started: no runtime file was written.
+    expect(existsSync(join(dir, '.factory', 'runtime.json'))).toBe(false);
+  });
+
+  it('allows a non-loopback effective bind when factory.yaml carries server.auth (container path)', async () => {
+    const dir = join(workDir, 'auth-serve-allowed');
+    mkdirSync(dir, { recursive: true });
+    expect(await runCli(['init', '--dir', dir], { out: () => {}, err: () => {} })).toBe(0);
+    const path = join(dir, 'factory.yaml');
+    writeFileSync(
+      path,
+      readFileSync(path, 'utf8').replace(
+        'hostname: 127.0.0.1',
+        ['hostname: 127.0.0.1', '  auth:', `    token: ${AUTH_TOKEN}`, `    actor: ${OPERATOR}`].join('\n'),
+      ),
+    );
+
+    // Detached like a real container boot (the `--hostname` override widens the
+    // bind past the YAML); hermetic (a local multi-interface bind).
+    const code = await runCli(['start', '--dir', dir, '--detached', '--port', '0', '--hostname', '0.0.0.0'], { out: () => {}, err: () => {} });
+    expect(code).toBe(0);
+    try {
+      const text = readFileSync(join(dir, '.factory', 'runtime.json'), 'utf8');
+      expect(JSON.parse(text)).toHaveProperty('url');
+    } finally {
+      await runCli(['stop', '--dir', dir], { out: () => {}, err: () => {} });
+    }
   });
 });
 

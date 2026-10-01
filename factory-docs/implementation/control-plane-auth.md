@@ -10,6 +10,7 @@ A shared **bearer token**. Every mutating request (non-GET) to the control-plane
 
 - **GET routes are public** (`/health`, `/handshake`, status/projections, list reads). They carry no secret-bearing responses beyond operational status, and `compose.yaml` publishes the port to **loopback only** (`127.0.0.1:8787`), so a loopback deployment keeps everything host-local. Widen the bind only with `server.auth` configured.
 - **All mutating routes are gated when auth is configured.** Without `server.auth`, a loopback bind is the trust boundary; non-loopback + no auth is a hard config error.
+- **Effective-bind re-check (E10.4 review fix):** `--hostname <non-loopback>` (the container path, `Dockerfile` CMD) widens the bind past the YAML's loopback default, so the serve path re-checks at boot and **refuses to bind** a non-loopback effective hostname when `runtime.server.auth` is absent — the container fails closed at start rather than serving mutating routes unauthenticated. Template `server.auth { token, actor }` into the shipped `factory.yaml` to enable the container path.
 
 ## Attributable receipts
 

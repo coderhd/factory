@@ -164,8 +164,12 @@ function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
-/** The hostnames that may serve the control plane unauthenticated (§20). */
-function isLoopbackHostname(hostname: string): boolean {
+/**
+ * The hostnames that may serve the control plane unauthenticated (§20).
+ * Exported for the serve path's effective-bind re-check (E10.4, #40): config
+ * validation sees only the YAML hostname, `--hostname` can widen the bind.
+ */
+export function isLoopbackHostname(hostname: string): boolean {
   return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
 }
 

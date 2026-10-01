@@ -170,7 +170,12 @@ function bearerToken(request: Request): string | null {
 function tokensEqual(presented: string, configured: string): boolean {
   const left = Buffer.from(presented, 'utf8');
   const right = Buffer.from(configured, 'utf8');
-  if (left.length !== right.length) return false;
+  if (left.length !== right.length) {
+    // Equal-burn: compare equal-length buffers so the call's timing does not
+    // leak the configured token's length.
+    timingSafeEqual(right, right);
+    return false;
+  }
   return timingSafeEqual(left, right);
 }
 
