@@ -375,9 +375,9 @@ function resolveGitHubInputs(
   options: ServerDepsOptions,
 ): GitHubCompositionInputs | null {
   const failClosed = (): never => {
-    const error = githubTokenMissingError(runtime);
-    if (error) throw new Error(error);
-    throw new Error('github adapter is unconfigured');
+    // Unreachable when `runtime.github` is absent: callers check the section
+    // first, so the token error is always present here.
+    throw new Error(githubTokenMissingError(runtime) ?? 'github adapter is unconfigured');
   };
 
   if (options.github) {
@@ -396,7 +396,7 @@ function resolveGitHubInputs(
     if (token.trim().length === 0) failClosed();
     const hostname = options.serverBind?.hostname ?? runtime.server.hostname;
     const port = options.serverBind?.port ?? runtime.server.port;
-    const effectiveUrl = `http://${hostname}:${port}`;
+    const effectiveUrl = `http://${bindLinkHostname(hostname, runtime.server.hostname)}:${port}`;
     return {
       transport:
         options.githubTransport ??
@@ -409,6 +409,24 @@ function resolveGitHubInputs(
       baseBranch: runtime.github.baseBranch,
     };
   }
+}
+
+function isWildcardHostname(hostname: string): boolean {
+  return hostname === '0.0.0.0' || hostname === '::' || hostname.trim().length === 0;
+}
+
+/**
+ * The hostname that is safe to embed in *outbound* links (E11.3, #43). The
+ * effective bind wins for a concrete host, but a deployment that binds
+ * `0.0.0.0`/`::` (e.g. the container path, `--hostname 0.0.0.0` per compose.yaml)
+ * would advertise `http://0.0.0.0:<port>` in PR bodies — the bind is correct,
+ * the link is unclickable. A wildcard bind therefore falls back to the YAML
+ * `server.hostname` when it is routable, else the loopback; the effective port
+ * is kept (the bound port is what the deployment exposes).
+ */
+function bindLinkHostname(hostname: string, configuredHostname: string): string {
+  if (hostname !== '0.0.0.0' && hostname !== '::') return hostname;
+  return isWildcardHostname(configuredHostname) ? '127.0.0.1' : configuredHostname;
 }
 
 export function buildServerDeps(

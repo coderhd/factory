@@ -388,4 +388,76 @@ describe('E11.3 GitHub transport/token configuration (#43)', () => {
       deps.store.close();
     }
   });
+
+  it('embeds a routable host for a wildcard bind; a concrete effective hostname still wins', async () => {
+    const listener = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('') });
+    const effectivePort = listener.port ?? 0;
+    const transport = new MockGitHub();
+    transport.issues.set('acme/widgets#43', issueDTO());
+    const url = `http://127.0.0.1:${effectivePort}`;
+    const listenerReload = (deps: ReturnType<typeof buildServerDeps>): void => {
+      listener.reload({ fetch: createApiHandler(deps) });
+    };
+
+    async function openPrFor(serverBind: { hostname: string; port: number }): Promise<string> {
+      // The YAML binds 127.0.0.1 (routable fallback for the wildcard case).
+      const runtime = runtimeFrom(
+        configText(undefined, { hostname: '127.0.0.1', port: effectivePort }),
+      );
+      const deps = buildServerDeps(runtime, {
+        reconcileOnBoot: false,
+        githubTransport: transport,
+        serverBind,
+      });
+      // The shared listener serves this build's deps for the duration.
+      listenerReload(deps);
+      try {
+        const imported = await fetch(`${url}/api/github/import`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ repository: 'acme/widgets', number: 43 }),
+        });
+        // 201 created, or 200 reconciled (a prior WO survives in the shared
+        // state dir); either way the Work Order exists for the PR.
+        if (imported.status !== 200 && imported.status !== 201) {
+          throw new Error(`import failed: ${imported.status} ${await imported.text()}`);
+        }
+        const { workOrder } = (await imported.json()) as { workOrder: WorkOrder };
+        const bundle = {
+          id: `eb_bind_${serverBind.hostname.replace(/[^a-z0-9]/gi, '_')}`,
+          workOrderId: workOrder.id,
+          complete: true,
+          gates: { deterministic: true, behavioral: true, semantic: true, run: true },
+        };
+        deps.store.set('evidence_bundles', bundle.id, bundle);
+        const opened = await fetch(`${url}/api/github/pull-requests`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ evidenceBundleId: bundle.id }),
+        });
+        expect(opened.status).toBe(201);
+        const pr = transport.prCalls.at(-1)!;
+        return pr.body;
+      } finally {
+        deps.store.close();
+      }
+    }
+
+    try {
+      // Container path: effective bind 0.0.0.0 — the PR link is the routable
+      // fallback (the YAML hostname 127.0.0.1), never the wildcard.
+      const wildcardBody = await openPrFor({ hostname: '0.0.0.0', port: effectivePort });
+      expect(wildcardBody).toContain(
+        `(${url}/api/observatory/work-orders/`,
+      );
+      expect(wildcardBody).not.toContain('0.0.0.0');
+
+      // A concrete effective hostname (localhost here) wins over the YAML
+      // fallback (127.0.0.1): the advertised host is the effective one.
+      const concreteBody = await openPrFor({ hostname: 'localhost', port: effectivePort });
+      expect(concreteBody).toContain(`http://localhost:${effectivePort}/api/`);
+    } finally {
+      listener.stop(true);
+    }
+  });
 });

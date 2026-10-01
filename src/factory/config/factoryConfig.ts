@@ -535,7 +535,10 @@ export function resolveFactoryConfig(
             // environment at serve time and never logged or persisted (#43).
             tokenEnv: config.github.token.env,
             apiBaseUrl: config.github.apiBaseUrl,
-            baseBranch: config.github.baseBranch ?? 'main',
+            // Trimmed like `repository` (and like the route trims caller
+            // input), so stray whitespace can't silently block the configured
+            // PR base during the policy gate.
+            baseBranch: (config.github.baseBranch ?? 'main').trim(),
           },
         }
       : {}),
