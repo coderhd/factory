@@ -8,6 +8,10 @@ import type {
   DrillDownDto,
   FactoryControlsDto,
   GateDecision,
+  GitHubImportRequest,
+  GitHubImportResultDto,
+  GitHubOpenPrRequest,
+  GitHubPullRequestDto,
   HandshakeDto,
   HealthDto,
   InteractionDto,
@@ -60,6 +64,17 @@ export interface FactoryClient {
   emergencyStop(actor: string): Promise<FactoryControlsDto>;
   pause(actor: string): Promise<FactoryControlsDto>;
   resume(actor: string): Promise<FactoryControlsDto>;
+  /**
+   * E10.3 (#37): reconcile a GitHub issue into a Work Order through the server.
+   * The server composes the E6 adapter; the client only speaks the contract.
+   */
+  githubImportIssue(request: GitHubImportRequest): Promise<GitHubImportResultDto>;
+  /**
+   * E10.3 (#37): open a PR whose body links the durable Evidence Bundle receipt
+   * named by `evidenceBundleId`. The server reads the receipt and runs the E6
+   * adapter's live `pr.create` policy gate.
+   */
+  githubOpenPullRequest(request: GitHubOpenPrRequest): Promise<GitHubPullRequestDto>;
 }
 
 export function createFactoryClient(options: FactoryClientOptions): FactoryClient {
@@ -159,5 +174,9 @@ export function createFactoryClient(options: FactoryClientOptions): FactoryClien
       request<FactoryControlsDto>('POST', '/factory/emergency-stop', { actor }),
     pause: (actor) => request<FactoryControlsDto>('POST', '/factory/pause', { actor }),
     resume: (actor) => request<FactoryControlsDto>('POST', '/factory/resume', { actor }),
+    githubImportIssue: (input) =>
+      request<GitHubImportResultDto>('POST', '/github/import', input),
+    githubOpenPullRequest: (input) =>
+      request<GitHubPullRequestDto>('POST', '/github/pull-requests', input),
   };
 }

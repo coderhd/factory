@@ -13,11 +13,19 @@ import { createEvidenceReadPort, type EvidenceReadPort } from '../observatory/ob
 import { changedPathsFromDiff, isEmergencyStopped, isFactoryPaused } from '../policy/policy';
 import {
   encodeFailure,
+  parseFailureClass,
   recover,
   RESOURCE_UNAVAILABLE,
+  type FailureClass,
   type FailureContext,
   type RecoveryAction,
 } from '../recovery/recovery';
+import {
+  beforeDependencyRequest,
+  circuitSnapshot,
+  recordDependencySuccess,
+  type CircuitConfig,
+} from '../recovery/circuitBreaker';
 import { routeAssignment } from '../routing/assignment';
 import type { BudgetState, ModelId } from '../routing/decisionModel';
 import { persistRoutingDecision } from '../routing/persist';
@@ -110,6 +118,14 @@ export interface SchedulerDeps {
    * built locally; either way the receipt is derived, never fabricated.
    */
   telemetry?: { evidence: EvidenceReadPort };
+  /**
+   * E10.3 (#37) circuit-breaker tuning. The scheduler is the **live producer**
+   * of dependency load: a worker dispatch consults {@link beforeDependencyRequest}
+   * (an OPEN circuit sheds it), a worker-reported dependency outage is fed to E7
+   * `recover()` (counting failures), and a completion through a circuit-admitted
+   * dispatch closes the circuit. Defaults to the module defaults.
+   */
+  circuit?: Partial<CircuitConfig>;
 }
 
 /** E4 routing signals for the assignment pass (RE7(b)). */
@@ -207,6 +223,45 @@ export const VERIFICATION_REJECTED = 'verification.rejected';
  * pending a human/operator path, and the park is surfaced by `status()`.
  */
 export const RECOVERY_PARKED = 'recovery.parked';
+
+/**
+ * E10.3 (#37): the §9.1 failure classes a worker can report that are really a
+ * dependency becoming unavailable (a model/provider outage), not a worker bug.
+ * A runtime writes its failure detail class-prefixed (`PROVIDER_OUTAGE: …`) per
+ * the §9.1 convention; the scheduler must preserve that signal so `recover()`
+ * feeds the circuit breaker instead of flattening it to `WORKER_FAILURE`.
+ */
+const DEPENDENCY_FAILURE_CLASSES: ReadonlySet<FailureClass> = new Set([
+  'DEPENDENCY_UNAVAILABLE',
+  'PROVIDER_OUTAGE',
+  'MODEL_UNAVAILABLE',
+]);
+
+/**
+ * E10.3 (#37): classify a live worker failure detail. A class-prefixed detail
+ * that names a dependency outage keeps that class (and, for the circuit key, the
+ * Attempt's model as the concrete dependency); anything else is a
+ * `WORKER_FAILURE` carrying the detail verbatim, exactly as before #37.
+ */
+export function classifyWorkerFailure(
+  detail: string,
+  model: string | null | undefined,
+): { failureClass: FailureClass; message: string; dependency?: string } {
+  const parsed = parseFailureClass(detail);
+  if (!DEPENDENCY_FAILURE_CLASSES.has(parsed)) {
+    return { failureClass: 'WORKER_FAILURE', message: detail };
+  }
+  const colon = detail.indexOf(':');
+  const message = colon >= 0 ? detail.slice(colon + 1).trim() : detail;
+  // Key the circuit on the concrete dependency the run needed (its model), so a
+  // failure, its dispatch gate and its closing success all agree on one bucket.
+  return { failureClass: parsed, message, ...(model ? { dependency: model } : {}) };
+}
+
+/** E10.3 (#37): the `beforeDependencyRequest` key for a worker-bound dispatch. */
+function dependencyKeyForModel(model: string | null | undefined): string {
+  return model ?? 'provider';
+}
 
 /**
  * A persisted §12 interaction: the durable question a `waiting_input` Attempt
@@ -310,6 +365,13 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
    * fresh event; the Task stays READY throughout and is retried every tick.
    */
   const blockedSignatures = new Map<string, string>();
+  /**
+   * E10.3 (#37): `task:model` signatures already shed by an OPEN dependency
+   * circuit, so a Task waiting on an open circuit records its
+   * `resource.unavailable` park once rather than once per tick. The Task is
+   * retried every tick and proceeds when the circuit half-opens.
+   */
+  const shedSignatures = new Set<string>();
   /**
    * E10.2 (#38, RF7): Tasks parked on a recovery action the live scheduler has
    * no executor for (or a recovery error). Seeded from the durable log on
@@ -573,6 +635,51 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     });
   }
 
+  // --- E10.3 (#37) circuit live producer ------------------------------------
+
+  /**
+   * The dependency-bound dispatch gate (spec §18.9). Consulted before a worker
+   * is dispatched for a model-keyed dependency: a CLOSED circuit admits, an OPEN
+   * circuit sheds (the Task waits — no Attempt, no worker, no budget spent) and
+   * past the reset window a single HALF_OPEN probe is admitted. A shed records a
+   * durable, idempotent `resource.unavailable` park so it is observable.
+   */
+  function admitDependency(model: string | null | undefined, taskId: string): boolean {
+    const dependency = dependencyKeyForModel(model);
+    const decision = beforeDependencyRequest(
+      { events: deps.events, now },
+      dependency,
+      deps.circuit,
+    );
+    if (decision.allowed) return true;
+    const signature = `${taskId}:${dependency}`;
+    if (!shedSignatures.has(signature)) {
+      shedSignatures.add(signature);
+      deps.events.appendEvent({
+        type: RESOURCE_UNAVAILABLE,
+        aggregateType: 'work_order',
+        aggregateId: deps.store.get<Task>('tasks', taskId)?.workOrderId ?? taskId,
+        payload: { resource: dependency, dependency, taskId, at: now() },
+      });
+    }
+    return false;
+  }
+
+  /**
+   * Settle a dependency success for a completed worker run (§18.9). A completion
+   * through a circuit-admitted dispatch is the evidence that closes a recovered
+   * circuit. Only non-CLOSED circuits are touched, so the happy path appends no
+   * events (no per-completion log spam); a HALF_OPEN probe is closed here.
+   */
+  function settleDependencySuccess(model: string | null | undefined): void {
+    const dependency = dependencyKeyForModel(model);
+    const circuitDeps = { events: deps.events, now };
+    if (circuitSnapshot(circuitDeps, dependency).state === 'CLOSED') {
+      return;
+    }
+    recordDependencySuccess(circuitDeps, dependency);
+  }
+
   function routeCompletion(item: Completion): void {
     const worker = deps.store.get<WorkerRecord>('workers', item.workerId);
     if (!worker || worker.runtimeState !== 'BUSY' || !worker.lease) return;
@@ -611,6 +718,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     routedReports.delete(worker.id);
     if (result && result.status === 'completed' && hasEvidence(result)) {
       const artifactIds = storeArtifacts(attemptId, result);
+      const modelAtCompletion = deps.store.get<Attempt>('attempts', attemptId)?.model ?? null;
       deps.store.db.transaction(() => {
         completeAttempt(deps, attemptId, {
           outcome: 'success',
@@ -621,6 +729,9 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         transitionTask(deps, task.id, { to: 'SUCCESS' });
         release(worker, assignment, t);
       })();
+      // E10.3 (#37): a completion through a circuit-admitted dispatch is live
+      // evidence that the dependency recovered — close a non-CLOSED circuit.
+      settleDependencySuccess(modelAtCompletion);
       recordTelemetry(attemptId);
       return;
     }
@@ -631,7 +742,12 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
     // re-opens execution with a fresh Assignment (the dead-end was the missing
     // re-dispatcher, not the RUNNING state).
     const detail = result?.failure ?? item.error ?? 'worker reported failure without evidence';
-    const failure = encodeFailure('WORKER_FAILURE', detail);
+    // E10.3 (#37): classify the live failure. A class-prefixed dependency outage
+    // keeps its class (both in the durable failure record and in the recovery
+    // context) so `recover()` feeds the circuit breaker; anything else remains a
+    // WORKER_FAILURE, exactly as before.
+    const classified = classifyWorkerFailure(detail, deps.store.get<Attempt>('attempts', attemptId)?.model);
+    const failure = encodeFailure(classified.failureClass, classified.message);
     const artifactIds = result ? storeArtifacts(attemptId, result) : [];
     deps.store.db.transaction(() => {
       completeAttempt(deps, attemptId, {
@@ -649,14 +765,16 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
       deps.artifacts.put(`${attemptId}/diff.patch`, result.diff);
     }
     recordTelemetry(attemptId);
-    recoverWorkerFailure(task, attemptId, detail);
+    recoverWorkerFailure(task, attemptId, classified);
   }
 
   /**
-   * Hand a live worker failure to E7's bounded recovery (E10.2, #38). E7
-   * classifies it `WORKER_FAILURE`, applies its budgeted action, and — for
+   * Hand a live worker failure to E7's bounded recovery (E10.2, #38; E10.3 #37).
+   * E7 classifies the failure, applies its budgeted action, and — for
    * `RETRY_NEW_ATTEMPT` — mints the single clean-baseline Attempt, which
-   * {@link redispatchPass} then re-opens with a fresh Assignment.
+   * {@link redispatchPass} then re-opens with a fresh Assignment. A
+   * dependency-class failure (E10.3) also feeds the circuit breaker through
+   * `recover()`.
    *
    * An action the scheduler has no live executor for (`REASSIGN`/`REPLAN`, whose
    * execution is deferred) is parked **loudly** (RF7): a durable
@@ -665,19 +783,26 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
    * retried on the next tick (the Attempt is already settled, so nothing
    * re-drives it); the Task stays RUNNING pending a human/operator path.
    */
-  function recoverWorkerFailure(task: Task, attemptId: string, detail: string): void {
+  function recoverWorkerFailure(
+    task: Task,
+    attemptId: string,
+    classified: ReturnType<typeof classifyWorkerFailure>,
+  ): void {
     const attempt = deps.store.get<Attempt>('attempts', attemptId);
     const failure: FailureContext = {
       attemptId,
       taskId: task.id,
       workOrderId: task.workOrderId,
-      failureClass: 'WORKER_FAILURE',
-      error: detail,
+      failureClass: classified.failureClass,
+      error: classified.message,
       // §18.4 default: a new Attempt from a clean worktree is the changed condition.
       changedCondition: 'clean-worktree',
       // Post-completion failureHistory length, so a replayed delivery computes
       // the same §9.6 idempotency key.
       failureIndex: attempt?.failureHistory.length ?? 1,
+      // E10.3 (#37): a dependency outage keys the circuit on the concrete
+      // dependency (the failed run's model), matching its dispatch gate.
+      ...(classified.dependency ? { dependency: classified.dependency } : {}),
     };
     let action: RecoveryAction;
     try {
@@ -687,6 +812,7 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
           events: deps.events,
           now,
           ...(deps.artifacts ? { artifacts: deps.artifacts } : {}),
+          ...(deps.circuit ? { circuit: deps.circuit } : {}),
         },
         failure,
       );
@@ -904,6 +1030,12 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         skipped.add(candidate.task.id);
         continue;
       }
+      // E10.3 (#37): an OPEN dependency circuit sheds the dispatch before any
+      // work starts — the Task stays READY, no Attempt, no budget spent.
+      if (!admitDependency(model, candidate.task.id)) {
+        skipped.add(candidate.task.id);
+        continue;
+      }
 
       let assignment: AssignmentRecord | null = null;
       try {
@@ -956,6 +1088,10 @@ export function createScheduler(deps: SchedulerDeps, config: Partial<SchedulerCo
         if (!attempt) continue;
         const idleWorker = deps.workers.listWorkers().find((worker) => worker.runtimeState === 'IDLE');
         if (!idleWorker) continue;
+        // E10.3 (#37): the re-dispatch is the dependency-bound operation too — an
+        // OPEN circuit sheds it, a HALF_OPEN window admits it as the probe. The
+        // Attempt is E7's and stays open; it is retried when the circuit closes.
+        if (!admitDependency(attempt.model, task.id)) continue;
         let assignment: AssignmentRecord | null = null;
         try {
           const worktree = deps.worktrees.createTaskWorktree(task.id, scope.workOrder.id, deps.repoPath);

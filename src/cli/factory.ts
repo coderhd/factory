@@ -23,6 +23,7 @@ import { createEvidenceReadPort } from '../factory/observatory/observatory';
 import { check, checkDetailed, repoWriteGate } from '../factory/policy/policy';
 import type { DAGProposalPayload } from '../factory/planning/dag';
 import { reconcileAfterRestart } from '../factory/recovery/recovery';
+import type { CircuitConfig } from '../factory/recovery/circuitBreaker';
 import { createScheduler, type SchedulerPolicy } from '../factory/scheduler/scheduler';
 import { createArtifactStore, openStateStore, type StateStore } from '../factory/state/store';
 import {
@@ -213,12 +214,38 @@ export interface ServerDepsOptions {
     runCommand?: CommandRunner;
   };
   /**
+   * E10.3 (#37) circuit-breaker tuning for the live dependency producer. Wired
+   * onto the scheduler; defaults to the module defaults.
+   */
+  circuit?: Partial<CircuitConfig>;
+  /**
    * E9.6 boot reconciliation. On a real server start this runs first (spec
    * §18.3), so a crash that left an in-flight Attempt behind is interrupted and
    * recovered before the scheduler loop begins. Defaults to `true`; tests that
    * build deps over pre-seeded state can opt out.
    */
   reconcileOnBoot?: boolean;
+  /**
+   * E10.3 (#37) GitHub route composition. When supplied, `buildServerDeps`
+   * constructs the E6 adapter here — the **only** place a `GitHubTransport` is
+   * injected — wiring it to the real E7 `checkDetailed` policy and the durable
+   * `evidence_bundles` read-back, and attaches it to `FactoryServerDeps.github`
+   * so the server's operator routes can import an issue and open a PR. The
+   * transport itself (production: the REST client; tests: a mock) is the
+   * caller's; auth/config is out of #37's scope. Absent, no adapter is built and
+   * the GitHub routes 404 (fail closed).
+   */
+  github?: {
+    transport: GitHubTransport;
+    /**
+     * Base URL of the E2 API the adapter's client mutates through. Defaults to
+     * the resolved `server.url` (the running process's own API). Tests that bind
+     * the server to an ephemeral port pass the bound URL here.
+     */
+    apiBaseUrl?: string;
+    /** Factory base URL used to render the PR body's links. Defaults to `server.url`. */
+    factoryBaseUrl?: string;
+  };
 }
 
 /**
@@ -310,6 +337,23 @@ export function buildServerDeps(
   // One store-backed evidence reader serves both the Observatory projection and
   // E9.7's per-Attempt telemetry (human-leverage layer) — a single read seam.
   const evidence = createEvidenceReadPort(store);
+  // E10.3 (#37): compose the E6 GitHub adapter into the running process when a
+  // transport is supplied. Its client speaks the E2 API (the sole mutation
+  // authority), its policy gate is the real E7 `checkDetailed`, and its evidence
+  // read-back is the durable `evidence_bundles` receipt — the same sources the
+  // server itself uses. Absent a transport, none is built (routes 404).
+  const github = options.github
+    ? buildGitHubAdapter({
+        transport: options.github.transport,
+        client: createFactoryClient({
+          baseUrl: options.github.apiBaseUrl ?? runtime.server.url,
+        }),
+        factoryBaseUrl: options.github.factoryBaseUrl ?? runtime.server.url,
+        store,
+        events,
+        baseBranch: runtime.worktrees.baseBranch,
+      })
+    : undefined;
   // E9.6 boot reconciliation (spec §18.3): walk durable state → event history →
   // RUNNING Attempts → worker leases before the loop starts. Post-restart no
   // adapter is live, so every lease is treated as stopped (via
@@ -341,6 +385,7 @@ export function buildServerDeps(
       policy: createSchedulerPolicy({ store, events }),
       telemetry: { evidence },
       ...(verifier ? { verifier } : {}),
+      ...(options.circuit ? { circuit: options.circuit } : {}),
     },
     {
       maxConcurrentTasks: runtime.scheduler.maxConcurrentTasks,
@@ -356,6 +401,7 @@ export function buildServerDeps(
     events,
     evidence,
     scheduler,
+    ...(github ? { github } : {}),
     version: runtime.factoryVersion,
     schemaVersion: runtime.schemaVersion,
   };
@@ -695,6 +741,62 @@ async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
   return 1;
 }
 
+/**
+ * E10.3 (#37) GitHub operator surface (spec §4.2/§28). `factory github import
+ * --repo <owner/name> --issue <n>` reconciles an issue into a Work Order;
+ * `factory github pr --bundle <evidenceBundleId>` opens a PR that links the
+ * durable Evidence Bundle. Both call the API — the server composes the E6
+ * adapter, and the CLI never talks to GitHub.
+ */
+async function cmdGithub(args: ParsedArgs, io: CliIO): Promise<number> {
+  const sub = args.positionals[1];
+  const url = resolveUrl(args, io);
+  if (!url) {
+    io.err('no server URL; pass --url or start the server first');
+    return 1;
+  }
+  const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
+
+  if (sub === 'import') {
+    const repository = flag(args, 'repo');
+    const number = flag(args, 'issue');
+    if (!repository || !number) {
+      io.err('usage: factory github import --repo <owner/name> --issue <number> [--url <url>]');
+      return 1;
+    }
+    const parsed = Number(number);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      io.err(`--issue must be a positive integer (got "${number}")`);
+      return 1;
+    }
+    io.out(JSON.stringify(await client.githubImportIssue({ repository, number: parsed })));
+    return 0;
+  }
+
+  if (sub === 'pr') {
+    const evidenceBundleId = flag(args, 'bundle');
+    if (!evidenceBundleId) {
+      io.err('usage: factory github pr --bundle <evidenceBundleId> [--base <branch>] [--title <text>] [--url <url>]');
+      return 1;
+    }
+    const base = flag(args, 'base');
+    const title = flag(args, 'title');
+    io.out(
+      JSON.stringify(
+        await client.githubOpenPullRequest({
+          evidenceBundleId,
+          ...(base ? { baseBranch: base } : {}),
+          ...(title ? { title } : {}),
+        }),
+      ),
+    );
+    return 0;
+  }
+
+  io.err(`unknown github subcommand: ${sub ?? ''}`);
+  return 1;
+}
+
 async function cmdObservatory(args: ParsedArgs, io: CliIO): Promise<number> {
   const url = resolveUrl(args, io);
   if (!url) {
@@ -799,6 +901,8 @@ const HELP = [
   '  approvals list [--status <state>]      list policy approvals',
   '  approvals answer <approvalId> --decision APPROVAL|DENY --actor <id>  answer an approval',
   '  observatory [--url]                    read Observatory projections',
+  '  github import --repo <owner/name> --issue <n>  import a GitHub issue into a Work Order',
+  '  github pr --bundle <evidenceBundleId>  open a PR linking the Evidence Bundle',
   '  control status [--url]                 read pause/e-stop controls',
   '  control <pause|resume|emergency-stop> --actor <id>  set a factory control',
 ].join('\n');
@@ -830,6 +934,8 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         return await cmdApprovals(args, io);
       case 'observatory':
         return await cmdObservatory(args, io);
+      case 'github':
+        return await cmdGithub(args, io);
       case 'control':
         return await cmdControl(args, io);
       case 'help':

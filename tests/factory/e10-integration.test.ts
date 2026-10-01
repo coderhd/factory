@@ -4,7 +4,9 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildServerDeps } from '../../src/cli/factory';
+import { buildGitHubAdapter, buildServerDeps, runCli, type CliIO } from '../../src/cli/factory';
+import { createFactoryClient } from '../../src/factory/api/client';
+import { createApiHandler, startFactoryServer } from '../../src/factory/api/server';
 import {
   DEFAULT_FACTORY_CONFIG,
   parseFactoryConfig,
@@ -12,6 +14,23 @@ import {
   serializeFactoryConfig,
   type FactoryDesiredConfig,
 } from '../../src/factory/config/factoryConfig';
+import { createEmptyEvidenceReadPort } from '../../src/factory/observatory/observatory';
+import { openEventLog } from '../../src/factory/events/log';
+import { circuitSnapshot } from '../../src/factory/recovery/circuitBreaker';
+import { taskWorktreeBranch } from '../../src/factory/worktrees/worktree';
+import { check as policyCheck } from '../../src/factory/policy/policy';
+import type {
+  CreateBranchInput,
+  CreatePullRequestInput,
+  GitHubIssue,
+  GitHubPullRequest,
+  GitHubPullRequestDetail,
+  GitHubTransport,
+  GitHubMergeResult,
+  IssueRef,
+  MergePullRequestInput,
+  PullRequestRef,
+} from '../../src/factory/github/adapter';
 import {
   completeAttempt,
   createAttempt,
@@ -900,6 +919,547 @@ describe('E10.2 worker-failure re-dispatch producer', () => {
     } finally {
       console.error = originalError;
       h.deps.store.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E10.3 (#37) — the circuit live producer
+// ---------------------------------------------------------------------------
+
+/**
+ * The E10.3 circuit producer harness. A live worker reports a failure whose
+ * detail already carries the §9.1 class prefix; the scheduler must classify it
+ * (not flatten it to WORKER_FAILURE), feed `recover()` and so open the circuit
+ * from real load. Two independent Tasks with `maxConcurrentTasks: 2` keep one
+ * live Attempt across the outage, so a successful completion is the evidence
+ * that closes a recovered circuit. A controllable clock crosses the reset window
+ * deterministically.
+ */
+function circuitHarness(): ProducerHarness & {
+  clock: { advance(ms: number): void };
+} {
+  const text = serializeFactoryConfig({
+    ...DEFAULT_FACTORY_CONFIG,
+    repository: { path: repoPath },
+    verification: VERIFICATION,
+    scheduler: { ...DEFAULT_FACTORY_CONFIG.scheduler, maxConcurrentTasks: 2 },
+  });
+  const runtime = runtimeFrom(text);
+  const adapters: ScriptedHerdr[] = [];
+  let t = Date.parse('2026-10-01T00:00:00.000Z');
+  const clock = {
+    now: () => new Date(t).toISOString(),
+    advance: (ms: number) => {
+      t += ms;
+    },
+  };
+  const deps = buildServerDeps(runtime, {
+    spawn: () => {
+      const adapter = new ScriptedHerdr();
+      adapters.push(adapter);
+      return adapter;
+    },
+    now: clock.now,
+    verification: { judge: passingJudge(), runCommand: passingRunner() },
+    // A small, deterministic circuit: two consecutive failures trip it; a 1s
+    // reset window opens the half-open probe without a real-time wait.
+    circuit: { failureThreshold: 2, resetTimeoutMs: 1_000, probeTimeoutMs: 500 },
+  });
+  const tickAndSettle = async (): Promise<void> => {
+    deps.scheduler!.tick();
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  };
+  return {
+    runtime,
+    deps,
+    adapters,
+    clock,
+    tickAndSettle,
+    async until(label, predicate, maxTicks = 30): Promise<void> {
+      for (let i = 0; i < maxTicks; i += 1) {
+        await tickAndSettle();
+        if (predicate()) return;
+        await tickAndSettle();
+        if (predicate()) return;
+      }
+      throw new Error(`E10.3: "${label}" was not reached within the tick budget`);
+    },
+    adapterForAttempt(attemptId): ScriptedHerdr {
+      const adapter = adapters.find((candidate) => candidate.envelope?.attemptId === attemptId);
+      if (!adapter) throw new Error(`no adapter dispatched for attempt ${attemptId}`);
+      return adapter;
+    },
+  };
+}
+
+/** Seed an EXECUTING Work Order with two independent nodes (two Tasks). */
+function seedTwoExecuting(deps: {
+  store: ReturnType<typeof buildServerDeps>['store'];
+  events: ReturnType<typeof buildServerDeps>['events'];
+}): { wo: WorkOrder; tasks: Task[] } {
+  const wo = createWorkOrder(deps, { intent: 'E10.3 circuit subject', acceptanceCriteria: ['accepted'] });
+  for (const to of ['READY', 'PLANNING'] as const) transitionWorkOrder(deps, wo.id, { to });
+  const dag = commitDAG(deps, wo.id, {
+    nodes: [
+      { nodeId: 'a', title: 'A' },
+      { nodeId: 'b', title: 'B' },
+    ],
+  });
+  transitionWorkOrder(deps, wo.id, { to: 'EXECUTING' });
+  return { wo, tasks: dag.nodes.map((node) => deps.store.get<Task>('tasks', node.taskId)!) };
+}
+
+const resourceUnavailableEvents = (
+  deps: ReturnType<typeof buildServerDeps>,
+  workOrderId: string,
+): Array<{ resource?: string }> =>
+  deps.events
+    .readEvents({ aggregateType: 'work_order', aggregateId: workOrderId })
+    .filter((event) => event.type === RESOURCE_UNAVAILABLE)
+    .map((event) => event.payload as { resource?: string });
+
+const runningTasks = (
+  store: ReturnType<typeof buildServerDeps>['store'],
+  tasks: Task[],
+): Task[] => tasks.filter((task) => taskById(store, task.id).state === 'RUNNING');
+
+describe('E10.3 circuit live producer (spec §18.9)', () => {
+  it('a live dependency failure opens the circuit and sheds (WAITING_RESOURCE, no budget spent); a circuit-admitted success closes it', async () => {
+    const h = circuitHarness();
+    try {
+      const { wo, tasks } = seedTwoExecuting(h.deps);
+      await h.until('two running', () => runningTasks(h.deps.store, tasks).length === 2);
+      const runners = runningTasks(h.deps.store, tasks);
+      const [runnerA, runnerB] = runners as [Task, Task];
+      const attemptA1 = attemptsFor(h.deps.store, runnerA.id)[0]!;
+      const model = attemptA1.model!;
+      expect(model).toBeString();
+      expect(attemptsFor(h.deps.store, runnerB.id)[0]!.model).toBe(model);
+
+      // The first live dependency outage is classified (not flattened to
+      // WORKER_FAILURE) and feeds the circuit (failure 1 of 2). E7 mints a
+      // clean-baseline retry, which the live re-dispatcher re-opens: Attempt A2
+      // stays live across the outage.
+      h.adapterForAttempt(attemptA1.id).release(
+        failedResult('DEPENDENCY_UNAVAILABLE: provider timed out'),
+      );
+      await h.until('A2 redispatched', () => attemptsFor(h.deps.store, runnerA.id).length === 2);
+      const attemptA2 = attemptsFor(h.deps.store, runnerA.id)[1]!;
+      await h.until('A2 live', () => Boolean(h.adapterForAttempt(attemptA2.id)));
+      expect(circuitSnapshot(h.deps, model).consecutiveFailures).toBe(1);
+      // The durable failure record names the real class (evidence-preserving).
+      expect(
+        h.deps.store.get<Attempt>('attempts', attemptA1.id)!.failureHistory[0]!.failure,
+      ).toContain('DEPENDENCY_UNAVAILABLE');
+
+      // The second live dependency failure reaches the threshold and opens the
+      // circuit. The opening failure is a shed: WAITING_RESOURCE, no new Attempt.
+      const attemptB1 = attemptsFor(h.deps.store, runnerB.id)[0]!;
+      h.adapterForAttempt(attemptB1.id).release(
+        failedResult('DEPENDENCY_UNAVAILABLE: provider timed out'),
+      );
+      await h.until('circuit open', () => circuitSnapshot(h.deps, model).state === 'OPEN');
+      expect(recoveryActions(h.deps, wo.id).at(-1)!.kind).toBe('WAITING_RESOURCE');
+      expect(attemptsFor(h.deps.store, runnerB.id)).toHaveLength(1);
+      // The shed is surfaced durably as a resource park for the dependency.
+      expect(resourceUnavailableEvents(h.deps, wo.id).some((e) => e.resource === model)).toBe(true);
+
+      // While OPEN, a live dependency failure is shed — WAITING_RESOURCE, no
+      // third Attempt, no budget spent.
+      await h.tickAndSettle();
+      expect(attemptsFor(h.deps.store, runnerA.id)).toHaveLength(2);
+      expect(taskById(h.deps.store, runnerA.id).state).toBe('RUNNING');
+
+      // The circuit-admitted Attempt A2 (dispatched before the window) completes
+      // successfully: live evidence that the dependency recovered closes it.
+      h.clock.advance(1_000);
+      h.adapterForAttempt(attemptA2.id).release({
+        status: 'completed',
+        commits: [],
+        artifacts: [],
+        interactions: [],
+        observations: [],
+        verificationRequests: [],
+        diff: 'diff --git a/a b/a\n+probe succeeded',
+        failure: null,
+      });
+      await h.until('circuit closed', () => circuitSnapshot(h.deps, model).state === 'CLOSED');
+      expect(circuitSnapshot(h.deps, model)).toMatchObject({
+        state: 'CLOSED',
+        consecutiveFailures: 0,
+        probeInFlight: false,
+      });
+    } finally {
+      h.deps.store.close();
+    }
+  });
+
+  it('settles a live HALF_OPEN probe: after the window a dependency failure is admitted as the probe and re-opens it', async () => {
+    const h = circuitHarness();
+    try {
+      const { tasks } = seedTwoExecuting(h.deps);
+      await h.until('two running', () => runningTasks(h.deps.store, tasks).length === 2);
+      const runners = runningTasks(h.deps.store, tasks);
+      const [runnerA, runnerB] = runners as [Task, Task];
+      const attemptA1 = attemptsFor(h.deps.store, runnerA.id)[0]!;
+      const model = attemptA1.model!;
+
+      // Open the circuit with two live dependency failures, keeping A2 live.
+      h.adapterForAttempt(attemptA1.id).release(failedResult('DEPENDENCY_UNAVAILABLE: provider timed out'));
+      await h.until('A2 redispatched', () => attemptsFor(h.deps.store, runnerA.id).length === 2);
+      const attemptA2 = attemptsFor(h.deps.store, runnerA.id)[1]!;
+      await h.until('A2 live', () => Boolean(h.adapterForAttempt(attemptA2.id)));
+      const attemptB1 = attemptsFor(h.deps.store, runnerB.id)[0]!;
+      h.adapterForAttempt(attemptB1.id).release(failedResult('MODEL_UNAVAILABLE: model-x down'));
+      await h.until('circuit open', () => circuitSnapshot(h.deps, model).state === 'OPEN');
+
+      // After the reset window the next live dependency failure is admitted as
+      // the single HALF_OPEN probe; because `recover()` is a failure delivery it
+      // settles the probe immediately — a failed probe re-opens the circuit with
+      // a fresh window and no dangling `probeInFlight`.
+      h.clock.advance(1_000);
+      h.adapterForAttempt(attemptA2.id).release(failedResult('MODEL_UNAVAILABLE: model-x down'));
+      await h.until('probe settled', () => {
+        const snapshot = circuitSnapshot(h.deps, model);
+        return snapshot.state === 'OPEN' && snapshot.probeInFlight === false;
+      });
+      const settled = circuitSnapshot(h.deps, model);
+      expect(settled.state).toBe('OPEN');
+      expect(settled.probeInFlight).toBe(false);
+      // The failed probe mints no retry: a shed is not evidence, and no budget
+      // is spent.
+      expect(attemptsFor(h.deps.store, runnerA.id)).toHaveLength(2);
+    } finally {
+      h.deps.store.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E10.3 (#37) — the GitHub adapter composed into a running process
+// ---------------------------------------------------------------------------
+
+/** A hermetic GitHub transport (Ruling R6): records calls, hits no network. */
+class MockGitHub implements GitHubTransport {
+  issues = new Map<string, GitHubIssue>();
+  issueCalls: IssueRef[] = [];
+  branchCalls: CreateBranchInput[] = [];
+  prCalls: CreatePullRequestInput[] = [];
+  private prNumber = 500;
+
+  async getIssue(ref: IssueRef): Promise<GitHubIssue> {
+    this.issueCalls.push({ ...ref });
+    const issue = this.issues.get(`${ref.repository}#${ref.number}`);
+    if (!issue) throw new Error(`no such issue: ${ref.repository}#${ref.number}`);
+    return issue;
+  }
+  async createBranch(input: CreateBranchInput) {
+    this.branchCalls.push({ ...input });
+    return { repository: input.repository, name: input.branch, sha: 'sha_base' };
+  }
+  async createPullRequest(input: CreatePullRequestInput): Promise<GitHubPullRequest> {
+    this.prCalls.push({ ...input });
+    this.prNumber += 1;
+    return {
+      repository: input.repository,
+      number: this.prNumber,
+      url: `https://github.com/${input.repository}/pull/${this.prNumber}`,
+      head: input.head,
+      base: input.base,
+    };
+  }
+  async getPullRequest(ref: PullRequestRef): Promise<GitHubPullRequestDetail> {
+    throw new Error(`unexpected getPullRequest in this test: ${ref.repository}#${ref.number}`);
+  }
+  async mergePullRequest(input: MergePullRequestInput): Promise<GitHubMergeResult> {
+    throw new Error(`unexpected mergePullRequest in this test: ${input.number}`);
+  }
+}
+describe('E10.3 GitHub adapter composed into a running process (#37)', () => {
+  it('buildServerDeps constructs the adapter against the live policy + durable evidence reader (transport mocked)', async () => {
+    const transport = new MockGitHub();
+    const runtime = runtimeFrom(configText(VERIFICATION));
+    // No github override: the adapter must NOT be constructed.
+    const bare = buildServerDeps(runtime, {
+      spawn: () => new FakeHerdr(),
+      reconcileOnBoot: false,
+    });
+    try {
+      expect(bare.github).toBeUndefined();
+    } finally {
+      bare.store.close();
+    }
+
+    const runtimeWithGitHub = runtimeFrom(configText(VERIFICATION));
+    const deps = buildServerDeps(runtimeWithGitHub, {
+      spawn: () => new FakeHerdr(),
+      reconcileOnBoot: false,
+      github: { transport, factoryBaseUrl: 'http://factory.local:8787' },
+    });
+    try {
+      expect(deps.github).toBeDefined();
+      // The adapter's gates are wired to the Factory's *real* E7 policy and
+      // durable evidence reader — the same store/events the server owns. An
+      // import against a repository-less issue still routes through the live
+      // policy path: proving the composition, not a detached adapter.
+      expect(typeof deps.github!.importIssue).toBe('function');
+      expect(typeof deps.github!.openPR).toBe('function');
+      expect(typeof deps.github!.merge).toBe('function');
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('imports an issue and opens a PR through the server routes, gated by the live policy', async () => {
+    const store = openStateStore(join(workDir, 'github-route.db'));
+    const events = openEventLog(store.db);
+    // The adapter's E2 client needs a live, loopback mutation authority. The e6
+    // harness pattern: a real loopback server sharing the same store/events.
+    const e2 = (await import('../../src/factory/api/server')).startFactoryServer(
+      { store, events, evidence: createEmptyEvidenceReadPort() },
+      { port: 0, hostname: '127.0.0.1' },
+    );
+    const transport = new MockGitHub();
+    const issue: GitHubIssue = {
+      repository: 'acme/widgets',
+      number: 77,
+      title: 'Add the circuit widget',
+      body: 'Acceptance:\n- [ ] widget works',
+      labels: ['enhancement'],
+      url: 'https://github.com/acme/widgets/issues/77',
+    };
+    transport.issues.set('acme/widgets#77', issue);
+
+    const client = createFactoryClient({ baseUrl: e2.url });
+    const adapter = buildGitHubAdapter({
+      transport,
+      client,
+      factoryBaseUrl: 'http://factory.local:8787',
+      store,
+      events,
+    });
+    const handler = createApiHandler({
+      store,
+      events,
+      evidence: createEmptyEvidenceReadPort(),
+      github: adapter,
+    });
+    try {
+      // import → WO through the route.
+      const imported = await handler(
+        new Request('http://factory.local/api/github/import', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ repository: 'acme/widgets', number: 77 }),
+        }),
+      );
+      expect(imported.status).toBe(201);
+      const importedBody = (await imported.json()) as { workOrder: WorkOrder; created: boolean };
+      expect(importedBody.created).toBe(true);
+      expect(importedBody.workOrder.repository).toBe('acme/widgets');
+      expect(transport.issueCalls).toHaveLength(1);
+
+      // Persist the durable Evidence Bundle the PR must link (E9.4 receipt).
+      const bundle = {
+        id: 'eb_route_1',
+        workOrderId: importedBody.workOrder.id,
+        complete: true,
+        gates: { deterministic: true, behavioral: true, semantic: true, run: true },
+      };
+      store.set('evidence_bundles', bundle.id, bundle);
+
+      const opened = await handler(
+        new Request('http://factory.local/api/github/pull-requests', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ evidenceBundleId: bundle.id }),
+        }),
+      );
+      expect(opened.status).toBe(201);
+      const pr = (await opened.json()) as GitHubPullRequest;
+      expect(transport.prCalls).toHaveLength(1);
+      expect(transport.prCalls[0]!.body).toContain(`[${bundle.id}](http://factory.local:8787/api/observatory/work-orders/${importedBody.workOrder.id}/drill-down)`);
+      expect(pr.head).toBe(`wo-${importedBody.workOrder.id}/task-${importedBody.workOrder.id.slice(0, 8)}`);
+
+      // The gate ran against the live policy: an ALLOW decision is durable.
+      expect(
+        store
+          .list<{ action: { capability: string }; decision: string }>('policy_decisions')
+          .find((row) => row.action.capability === 'pr.create')?.decision,
+      ).toBe('ALLOW');
+
+      // A caller-fabricated receipt (no durable row) is refused — no PR.
+      const forged = await handler(
+        new Request('http://factory.local/api/github/pull-requests', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ evidenceBundleId: 'eb_not_persisted' }),
+        }),
+      );
+      expect(forged.status).toBe(404);
+      expect(transport.prCalls).toHaveLength(1);
+    } finally {
+      e2.stop();
+      store.close();
+    }
+  });
+
+  it('fails closed when no GitHub adapter is composed (no ungoverned route)', async () => {
+    const store = openStateStore(join(workDir, 'github-absent.db'));
+    const events = openEventLog(store.db);
+    const handler = createApiHandler({ store, events, evidence: createEmptyEvidenceReadPort() });
+    try {
+      const response = await handler(
+        new Request('http://factory.local/api/github/import', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ repository: 'acme/widgets', number: 1 }),
+        }),
+      );
+      expect(response.status).toBe(404);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('drives the operator CLI (`factory github import` / `github pr`) through the server', async () => {
+    const store = openStateStore(join(workDir, 'github-cli.db'));
+    const events = openEventLog(store.db);
+    const e2 = startFactoryServer(
+      { store, events, evidence: createEmptyEvidenceReadPort() },
+      { port: 0, hostname: '127.0.0.1' },
+    );
+    const transport = new MockGitHub();
+    transport.issues.set('acme/widgets#88', {
+      repository: 'acme/widgets',
+      number: 88,
+      title: 'CLI subject',
+      body: '- [ ] criterion',
+      labels: [],
+      url: 'https://github.com/acme/widgets/issues/88',
+    });
+    const adapter = buildGitHubAdapter({
+      transport,
+      client: createFactoryClient({ baseUrl: e2.url }),
+      factoryBaseUrl: 'http://factory.local:8787',
+      store,
+      events,
+    });
+    const server = startFactoryServer(
+      { store, events, evidence: createEmptyEvidenceReadPort(), github: adapter },
+      { port: 0, hostname: '127.0.0.1' },
+    );
+    const capture = (): { io: CliIO; out: string[]; err: string[] } => {
+      const out: string[] = [];
+      const err: string[] = [];
+      return { out, err, io: { out: (line) => out.push(line), err: (line) => err.push(line) } };
+    };
+    try {
+      // `factory github import` creates the Work Order through the server.
+      const importCap = capture();
+      const code = await runCli(
+        ['github', 'import', '--repo', 'acme/widgets', '--issue', '88', '--url', server.url],
+        importCap.io,
+      );
+      expect(code).toBe(0);
+      const imported = JSON.parse(importCap.out[0]!) as { workOrder: WorkOrder; created: boolean };
+      expect(imported.created).toBe(true);
+
+      // `factory github pr` opens the PR from the durable bundle id.
+      const bundle = {
+        id: 'eb_cli_1',
+        workOrderId: imported.workOrder.id,
+        complete: true,
+        gates: { deterministic: true, behavioral: true, semantic: true, run: true },
+      };
+      store.set('evidence_bundles', bundle.id, bundle);
+      const prCap = capture();
+      const prCode = await runCli(
+        ['github', 'pr', '--bundle', bundle.id, '--url', server.url],
+        prCap.io,
+      );
+      expect(prCode).toBe(0);
+      const pr = JSON.parse(prCap.out[0]!) as GitHubPullRequest;
+      expect(pr.head).toBe(`wo-${imported.workOrder.id}/task-${imported.workOrder.id.slice(0, 8)}`);
+      expect(transport.prCalls).toHaveLength(1);
+
+      // A bad invocation fails closed (usage error, no call).
+      const badCap = capture();
+      expect(await runCli(['github', 'import', '--repo', 'acme/widgets'], badCap.io)).toBe(1);
+      expect(badCap.err.join('\n')).toContain('usage: factory github import');
+    } finally {
+      server.stop();
+      e2.stop();
+      store.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E10.3 (#37) — E6 PR branch and E3 worktree branch: the aggregation model
+// ---------------------------------------------------------------------------
+
+/**
+ * The PR branch is intentionally the **Work-Order-keyed aggregate** of the
+ * Task-keyed worktree branches: E6 opens one PR per Work Order (aggregating its
+ * Tasks), while E3's `taskWorktreeBranch` keys each Task's worktree branch on
+ * the Task. Both share the `wo-<workOrderId>/task-<…>` namespace — and therefore
+ * the E7 `wo-*` namespace `branch.create`/`repo.write` grant. This is the documented
+ * model; the test proves the namespace is consistent and both shapes are
+ * authorized by the live embedded policy, so the divergence is a declared leaf,
+ * not a scope leak.
+ */
+describe('E10.3 PR branch / worktree branch aggregation namespace (#37)', () => {
+  const prBranchFor = (workOrderId: string): string =>
+    `wo-${workOrderId}/task-${workOrderId.slice(0, 8)}`;
+
+  it('shares one namespace: both branches are `wo-<id>/task-<short>` and both are policy-authorized', () => {
+    const store = openStateStore(join(workDir, 'branch-namespace.db'));
+    const events = openEventLog(store.db);
+    try {
+      const wo = createWorkOrder({ store, events }, {
+        intent: 'branch namespace subject',
+        acceptanceCriteria: ['accepted'],
+        repository: 'acme/widgets',
+      });
+      const taskBranch = taskWorktreeBranch('task_abcdef123456', wo.id);
+      const prBranch = prBranchFor(wo.id);
+
+      // Same namespace prefix: `wo-<workOrderId>/task-`.
+      expect(taskBranch.startsWith(`wo-${wo.id}/task-`)).toBe(true);
+      expect(prBranch.startsWith(`wo-${wo.id}/task-`)).toBe(true);
+
+      // Both leaves are the deterministic short-id form; the PR leaf keys the
+      // Work Order (the aggregate), the worktree leaf keys the Task (a member).
+      expect(prBranch).toBe(`wo-${wo.id}/task-${wo.id.slice(0, 8)}`);
+      expect(taskBranch).toBe(`wo-${wo.id}/task-task_abc`);
+
+      // The live embedded E7 policy authorizes both the aggregate PR branch and
+      // every member worktree branch under the same `wo-*/**` grant — so one PR
+      // per Work Order never escapes the Factory's write scope.
+      const subject = { taskId: null, workOrderId: wo.id };
+      for (const branch of [prBranch, taskBranch]) {
+        expect(
+          policyCheck({ store, events }, subject, { capability: 'branch.create', resource: { branch } }),
+        ).toBe('ALLOW');
+        expect(
+          policyCheck({ store, events }, subject, {
+            capability: 'repo.write',
+            resource: { branch, path: 'src/index.ts' },
+          }),
+        ).toBe('ALLOW');
+      }
+      // A branch outside the Factory namespace is denied: the shared prefix is
+      // load-bearing, not cosmetic.
+      expect(
+        policyCheck({ store, events }, subject, {
+          capability: 'branch.create',
+          resource: { branch: 'someone-elses-branch' },
+        }),
+      ).toBe('DENY');
+    } finally {
+      store.close();
     }
   });
 });

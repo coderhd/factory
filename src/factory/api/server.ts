@@ -9,6 +9,8 @@ import {
   type WorkOrderState,
 } from '../domain/workOrder';
 import type { EventLog } from '../events/log';
+import { PolicyBlockedError, type EvidenceReceipt, type GitHubAdapter } from '../github/adapter';
+import type { EvidenceBundle } from '../evidence/bundle';
 import type { EvidenceReadPort } from '../observatory/observatory';
 import { commitDAG, getActiveDAG, proposeDAG, type DAGProposalPayload } from '../planning/dag';
 import {
@@ -34,6 +36,10 @@ import {
   type CommitDagResultDto,
   type FactoryControlsDto,
   type GateDecision,
+  type GitHubImportRequest,
+  type GitHubImportResultDto,
+  type GitHubOpenPrRequest,
+  type GitHubPullRequestDto,
   type HandshakeDto,
   type HealthDto,
   type InteractionDto,
@@ -59,6 +65,13 @@ export interface FactoryServerDeps {
   evidence: EvidenceReadPort;
   /** Optional E3 scheduler; exposes its status projection when present. */
   scheduler?: Scheduler;
+  /**
+   * E10.3 (#37) the E6 GitHub adapter, composed by `buildServerDeps` with the
+   * live E7 policy and durable evidence reader. Only the two operator routes
+   * below use it. Absent, those routes 404 — no ungoverned GitHub path is ever
+   * exposed, and the transport is mocked in tests (Ruling R6).
+   */
+  github?: GitHubAdapter;
   version?: string;
   schemaVersion?: string;
   instanceId?: string;
@@ -90,6 +103,12 @@ const STATUS_BY_CODE: Record<string, number> = {
   APPROVAL_ACTOR_REQUIRED: 400,
   OPERATOR_REQUIRED: 400,
   DAG_INVALID: 422,
+  // E10.3 (#37) GitHub operator surface.
+  GITHUB_NOT_CONFIGURED: 404,
+  EVIDENCE_BUNDLE_NOT_FOUND: 404,
+  INVALID_GITHUB_REQUEST: 400,
+  GITHUB_POLICY_BLOCKED: 403,
+  GITHUB_UNAVAILABLE: 502,
 };
 
 function json(body: unknown, status = 200): Response {
@@ -490,6 +509,84 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
           ...(comment ? { comment } : {}),
         });
         return json({ approval });
+      }
+    }
+
+    if (resource === 'github') {
+      const adapter = deps.github;
+      if (!adapter) return apiError('GITHUB_NOT_CONFIGURED', 'github adapter is not configured', 404);
+
+      // POST /api/github/import { repository, number } — issue → Work Order.
+      if (method === 'POST' && id === 'import' && action === undefined) {
+        const body = await readJson<Partial<GitHubImportRequest>>(request);
+        const repository = typeof body?.repository === 'string' ? body.repository.trim() : '';
+        const number = typeof body?.number === 'number' ? body.number : Number(body?.number);
+        if (repository.length === 0 || !Number.isInteger(number) || number <= 0) {
+          return apiError(
+            'INVALID_GITHUB_REQUEST',
+            'import requires { repository: "owner/name", number: <positive integer> }',
+            400,
+          );
+        }
+        try {
+          const result: GitHubImportResultDto = await adapter.importIssue({ repository, number });
+          return json(result, result.created ? 201 : 200);
+        } catch (error) {
+          if (error instanceof PolicyBlockedError) {
+            return apiError('GITHUB_POLICY_BLOCKED', error.message, 403);
+          }
+          return apiError(
+            'GITHUB_UNAVAILABLE',
+            error instanceof Error ? error.message : String(error),
+            502,
+          );
+        }
+      }
+
+      // POST /api/github/pull-requests { evidenceBundleId } — open a PR whose
+      // body links the **durable** evidence receipt. The route reads the bundle
+      // by id from the store: a caller cannot present a bundle that was never
+      // persisted, and the adapter runs its `pr.create` policy gate.
+      if (method === 'POST' && id === 'pull-requests' && action === undefined) {
+        const body = await readJson<Partial<GitHubOpenPrRequest>>(request);
+        const evidenceBundleId =
+          typeof body?.evidenceBundleId === 'string' ? body.evidenceBundleId.trim() : '';
+        if (evidenceBundleId.length === 0) {
+          return apiError(
+            'INVALID_GITHUB_REQUEST',
+            'opening a pull request requires { evidenceBundleId }',
+            400,
+          );
+        }
+        const evidence = deps.store.get<EvidenceBundle>('evidence_bundles', evidenceBundleId);
+        if (!evidence) {
+          return apiError(
+            'EVIDENCE_BUNDLE_NOT_FOUND',
+            `evidence bundle not found: ${evidenceBundleId}`,
+            404,
+          );
+        }
+        const receipt: EvidenceReceipt = evidence;
+        const openOptions: { baseBranch?: string; title?: string } = {};
+        if (typeof body?.baseBranch === 'string' && body.baseBranch.trim().length > 0) {
+          openOptions.baseBranch = body.baseBranch.trim();
+        }
+        if (typeof body?.title === 'string' && body.title.trim().length > 0) {
+          openOptions.title = body.title.trim();
+        }
+        try {
+          const pr: GitHubPullRequestDto = await adapter.openPR(receipt, openOptions);
+          return json(pr, 201);
+        } catch (error) {
+          if (error instanceof PolicyBlockedError) {
+            return apiError('GITHUB_POLICY_BLOCKED', error.message, 403);
+          }
+          return apiError(
+            'GITHUB_UNAVAILABLE',
+            error instanceof Error ? error.message : String(error),
+            502,
+          );
+        }
       }
     }
 
