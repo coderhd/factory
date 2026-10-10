@@ -2128,11 +2128,11 @@ describe('E9.6 e-stop/pause freeze the live scheduler', () => {
       expect(JSON.parse(stop.out())).toEqual({ paused: false, emergencyStopped: true });
 
       const status = capture(workDir);
-      expect(await runCli(['control', 'status', '--url', h.url], status.io)).toBe(0);
+      expect(await runCli(['control', 'status', '--url', h.url, '--json'], status.io)).toBe(0);
       expect(JSON.parse(status.out())).toEqual({ paused: false, emergencyStopped: true });
 
       const resume = capture(workDir);
-      expect(await runCli(['control', 'resume', '--actor', 'operator-7', '--url', h.url], resume.io)).toBe(0);
+      expect(await runCli(['control', 'resume', '--actor', 'operator-7', '--url', h.url, '--json'], resume.io)).toBe(0);
       expect(JSON.parse(resume.out())).toEqual({ paused: false, emergencyStopped: false });
 
       // An actor is required: the operator identity is the durable receipt.
