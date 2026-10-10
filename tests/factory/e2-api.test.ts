@@ -959,7 +959,7 @@ describe('E2 CLI', () => {
     expect(parseFactoryConfig(readFileSync(configPath, 'utf8')).ok).toBe(true);
 
     const statusCap = capture(dir);
-    const statusCode = await runCli(['status', '--dir', dir], statusCap.io);
+    const statusCode = await runCli(['status', '--dir', dir, '--json'], statusCap.io);
     expect(statusCode).toBe(0);
     expect((JSON.parse(statusCap.out()) as { status: string }).status).toBe('stopped');
   });
@@ -969,7 +969,7 @@ describe('E2 CLI', () => {
     try {
       const cap = capture(workDir);
       const submitCode = await runCli(
-        ['wo', 'submit', '--url', h.server.url, '--intent', 'via cli', '--acceptance', 'works'],
+        ['wo', 'submit', '--url', h.server.url, '--intent', 'via cli', '--acceptance', 'works', '--json'],
         cap.io,
       );
       expect(submitCode).toBe(0);
@@ -977,7 +977,10 @@ describe('E2 CLI', () => {
       expect(submitted.state).toBe('DRAFT');
 
       const statusCap = capture(workDir);
-      const statusCode = await runCli(['wo', 'status', submitted.id, '--url', h.server.url], statusCap.io);
+      const statusCode = await runCli(
+        ['wo', 'status', submitted.id, '--url', h.server.url, '--json'],
+        statusCap.io,
+      );
       expect(statusCode).toBe(0);
       const status = JSON.parse(statusCap.out()) as { workOrder: WorkOrder };
       expect(status.workOrder.id).toBe(submitted.id);
@@ -1112,7 +1115,7 @@ describe('E2 CLI', () => {
 
       const cap = capture(workDir);
       const code = await runCli(
-        ['wo', 'answer', pending[0].id, 'use main', '--url', h.server.url],
+        ['wo', 'answer', pending[0].id, 'use main', '--url', h.server.url, '--json'],
         cap.io,
       );
       expect(code).toBe(0);
@@ -1205,7 +1208,7 @@ describe('E2 CLI', () => {
     openStateStore(runtime.paths.db).close();
 
     const cap = capture(dir);
-    expect(await runCli(['update', '--dir', dir], cap.io)).toBe(0);
+    expect(await runCli(['update', '--dir', dir, '--json'], cap.io)).toBe(0);
     const update = JSON.parse(cap.out()) as { configValid: boolean; image: string; backup: string };
     expect(update.configValid).toBe(true);
     expect(update.image).toBe(runtime.image.ref);
@@ -1225,7 +1228,7 @@ describe('E2 CLI', () => {
       let status: { status: string; url?: string } | null = null;
       for (let i = 0; i < 50; i += 1) {
         const cap = capture(dir);
-        await runCli(['status', '--dir', dir], cap.io);
+        await runCli(['status', '--dir', dir, '--json'], cap.io);
         status = JSON.parse(cap.out()) as { status: string; url?: string };
         if (status.status === 'running') break;
         await new Promise((resolve) => setTimeout(resolve, 100));
@@ -1235,13 +1238,166 @@ describe('E2 CLI', () => {
       expect(await runCli(['stop', '--dir', dir], capture(dir).io)).toBe(0);
 
       const stoppedCap = capture(dir);
-      await runCli(['status', '--dir', dir], stoppedCap.io);
+      await runCli(['status', '--dir', dir, '--json'], stoppedCap.io);
       expect((JSON.parse(stoppedCap.out()) as { status: string }).status).toBe('stopped');
     } finally {
       // Safety net: never leak a detached server if an assertion fails. Assert
       // the exit code so a broken `stop` (which would leave the child running)
       // cannot pass silently.
       expect(await runCli(['stop', '--dir', dir], capture(dir).io)).toBe(0);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POC-finish — CLI usability: human-readable output + wo transition
+// ---------------------------------------------------------------------------
+
+describe('E2 CLI usability', () => {
+  it('wo submit prints human-readable output by default and exact JSON with --json', async () => {
+    const h = apiHarness();
+    try {
+      const cap = capture(workDir);
+      const code = await runCli(
+        ['wo', 'submit', '--url', h.server.url, '--intent', 'polish cli', '--acceptance', 'works'],
+        cap.io,
+      );
+      expect(code).toBe(0);
+      // Human-readable: not JSON, but names the id, state, and intent.
+      expect(() => JSON.parse(cap.out())).toThrow();
+      expect(cap.out()).toContain('DRAFT');
+      expect(cap.out()).toContain('polish cli');
+      const id = /Work order (\S+)/.exec(cap.out())?.[1];
+      expect(id).toBeDefined();
+
+      // The surfaced id is usable by the next command.
+      const statusCap = capture(workDir);
+      expect(await runCli(['wo', 'status', id as string, '--url', h.server.url], statusCap.io)).toBe(0);
+      expect(statusCap.out()).toContain(id as string);
+
+      // --json output parses with the same fields the old default carried.
+      const jcap = capture(workDir);
+      const jcode = await runCli(
+        ['wo', 'submit', '--url', h.server.url, '--intent', 'polish cli', '--acceptance', 'works', '--json'],
+        jcap.io,
+      );
+      expect(jcode).toBe(0);
+      const parsed = JSON.parse(jcap.out()) as WorkOrder;
+      expect(parsed.state).toBe('DRAFT');
+      expect(parsed.intent).toBe('polish cli');
+      expect(parsed.acceptanceCriteria).toEqual(['works']);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('wo status prints human-readable output by default', async () => {
+    const h = apiHarness();
+    try {
+      const created = await h.client.submitWorkOrder({ intent: 'status readability' });
+      const cap = capture(workDir);
+      expect(await runCli(['wo', 'status', created.id, '--url', h.server.url], cap.io)).toBe(0);
+      expect(() => JSON.parse(cap.out())).toThrow();
+      expect(cap.out()).toContain(created.id);
+      expect(cap.out()).toContain('DRAFT');
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('wo transition moves a Work Order and prints the new state', async () => {
+    const h = apiHarness();
+    try {
+      const created = await h.client.submitWorkOrder({ intent: 'transition me' });
+      const cap = capture(workDir);
+      const code = await runCli(
+        ['wo', 'transition', created.id, '--to', 'READY', '--url', h.server.url],
+        cap.io,
+      );
+      expect(code).toBe(0);
+      expect(cap.out()).toContain(created.id);
+      expect(cap.out()).toContain('READY');
+      expect(h.store.get<WorkOrder>('work_orders', created.id)?.state).toBe('READY');
+
+      const planningCap = capture(workDir);
+      expect(
+        await runCli(['wo', 'transition', created.id, '--to', 'PLANNING', '--url', h.server.url], planningCap.io),
+      ).toBe(0);
+      expect(h.store.get<WorkOrder>('work_orders', created.id)?.state).toBe('PLANNING');
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('wo transition rejects missing/invalid input with usage', async () => {
+    const h = apiHarness();
+    try {
+      const created = await h.client.submitWorkOrder({ intent: 'bad transition' });
+
+      const missing = capture(workDir);
+      expect(await runCli(['wo', 'transition', created.id, '--url', h.server.url], missing.io)).toBe(1);
+      expect(missing.err()).toMatch(/--to/);
+
+      const invalid = capture(workDir);
+      expect(
+        await runCli(['wo', 'transition', created.id, '--to', 'BOGUS', '--url', h.server.url], invalid.io),
+      ).toBe(1);
+      expect(h.store.get<WorkOrder>('work_orders', created.id)?.state).toBe('DRAFT');
+
+      const noId = capture(workDir);
+      expect(await runCli(['wo', 'transition', '--to', 'READY', '--url', h.server.url], noId.io)).toBe(1);
+      expect(noId.err()).toMatch(/usage/);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('submit → transition → plan runs entirely in the CLI', async () => {
+    const h = apiHarness();
+    try {
+      const submitted = await h.client.submitWorkOrder({ intent: 'cli-only flow' });
+      expect(
+        await runCli(['wo', 'transition', submitted.id, '--to', 'READY', '--url', h.server.url], capture(workDir).io),
+      ).toBe(0);
+      expect(
+        await runCli(
+          ['wo', 'transition', submitted.id, '--to', 'PLANNING', '--url', h.server.url],
+          capture(workDir).io,
+        ),
+      ).toBe(0);
+
+      const dagPath = join(workDir, 'dag.json');
+      writeFileSync(
+        dagPath,
+        JSON.stringify({ nodes: [{ nodeId: 'n1', title: 'First' }, { nodeId: 'n2', title: 'Second', dependsOn: ['n1'] }] }),
+      );
+      const planCap = capture(workDir);
+      expect(
+        await runCli(['wo', 'plan', submitted.id, '--dag', dagPath, '--url', h.server.url], planCap.io),
+      ).toBe(0);
+      expect(planCap.out()).toContain('1');
+      expect(planCap.out()).toContain('2 tasks');
+
+      // An invalid DAG is refused without writing tasks.
+      const badPath = join(workDir, 'bad-dag.json');
+      writeFileSync(badPath, JSON.stringify({ nodes: [{ nodeId: 'x', title: 'X', dependsOn: ['missing'] }] }));
+      const badCap = capture(workDir);
+      expect(await runCli(['wo', 'plan', submitted.id, '--dag', badPath, '--url', h.server.url], badCap.io)).toBe(1);
+    } finally {
+      h.stop();
+    }
+  });
+
+  it('wo subcommands print usage on missing args', async () => {
+    const cases: string[][] = [
+      ['wo', 'submit', '--url', 'http://127.0.0.1:1'],
+      ['wo', 'status', '--url', 'http://127.0.0.1:1'],
+      ['wo', 'plan', 'wo_missing', '--url', 'http://127.0.0.1:1'],
+    ];
+    for (const argv of cases) {
+      const cap = capture(workDir);
+      expect(await runCli(argv, cap.io)).toBe(1);
+      expect(cap.err()).toMatch(/usage/);
     }
   });
 });
