@@ -1919,7 +1919,7 @@ describe('E10.3 GitHub adapter composed into a running process (#37)', () => {
       // `factory github import` creates the Work Order through the server.
       const importCap = capture();
       const code = await runCli(
-        ['github', 'import', '--repo', 'acme/widgets', '--issue', '88', '--url', server.url],
+        ['github', 'import', '--repo', 'acme/widgets', '--issue', '88', '--url', server.url, '--json'],
         importCap.io,
       );
       expect(code).toBe(0);

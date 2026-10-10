@@ -2123,7 +2123,7 @@ describe('E9.6 e-stop/pause freeze the live scheduler', () => {
 
       const stop = capture(workDir);
       expect(
-        await runCli(['control', 'emergency-stop', '--actor', 'operator-7', '--url', h.url], stop.io),
+        await runCli(['control', 'emergency-stop', '--actor', 'operator-7', '--url', h.url, '--json'], stop.io),
       ).toBe(0);
       expect(JSON.parse(stop.out())).toEqual({ paused: false, emergencyStopped: true });
 
