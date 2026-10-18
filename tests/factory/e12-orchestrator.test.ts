@@ -10,7 +10,16 @@ import {
   ModelUnavailableError,
   createHttpModelClient,
 } from '../../src/factory/inference/modelClient';
-import type { ModelFailureReason } from '../../src/factory/inference/modelClient';
+import type {
+  ModelClient,
+  ModelFailureReason,
+  ModelReply,
+  ModelRequest,
+} from '../../src/factory/inference/modelClient';
+import type { FactoryClient } from '../../src/factory/api/client';
+import { ORCHESTRATOR_TOOLS, toolByName } from '../../src/factory/orchestrator/tools';
+import { createOrchestrator } from '../../src/factory/orchestrator/orchestrator';
+import type { OrchestratorResult } from '../../src/factory/orchestrator/orchestrator';
 
 /**
  * E12 (#48) — the `orchestrator:` config section. The Factory carries the
@@ -458,5 +467,410 @@ describe('E12 orchestrator: ModelClient (#48)', () => {
     expect(error).toBeInstanceOf(ModelUnavailableError);
     expect(error!.reason).toBe('transport');
     expect(error!.message).toContain(KEY_ENV);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T3 — the tool registry + the confirmation-gated orchestration loop (#48)
+// ---------------------------------------------------------------------------
+
+interface RecordedFactoryCall {
+  method: string;
+  args: unknown[];
+}
+
+/**
+ * A recording `FactoryClient` stand-in. Every method access resolves to an async
+ * function that records `{ method, args }` and answers with the canned DTO for
+ * that method (or a canned function's result). Nothing here touches the network
+ * or Factory state — which is exactly how "the loop performs no direct
+ * mutation" and "a refused confirmation makes zero calls" become observable.
+ */
+function fakeFactoryClient(canned: Partial<Record<keyof FactoryClient, unknown>> = {}): {
+  client: FactoryClient;
+  calls: RecordedFactoryCall[];
+  methods: () => string[];
+} {
+  const calls: RecordedFactoryCall[] = [];
+  const client = new Proxy(
+    {},
+    {
+      get(_target, property) {
+        if (typeof property !== 'string') return undefined;
+        return (...args: unknown[]) => {
+          calls.push({ method: property, args });
+          const entry = canned[property as keyof FactoryClient];
+          const value =
+            typeof entry === 'function'
+              ? (entry as (...a: unknown[]) => unknown)(...args)
+              : entry;
+          return Promise.resolve(value);
+        };
+      },
+    },
+  ) as FactoryClient;
+  return { client, calls, methods: () => calls.map((call) => call.method) };
+}
+
+/** A scripted `ModelClient`: one reply per call, then a hard error. */
+function scriptedModelClient(replies: Array<string | Error>): {
+  model: ModelClient;
+  requests: ModelRequest[];
+} {
+  const requests: ModelRequest[] = [];
+  let next = 0;
+  const model: ModelClient = {
+    async complete(request: ModelRequest): Promise<ModelReply> {
+      requests.push(request);
+      if (next >= replies.length) {
+        throw new Error(
+          'scripted model client exhausted: the orchestrator called the model more times than scripted',
+        );
+      }
+      const reply = replies[next++]!;
+      if (reply instanceof Error) throw reply;
+      return { text: reply };
+    },
+  };
+  return { model, requests };
+}
+
+/** The eight Factory methods that change state; a read path must never touch them. */
+const MUTATING_METHODS = new Set<string>([
+  'submitWorkOrder',
+  'githubImportIssue',
+  'transitionWorkOrder',
+  'commitDag',
+  'answerInteraction',
+  'answerApproval',
+  'applyGate',
+  'githubOpenPullRequest',
+  'pause',
+  'resume',
+  'emergencyStop',
+]);
+
+/** The plan's enumerated tool set, and the one Factory method each tool calls. */
+const TOOL_METHOD: Record<string, keyof FactoryClient> = {
+  list_work_orders: 'listWorkOrders',
+  work_order_status: 'getWorkOrder',
+  scheduler_status: 'schedulerStatus',
+  observatory: 'observatory',
+  list_approvals: 'listApprovals',
+  list_interactions: 'listInteractions',
+  submit_work_order: 'submitWorkOrder',
+  github_import: 'githubImportIssue',
+  transition_work_order: 'transitionWorkOrder',
+  plan_dag: 'commitDag',
+  answer_interaction: 'answerInteraction',
+  answer_approval: 'answerApproval',
+  gate_decision: 'applyGate',
+  github_open_pr: 'githubOpenPullRequest',
+  pause: 'pause',
+  resume: 'resume',
+  emergency_stop: 'emergencyStop',
+};
+
+/** Sample args that satisfy every tool's required fields (extra keys are ignored). */
+const SAMPLE_ARGS: Record<string, unknown> = {
+  id: 'wo-1',
+  to: 'PLANNING',
+  reason: 'because',
+  decision: 'APPROVE',
+  actor: 'operator',
+  response: 'yes',
+  status: 'PENDING',
+  intent: 'do the thing',
+  repository: 'acme/widgets',
+  number: 7,
+  evidenceBundleId: 'eb-1',
+  payload: { nodes: [] },
+};
+
+describe('E12 orchestrator: tool registry (#48)', () => {
+  it('exposes exactly the enumerated tools, each well-formed and uniquely named', () => {
+    expect(ORCHESTRATOR_TOOLS).toHaveLength(17);
+    expect(new Set(ORCHESTRATOR_TOOLS.map((tool) => tool.name)).size).toBe(17);
+    expect(ORCHESTRATOR_TOOLS.map((tool) => tool.name).sort()).toEqual(
+      Object.keys(TOOL_METHOD).sort(),
+    );
+    for (const tool of ORCHESTRATOR_TOOLS) {
+      expect(tool.description.length).toBeGreaterThan(0);
+      expect(tool.parameters['type']).toBe('object');
+      expect(['read', 'mutate', 'control']).toContain(tool.kind);
+      expect(typeof tool.run).toBe('function');
+    }
+  });
+
+  it('classifies each tool as read, mutate, or control exactly as the plan enumerates', () => {
+    const reads = [
+      'list_work_orders',
+      'work_order_status',
+      'scheduler_status',
+      'observatory',
+      'list_approvals',
+      'list_interactions',
+    ];
+    const mutates = [
+      'submit_work_order',
+      'github_import',
+      'transition_work_order',
+      'plan_dag',
+      'answer_interaction',
+      'answer_approval',
+      'gate_decision',
+      'github_open_pr',
+    ];
+    const controls = ['pause', 'resume', 'emergency_stop'];
+    for (const name of reads) expect(toolByName(name)?.kind).toBe('read');
+    for (const name of mutates) expect(toolByName(name)?.kind).toBe('mutate');
+    for (const name of controls) expect(toolByName(name)?.kind).toBe('control');
+    expect(reads.length + mutates.length + controls.length).toBe(17);
+    expect(toolByName('rm_rf')).toBeUndefined();
+  });
+
+  it('every run delegates to exactly one FactoryClient method, and no tool reaches the shell', async () => {
+    for (const tool of ORCHESTRATOR_TOOLS) {
+      const factory = fakeFactoryClient({});
+      await tool.run(SAMPLE_ARGS, factory.client);
+      expect(factory.calls).toHaveLength(1);
+      expect(factory.calls[0]!.method).toBe(TOOL_METHOD[tool.name]!);
+    }
+  });
+});
+
+describe('E12 orchestrator: loop + confirmation gate (#48)', () => {
+  const MODEL = 'glm-5.3-flash';
+
+  function resultOf(result: OrchestratorResult): OrchestratorResult {
+    return result;
+  }
+
+  it('read path: runs a read tool, feeds the result back, and returns the model summary', async () => {
+    const factory = fakeFactoryClient({
+      listWorkOrders: [{ id: 'wo-1' }, { id: 'wo-2' }],
+    });
+    const { model, requests } = scriptedModelClient([
+      '{"tool":"list_work_orders","args":{}}',
+      '{"final":"2 work orders"}',
+    ]);
+    const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
+
+    const result = resultOf(await orchestrator.handle({ message: 'how many work orders?' }));
+
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') throw new Error(`expected ok, got ${result.status}`);
+    expect(result.summary).toBe('2 work orders');
+    expect(result.toolCalls).toEqual([{ tool: 'list_work_orders', args: {} }]);
+    expect(factory.methods()).toEqual(['listWorkOrders']);
+    expect(factory.methods().some((method) => MUTATING_METHODS.has(method))).toBe(false);
+    // The read tool's DTO was fed back to the model as an observation.
+    expect(requests).toHaveLength(2);
+    expect(requests[1]!.turns.some((turn) => turn.content.includes('wo-1'))).toBe(true);
+    // Carry-forward from Task 2: max_tokens rides on every call (default 2048).
+    expect(requests[0]!.maxTokens).toBe(2048);
+    expect(requests[1]!.maxTokens).toBe(2048);
+  });
+
+  it('advertises every tool and the strict-JSON contract in the system prompt', async () => {
+    const factory = fakeFactoryClient();
+    const { model, requests } = scriptedModelClient(['{"final":"nothing to do"}']);
+    const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
+
+    const result = resultOf(await orchestrator.handle({ message: 'hello' }));
+
+    expect(result.status).toBe('ok');
+    const system = requests[0]!.system ?? '';
+    for (const tool of ORCHESTRATOR_TOOLS) expect(system).toContain(tool.name);
+    expect(system).toContain('{"tool"');
+    expect(system).toContain('{"final"');
+    expect(factory.calls).toHaveLength(0);
+  });
+
+  it('sends maxTokensPerMessage on every model call when overridden', async () => {
+    const factory = fakeFactoryClient({ listWorkOrders: [] });
+    const { model, requests } = scriptedModelClient([
+      '{"tool":"list_work_orders","args":{}}',
+      '{"final":"none"}',
+    ]);
+    const orchestrator = createOrchestrator({
+      client: factory.client,
+      model,
+      modelName: MODEL,
+      maxTokensPerMessage: 512,
+    });
+
+    await orchestrator.handle({ message: 'anything pending?' });
+
+    expect(requests).toHaveLength(2);
+    expect(requests.every((request) => request.maxTokens === 512)).toBe(true);
+  });
+
+  it('confirmation refused: a mutate/control tool is never executed and zero client calls happen', async () => {
+    const factory = fakeFactoryClient();
+    const { model, requests } = scriptedModelClient(['{"tool":"emergency_stop","args":{"actor":"me"}}']);
+    const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
+
+    const result = resultOf(await orchestrator.handle({ message: 'stop everything now' }));
+
+    expect(result.status).toBe('awaiting_confirmation');
+    if (result.status !== 'awaiting_confirmation') {
+      throw new Error(`expected awaiting_confirmation, got ${result.status}`);
+    }
+    expect(result.pending.tool).toBe('emergency_stop');
+    expect(result.pending.args).toEqual({ actor: 'me' });
+    expect(result.pending.description.length).toBeGreaterThan(0);
+    expect(factory.calls).toHaveLength(0);
+    // The model was consulted exactly once (to propose), never to execute.
+    expect(requests).toHaveLength(1);
+  });
+
+  it('confirmation applied: executes exactly the confirmed tool without calling the model', async () => {
+    const factory = fakeFactoryClient({ emergencyStop: { paused: true, emergencyStopped: true } });
+    const { model, requests } = scriptedModelClient([]);
+    const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
+
+    const result = resultOf(
+      await orchestrator.handle({
+        message: 'stop everything now',
+        confirm: { tool: 'emergency_stop', args: { actor: 'me' } },
+      }),
+    );
+
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') throw new Error(`expected ok, got ${result.status}`);
+    expect(factory.calls).toHaveLength(1);
+    expect(factory.calls[0]!.method).toBe('emergencyStop');
+    expect(factory.calls[0]!.args).toEqual(['me']);
+    expect(result.toolCalls).toEqual([{ tool: 'emergency_stop', args: { actor: 'me' } }]);
+    // The model is never called on the confirmation path.
+    expect(requests).toHaveLength(0);
+  });
+
+  it('confirmation of an unknown tool is an error and makes zero client calls', async () => {
+    const factory = fakeFactoryClient();
+    const { model, requests } = scriptedModelClient([]);
+    const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
+
+    const result = resultOf(
+      await orchestrator.handle({ message: 'do it', confirm: { tool: 'rm_rf', args: {} } }),
+    );
+
+    expect(result.status).toBe('error');
+    if (result.status !== 'error') throw new Error(`expected error, got ${result.status}`);
+    expect(result.error.code).toBe('ORCHESTRATOR_UNKNOWN_TOOL');
+    expect(factory.calls).toHaveLength(0);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('guardrail: an unknown tool is corrected once, then a second offence errors with zero calls', async () => {
+    const factory = fakeFactoryClient();
+    const { model, requests } = scriptedModelClient([
+      '{"tool":"rm_rf","args":{}}',
+      '{"tool":"rm_rf","args":{}}',
+    ]);
+    const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
+
+    const result = resultOf(await orchestrator.handle({ message: 'nuke it' }));
+
+    expect(result.status).toBe('error');
+    if (result.status !== 'error') throw new Error(`expected error, got ${result.status}`);
+    expect(result.error.code).toBe('ORCHESTRATOR_BAD_MODEL_OUTPUT');
+    expect(factory.calls).toHaveLength(0);
+    // Retried exactly once: two model calls, no third.
+    expect(requests).toHaveLength(2);
+  });
+
+  it('guardrail: non-JSON output is corrected once, and a valid retry recovers', async () => {
+    const factory = fakeFactoryClient();
+    const { model, requests } = scriptedModelClient([
+      'sorry, I cannot do that',
+      '{"final":"recovered"}',
+    ]);
+    const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
+
+    const result = resultOf(await orchestrator.handle({ message: 'hello' }));
+
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') throw new Error(`expected ok, got ${result.status}`);
+    expect(result.summary).toBe('recovered');
+    expect(requests).toHaveLength(2);
+    expect(factory.calls).toHaveLength(0);
+  });
+
+  it('a second offence after an accepted reply earns its own correction turn', async () => {
+    const factory = fakeFactoryClient({ listWorkOrders: [] });
+    const { model, requests } = scriptedModelClient([
+      'not json yet',
+      '{"tool":"list_work_orders","args":{}}',
+      'bad again',
+      '{"final":"recovered twice"}',
+    ]);
+    const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
+
+    const result = resultOf(await orchestrator.handle({ message: 'hello' }));
+
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') throw new Error(`expected ok, got ${result.status}`);
+    expect(result.summary).toBe('recovered twice');
+    expect(requests).toHaveLength(4);
+    expect(factory.methods()).toEqual(['listWorkOrders']);
+  });
+
+  it('bound: a model that never finishes stops at maxSteps with ORCHESTRATOR_STEP_LIMIT', async () => {    const factory = fakeFactoryClient({ listWorkOrders: [] });
+    const { model, requests } = scriptedModelClient([
+      '{"tool":"list_work_orders","args":{}}',
+      '{"tool":"list_work_orders","args":{}}',
+      '{"tool":"list_work_orders","args":{}}',
+      '{"tool":"list_work_orders","args":{}}',
+      '{"tool":"list_work_orders","args":{}}',
+    ]);
+    const orchestrator = createOrchestrator({
+      client: factory.client,
+      model,
+      modelName: MODEL,
+      maxSteps: 3,
+    });
+
+    const result = resultOf(await orchestrator.handle({ message: 'loop forever' }));
+
+    expect(result.status).toBe('error');
+    if (result.status !== 'error') throw new Error(`expected error, got ${result.status}`);
+    expect(result.error.code).toBe('ORCHESTRATOR_STEP_LIMIT');
+    // Exactly maxSteps model calls — the cap is a hard bound, not a hint.
+    expect(requests).toHaveLength(3);
+    expect(factory.methods()).toEqual(['listWorkOrders', 'listWorkOrders', 'listWorkOrders']);
+  });
+
+  it('bound: defaults maxSteps to 8', async () => {
+    const factory = fakeFactoryClient({ listWorkOrders: [] });
+    const { model, requests } = scriptedModelClient(new Array(9).fill('{"tool":"list_work_orders","args":{}}'));
+    const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
+
+    const result = resultOf(await orchestrator.handle({ message: 'loop forever' }));
+
+    expect(result.status).toBe('error');
+    if (result.status !== 'error') throw new Error(`expected error, got ${result.status}`);
+    expect(result.error.code).toBe('ORCHESTRATOR_STEP_LIMIT');
+    expect(requests).toHaveLength(8);
+  });
+
+  it('a ModelUnavailableError surfaces as MODEL_UNAVAILABLE and makes zero client calls', async () => {
+    const factory = fakeFactoryClient();
+    const { model } = scriptedModelClient([
+      new ModelUnavailableError(
+        'quota',
+        'opencode inference openai request failed (quota): HTTP 429 (check OPENCODE_API_KEY)',
+      ),
+    ]);
+    const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
+
+    const result = resultOf(await orchestrator.handle({ message: 'what is going on?' }));
+
+    expect(result.status).toBe('error');
+    if (result.status !== 'error') throw new Error(`expected error, got ${result.status}`);
+    expect(result.error.code).toBe('MODEL_UNAVAILABLE');
+    expect(result.error.message).toContain('OPENCODE_API_KEY');
+    expect(factory.calls).toHaveLength(0);
   });
 });
