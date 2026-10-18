@@ -1,0 +1,13 @@
+/* E12.2 (#49) Factory web UI — minimal reset. The dashboard styles are added in
+   Tasks 2–4. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}

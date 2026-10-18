@@ -27,6 +27,7 @@ import type { Orchestrator, OrchestratorRequest } from '../orchestrator/orchestr
 import type { ReadyTicketPoller } from '../github/poller';
 import type { Scheduler } from '../scheduler/scheduler';
 import type { StateStore } from '../state/store';
+import { serveUi } from '../ui/assets';
 import {
   projectDrillDown as projectTelemetryDrillDown,
   projectTelemetryMetrics,
@@ -147,6 +148,9 @@ const STATUS_BY_CODE: Record<string, number> = {
   // E12 (#48) the orchestrator request body is malformed (no usable message
   // and no valid confirmation) — the caller's error, not the model's.
   INVALID_ORCHESTRATOR_REQUEST: 400,
+  // E12.2 (#49) a known UI asset exists in the route table but its file cannot
+  // be read — a broken deployment (server fault), not a client 404.
+  UI_ASSET_UNAVAILABLE: 500,
 };
 
 function json(body: unknown, status = 200): Response {
@@ -392,6 +396,15 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
     const url = new URL(request.url);
     const segments = url.pathname.split('/').filter(Boolean);
     const method = request.method.toUpperCase();
+
+    // E12.2 (#49) serve the read-first web UI. This is deliberately *before*
+    // the auth boundary below: the documented decision is that GET stays public,
+    // so an operator must be able to load the shell and its assets with no
+    // credential. `serveUi` answers only GET/HEAD on `/`, `/index.html`, and
+    // `/ui/*`; every other request (including any mutating method on a UI path)
+    // falls through unchanged to the API routing and its auth gate.
+    const uiAsset = await serveUi(request);
+    if (uiAsset) return uiAsset;
 
     // E10.4 (#40) auth boundary. When auth is configured: GET stays public
     // (documented read-only decision), every mutating method requires a valid
