@@ -482,9 +482,11 @@ interface RecordedFactoryCall {
 /**
  * A recording `FactoryClient` stand-in. Every method access resolves to an async
  * function that records `{ method, args }` and answers with the canned DTO for
- * that method (or a canned function's result). Nothing here touches the network
- * or Factory state — which is exactly how "the loop performs no direct
- * mutation" and "a refused confirmation makes zero calls" become observable.
+ * that method (or a canned function's result). A canned function that throws
+ * rejects the call, exactly as a real `FactoryApiError` would. Nothing here
+ * touches the network or Factory state — which is exactly how "the loop performs
+ * no direct mutation" and "a refused confirmation makes zero calls" become
+ * observable.
  */
 function fakeFactoryClient(canned: Partial<Record<keyof FactoryClient, unknown>> = {}): {
   client: FactoryClient;
@@ -497,14 +499,12 @@ function fakeFactoryClient(canned: Partial<Record<keyof FactoryClient, unknown>>
     {
       get(_target, property) {
         if (typeof property !== 'string') return undefined;
-        return (...args: unknown[]) => {
+        return async (...args: unknown[]) => {
           calls.push({ method: property, args });
           const entry = canned[property as keyof FactoryClient];
-          const value =
-            typeof entry === 'function'
-              ? (entry as (...a: unknown[]) => unknown)(...args)
-              : entry;
-          return Promise.resolve(value);
+          return typeof entry === 'function'
+            ? (entry as (...a: unknown[]) => unknown)(...args)
+            : entry;
         };
       },
     },
@@ -672,8 +672,34 @@ describe('E12 orchestrator: loop + confirmation gate (#48)', () => {
     expect(requests[1]!.maxTokens).toBe(2048);
   });
 
-  it('advertises every tool and the strict-JSON contract in the system prompt', async () => {
-    const factory = fakeFactoryClient();
+  it('read loop: a throwing read tool reports ORCHESTRATOR_TOOL_FAILED and stops the loop', async () => {
+    const factory = fakeFactoryClient({
+      listWorkOrders: () => {
+        throw new Error('factory unreachable');
+      },
+    });
+    const { model, requests } = scriptedModelClient([
+      '{"tool":"list_work_orders","args":{}}',
+      '{"final":"this final must never be reached"}',
+    ]);
+    const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
+
+    const result = resultOf(await orchestrator.handle({ message: 'list the work orders' }));
+
+    expect(result.status).toBe('error');
+    if (result.status !== 'error') throw new Error(`expected error, got ${result.status}`);
+    expect(result.error.code).toBe('ORCHESTRATOR_TOOL_FAILED');
+    expect(result.error.message).toContain('factory unreachable');
+    // The error plainly reports failure; it does not carry a success summary.
+    expect((result as { summary?: unknown }).summary).toBeUndefined();
+    // Exactly one client call, and the loop stopped: the second scripted model
+    // reply was never consumed, so no further model call (or tool call) happened.
+    expect(factory.calls).toHaveLength(1);
+    expect(factory.calls[0]!.method).toBe('listWorkOrders');
+    expect(requests).toHaveLength(1);
+  });
+
+  it('advertises every tool and the strict-JSON contract in the system prompt', async () => {    const factory = fakeFactoryClient();
     const { model, requests } = scriptedModelClient(['{"final":"nothing to do"}']);
     const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
 
@@ -760,6 +786,33 @@ describe('E12 orchestrator: loop + confirmation gate (#48)', () => {
     if (result.status !== 'error') throw new Error(`expected error, got ${result.status}`);
     expect(result.error.code).toBe('ORCHESTRATOR_UNKNOWN_TOOL');
     expect(factory.calls).toHaveLength(0);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('confirmation apply: a throwing tool reports ORCHESTRATOR_TOOL_FAILED, once, without the model', async () => {
+    const factory = fakeFactoryClient({
+      emergencyStop: () => {
+        throw new Error('factory unreachable');
+      },
+    });
+    const { model, requests } = scriptedModelClient([]);
+    const orchestrator = createOrchestrator({ client: factory.client, model, modelName: MODEL });
+
+    const result = resultOf(
+      await orchestrator.handle({
+        message: 'stop everything now',
+        confirm: { tool: 'emergency_stop', args: { actor: 'me' } },
+      }),
+    );
+
+    expect(result.status).toBe('error');
+    if (result.status !== 'error') throw new Error(`expected error, got ${result.status}`);
+    expect(result.error.code).toBe('ORCHESTRATOR_TOOL_FAILED');
+    expect(result.error.message).toContain('factory unreachable');
+    // Exactly the one confirmed call was attempted; the model was never consulted.
+    expect(factory.calls).toHaveLength(1);
+    expect(factory.calls[0]!.method).toBe('emergencyStop');
+    expect(factory.calls[0]!.args).toEqual(['me']);
     expect(requests).toHaveLength(0);
   });
 
