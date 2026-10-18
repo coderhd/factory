@@ -743,7 +743,7 @@ describe('E9.2 DAG-commit CLI surface', () => {
       );
 
       const cap = capture(workDir);
-      expect(await runCli(['wo', 'plan', wo.id, '--dag', dagFile, '--url', h.url], cap.io)).toBe(0);
+      expect(await runCli(['wo', 'plan', wo.id, '--dag', dagFile, '--url', h.url, '--json'], cap.io)).toBe(0);
       const out = JSON.parse(cap.out()) as { dag: { version: number; nodes: Array<{ taskId: string }> } };
       expect(out.dag.version).toBe(1);
       expect(out.dag.nodes).toHaveLength(2);
@@ -1907,7 +1907,7 @@ describe('E9.5 approval answering — REQUIRE_HUMAN park answerable end-to-end',
 
       const cap = capture(workDir);
       const code = await runCli(
-        ['approvals', 'answer', parked.id, '--decision', 'APPROVAL', '--actor', 'operator-7', '--url', h.url],
+        ['approvals', 'answer', parked.id, '--decision', 'APPROVAL', '--actor', 'operator-7', '--url', h.url, '--json'],
         cap.io,
       );
       expect(code).toBe(0);
@@ -2123,16 +2123,16 @@ describe('E9.6 e-stop/pause freeze the live scheduler', () => {
 
       const stop = capture(workDir);
       expect(
-        await runCli(['control', 'emergency-stop', '--actor', 'operator-7', '--url', h.url], stop.io),
+        await runCli(['control', 'emergency-stop', '--actor', 'operator-7', '--url', h.url, '--json'], stop.io),
       ).toBe(0);
       expect(JSON.parse(stop.out())).toEqual({ paused: false, emergencyStopped: true });
 
       const status = capture(workDir);
-      expect(await runCli(['control', 'status', '--url', h.url], status.io)).toBe(0);
+      expect(await runCli(['control', 'status', '--url', h.url, '--json'], status.io)).toBe(0);
       expect(JSON.parse(status.out())).toEqual({ paused: false, emergencyStopped: true });
 
       const resume = capture(workDir);
-      expect(await runCli(['control', 'resume', '--actor', 'operator-7', '--url', h.url], resume.io)).toBe(0);
+      expect(await runCli(['control', 'resume', '--actor', 'operator-7', '--url', h.url, '--json'], resume.io)).toBe(0);
       expect(JSON.parse(resume.out())).toEqual({ paused: false, emergencyStopped: false });
 
       // An actor is required: the operator identity is the durable receipt.

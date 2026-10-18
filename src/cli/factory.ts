@@ -15,6 +15,7 @@ import {
   type FactoryRuntimeConfig,
 } from '../factory/config/factoryConfig';
 import type { EvidenceBundle } from '../factory/evidence/bundle';
+import { WORK_ORDER_STATES, type WorkOrderState } from '../factory/domain/workOrder';
 import {
   createGitHubAdapter,
   createGitHubRestTransport,
@@ -107,6 +108,23 @@ const runtimeFilePath = (dir: string): string => join(dir, '.factory', 'runtime.
 function credentialOptions(args: ParsedArgs): { token?: string } {
   const token = flag(args, 'token') ?? process.env.FACTORY_TOKEN;
   return token ? { token } : {};
+}
+
+/**
+ * POC-finish: human-readable output by default, exact JSON with `--json`.
+ * `emit` prints the value as today's JSON when `--json` is passed, else one
+ * human-readable line per entry of `lines`. JSON shapes are unchanged.
+ */
+function emit(args: ParsedArgs, io: CliIO, value: unknown, lines: string[]): void {
+  if (hasFlag(args, 'json')) {
+    io.out(JSON.stringify(value));
+    return;
+  }
+  for (const line of lines) io.out(line);
+}
+
+function yesNo(value: boolean): string {
+  return value ? 'yes' : 'no';
 }
 
 interface RuntimeFile {
@@ -717,23 +735,26 @@ async function cmdStatus(args: ParsedArgs, io: CliIO): Promise<number> {
   const runtimeFile = readRuntimeFile(dir);
   const url = explicitUrl ?? runtimeFile?.url;
   if (!url) {
-    io.out(JSON.stringify({ status: 'stopped' }));
+    emit(args, io, { status: 'stopped' }, ['stopped']);
     return 0;
   }
   try {
     const client = createFactoryClient({ baseUrl: url, fetch: io.fetch });
     const health = await client.health();
-    io.out(
-      JSON.stringify({
+    emit(
+      args,
+      io,
+      {
         status: 'running',
         url,
         instanceId: health.instanceId,
         version: health.version,
         schemaVersion: health.schemaVersion,
-      }),
+      },
+      ['running', `  url: ${url}`, `  instance: ${health.instanceId}`, `  version: ${health.version}`],
     );
   } catch {
-    io.out(JSON.stringify({ status: 'stopped', url }));
+    emit(args, io, { status: 'stopped', url }, ['stopped', `  url: ${url}`]);
   }
   return 0;
 }
@@ -891,7 +912,7 @@ async function cmdStop(args: ParsedArgs, io: CliIO): Promise<number> {
   const dir = resolveDir(args, io);
   const runtimeFile = readRuntimeFile(dir);
   if (!runtimeFile) {
-    io.out(JSON.stringify({ status: 'stopped', stopped: false }));
+    emit(args, io, { status: 'stopped', stopped: false }, ['already stopped']);
     return 0;
   }
   try {
@@ -900,7 +921,12 @@ async function cmdStop(args: ParsedArgs, io: CliIO): Promise<number> {
     // Already gone — clearing the runtime file is still correct.
   }
   clearRuntimeFile(dir);
-  io.out(JSON.stringify({ status: 'stopped', stopped: true, pid: runtimeFile.pid }));
+  emit(
+    args,
+    io,
+    { status: 'stopped', stopped: true, pid: runtimeFile.pid },
+    [`stopped (pid ${runtimeFile.pid})`],
+  );
   return 0;
 }
 
@@ -919,12 +945,15 @@ async function cmdUpdate(args: ParsedArgs, io: CliIO): Promise<number> {
     factoryVersion: loaded.runtime.factoryVersion,
     schemaVersion: loaded.runtime.schemaVersion,
   });
-  io.out(
-    JSON.stringify({
+  emit(
+    args,
+    io,
+    {
       configValid: true,
       image: loaded.runtime.image.ref,
       backup: resolve(backup),
-    }),
+    },
+    ['config valid', `  image: ${loaded.runtime.image.ref}`, `  backup: ${resolve(backup)}`],
   );
   return 0;
 }
@@ -974,6 +1003,10 @@ function resolveUrl(args: ParsedArgs, io: CliIO): string | null {
 
 async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
   const sub = args.positionals[1];
+  if (sub === undefined || sub === 'help' || hasFlag(args, 'help')) {
+    io.out(WO_USAGE);
+    return sub === undefined ? 1 : 0;
+  }
   const url = resolveUrl(args, io);
   if (!url) {
     io.err('no server URL; pass --url or start the server first');
@@ -997,7 +1030,11 @@ async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
       acceptanceCriteria: args.flags.get('acceptance'),
       repository: flag(args, 'repo'),
     });
-    io.out(JSON.stringify(workOrder));
+    emit(args, io, workOrder, [
+      `Work order ${workOrder.id}`,
+      `  state: ${workOrder.state}`,
+      `  intent: ${workOrder.intent}`,
+    ]);
     return 0;
   }
 
@@ -1007,12 +1044,44 @@ async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
       io.err('usage: factory wo status <workOrderId>');
       return 1;
     }
-    io.out(JSON.stringify(await client.getWorkOrder(id)));
+    const snapshot = await client.getWorkOrder(id);
+    emit(args, io, snapshot, [
+      `Work order ${snapshot.workOrder.id}`,
+      `  state: ${snapshot.workOrder.state}`,
+      `  tasks: ${snapshot.tasks.length}`,
+      `  attempts: ${snapshot.attempts.length}`,
+      `  interactions: ${snapshot.interactions.length}`,
+      `  dag: ${snapshot.dag ? `v${snapshot.dag.version}` : 'none'}`,
+    ]);
     return 0;
   }
 
   if (sub === 'list') {
-    io.out(JSON.stringify(await client.listWorkOrders()));
+    const workOrders = await client.listWorkOrders();
+    emit(
+      args,
+      io,
+      workOrders,
+      workOrders.length === 0
+        ? ['no work orders']
+        : workOrders.map((workOrder) => `- ${workOrder.id} [${workOrder.state}] ${workOrder.intent}`),
+    );
+    return 0;
+  }
+
+  if (sub === 'transition') {
+    const id = args.positionals[2];
+    const to = flag(args, 'to');
+    if (!id || !to) {
+      io.err('usage: factory wo transition <workOrderId> --to <STATE> [--url <url>]');
+      return 1;
+    }
+    if (!(WORK_ORDER_STATES as readonly string[]).includes(to)) {
+      io.err(`unknown state "${to}" (expected one of: ${WORK_ORDER_STATES.join(', ')})`);
+      return 1;
+    }
+    const workOrder = await client.transitionWorkOrder(id, { to: to as WorkOrderState });
+    emit(args, io, workOrder, [`Work order ${workOrder.id} → ${workOrder.state}`]);
     return 0;
   }
 
@@ -1039,7 +1108,8 @@ async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
       io.err('dag file must be a JSON object with a "nodes" array');
       return 1;
     }
-    io.out(JSON.stringify(await client.commitDag(id, payload as DAGProposalPayload)));
+    const result = await client.commitDag(id, payload as DAGProposalPayload);
+    emit(args, io, result, [`DAG v${result.dag.version} committed (${result.dag.nodes.length} tasks)`]);
     return 0;
   }
 
@@ -1050,7 +1120,12 @@ async function cmdWo(args: ParsedArgs, io: CliIO): Promise<number> {
       io.err('usage: factory wo answer <interactionId> <response> [--actor <id>]');
       return 1;
     }
-    io.out(JSON.stringify(await client.answerInteraction(id, response, flag(args, 'actor'))));
+    const answer = await client.answerInteraction(id, response, flag(args, 'actor'));
+    emit(args, io, answer, [
+      `Answered ${answer.interaction.id}`,
+      `  response: ${answer.interaction.response ?? ''}`,
+      `  task ${answer.task.id} → ${answer.task.state}`,
+    ]);
     return 0;
   }
 
@@ -1091,7 +1166,11 @@ async function cmdGithub(args: ParsedArgs, io: CliIO): Promise<number> {
       io.err(`--issue must be a positive integer (got "${number}")`);
       return 1;
     }
-    io.out(JSON.stringify(await client.githubImportIssue({ repository, number: parsed })));
+    const result = await client.githubImportIssue({ repository, number: parsed });
+    emit(args, io, result, [
+      `Work order ${result.workOrder.id} (${result.created ? 'created' : 'reconciled'})`,
+      `  state: ${result.workOrder.state}`,
+    ]);
     return 0;
   }
 
@@ -1103,15 +1182,16 @@ async function cmdGithub(args: ParsedArgs, io: CliIO): Promise<number> {
     }
     const base = flag(args, 'base');
     const title = flag(args, 'title');
-    io.out(
-      JSON.stringify(
-        await client.githubOpenPullRequest({
-          evidenceBundleId,
-          ...(base ? { baseBranch: base } : {}),
-          ...(title ? { title } : {}),
-        }),
-      ),
-    );
+    const pullRequest = await client.githubOpenPullRequest({
+      evidenceBundleId,
+      ...(base ? { baseBranch: base } : {}),
+      ...(title ? { title } : {}),
+    });
+    emit(args, io, pullRequest, [
+      `PR ${pullRequest.repository}#${pullRequest.number}`,
+      `  url: ${pullRequest.url}`,
+      `  ${pullRequest.head} → ${pullRequest.base}`,
+    ]);
     return 0;
   }
 
@@ -1131,7 +1211,19 @@ async function cmdObservatory(args: ParsedArgs, io: CliIO): Promise<number> {
     // E10.4 (#40): the bearer credential for authenticated deployments.
     ...credentialOptions(args),
   });
-  io.out(JSON.stringify(await client.observatory()));
+  const metrics = await client.observatory();
+  const perDay =
+    metrics.verifiedPerDay.length === 0
+      ? 'none'
+      : metrics.verifiedPerDay.map((day) => `${day.day}: ${day.verifiedChanges} changes`).join(', ');
+  emit(args, io, metrics, [
+    `Observatory (${metrics.generatedAt})`,
+    `  verified/day: ${perDay}`,
+    `  throughput/human-hour: ${metrics.throughputPerHumanHour.verifiedChangesPerHumanHour} changes/hour ` +
+      `(${metrics.throughputPerHumanHour.verifiedChanges} changes / ${metrics.throughputPerHumanHour.humanHours}h)`,
+    `  rework: ${metrics.rework}`,
+    `  cost: ${metrics.cost.total} ${metrics.cost.currency}`,
+  ]);
   return 0;
 }
 
@@ -1156,7 +1248,8 @@ async function cmdControl(args: ParsedArgs, io: CliIO): Promise<number> {
   });
 
   if (sub === 'status') {
-    io.out(JSON.stringify(await client.factoryControls()));
+    const controls = await client.factoryControls();
+    emit(args, io, controls, [`paused: ${yesNo(controls.paused)}`, `  emergency-stopped: ${yesNo(controls.emergencyStopped)}`]);
     return 0;
   }
   if (sub === 'pause' || sub === 'resume' || sub === 'emergency-stop') {
@@ -1171,7 +1264,11 @@ async function cmdControl(args: ParsedArgs, io: CliIO): Promise<number> {
         : sub === 'resume'
           ? await client.resume(actor)
           : await client.emergencyStop(actor);
-    io.out(JSON.stringify(controls));
+    emit(args, io, controls, [
+      `${sub} by ${actor}`,
+      `  paused: ${yesNo(controls.paused)}`,
+      `  emergency-stopped: ${yesNo(controls.emergencyStopped)}`,
+    ]);
     return 0;
   }
 
@@ -1195,7 +1292,15 @@ async function cmdApprovals(args: ParsedArgs, io: CliIO): Promise<number> {
 
   if (sub === 'list') {
     const status = flag(args, 'status') as 'PENDING' | 'ANSWERED' | 'SPENT' | undefined;
-    io.out(JSON.stringify(await client.listApprovals(status)));
+    const approvals = await client.listApprovals(status);
+    emit(
+      args,
+      io,
+      approvals,
+      approvals.length === 0
+        ? ['no approvals']
+        : approvals.map((approval) => `- ${approval.id} [${approval.status}] ${approval.binding.capability}: ${approval.question}`),
+    );
     return 0;
   }
 
@@ -1213,13 +1318,29 @@ async function cmdApprovals(args: ParsedArgs, io: CliIO): Promise<number> {
       actor,
       ...(comment ? { comment } : {}),
     });
-    io.out(JSON.stringify(approval));
+    emit(args, io, approval, [
+      `Approval ${approval.id}: ${approval.response?.decision ?? decision} by ${approval.response?.actor ?? actor} (${approval.status})`,
+    ]);
     return 0;
   }
 
   io.err(`unknown approvals subcommand: ${sub ?? ''}`);
   return 1;
 }
+
+const WO_USAGE = [
+  'factory wo <subcommand>',
+  '',
+  '  wo submit --intent <text> [--acceptance <c>] [--repo <r>] [--url] [--json]  create a Work Order (DRAFT)',
+  '  wo status <workOrderId> [--url] [--json]                                  read Work Order status',
+  '  wo list [--url] [--json]                                                   list Work Orders',
+  '  wo transition <workOrderId> --to <STATE> [--url] [--json]                  move a Work Order (e.g. DRAFT→READY→PLANNING)',
+  '  wo plan <workOrderId> --dag <file> [--url] [--json]                        commit a planner DAG proposal',
+  '  wo answer <interactionId> <response> [--actor <id>] [--url] [--json]       answer a QUESTION',
+  '',
+  '  Work Order states: ' + WORK_ORDER_STATES.join(', '),
+  '  Append --json to any command above for the machine-readable JSON output.',
+].join('\n');
 
 const HELP = [
   'factory <command>',
@@ -1233,6 +1354,8 @@ const HELP = [
   '  restore <archive> --into <dir> [--force]  restore a backup archive',
   '  wo submit --intent <text> [--url]      create a Work Order (DRAFT)',
   '  wo status <workOrderId> [--url]        read Work Order status',
+  '  wo list [--url]                        list Work Orders',
+  '  wo transition <id> --to <STATE>        move a Work Order (DRAFT→READY→PLANNING…)',
   '  wo plan <workOrderId> --dag <file>     commit a planner DAG proposal',
   '  wo answer <interactionId> <response> [--actor <id>]  answer a QUESTION (--actor is overridden when the server requires a credential)',
   '  approvals list [--status <state>]      list policy approvals',
@@ -1243,6 +1366,7 @@ const HELP = [
   '  control status [--url]                 read pause/e-stop controls',
   '  control <pause|resume|emergency-stop> --actor <id>  set a factory control (--actor is overridden when the server requires a credential)',
   '',
+  '  Output is human-readable by default; append --json for machine-readable JSON.',
   "  Client commands accept --token <tok> (or $FACTORY_TOKEN) when the server",
   '  requires a bearer credential (E10.4).',
 ].join('\n');

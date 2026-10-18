@@ -1919,7 +1919,7 @@ describe('E10.3 GitHub adapter composed into a running process (#37)', () => {
       // `factory github import` creates the Work Order through the server.
       const importCap = capture();
       const code = await runCli(
-        ['github', 'import', '--repo', 'acme/widgets', '--issue', '88', '--url', server.url],
+        ['github', 'import', '--repo', 'acme/widgets', '--issue', '88', '--url', server.url, '--json'],
         importCap.io,
       );
       expect(code).toBe(0);
@@ -1936,7 +1936,7 @@ describe('E10.3 GitHub adapter composed into a running process (#37)', () => {
       store.set('evidence_bundles', bundle.id, bundle);
       const prCap = capture();
       const prCode = await runCli(
-        ['github', 'pr', '--bundle', bundle.id, '--url', server.url],
+        ['github', 'pr', '--bundle', bundle.id, '--url', server.url, '--json'],
         prCap.io,
       );
       expect(prCode).toBe(0);
