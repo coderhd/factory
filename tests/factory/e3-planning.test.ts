@@ -47,6 +47,10 @@ import {
 } from '../../src/factory/workers/manager';
 import { createWorktreeManager, taskWorktreeBranch } from '../../src/factory/worktrees/worktree';
 
+// The single shared in-process `herdr` CLI fake (#46): used by this suite and by
+// the E11 integration suite, so both exercise the same double.
+import { FakeHerdrCli } from './helpers/fakeHerdr';
+
 let workDir: string;
 let dbPath: string;
 let worktreeRoot: string;
@@ -1305,68 +1309,11 @@ describe('E3 assignment + completion rules', () => {
 // T9b — real-adapter boot race + scheduler compensation (final-review fixes)
 // E11.1 (#44): the "real adapter" is the herdr-CLI-driven one. These tests
 // inject a fake herdr CLI (never a real herdr/opencode).
+// The fake is the single shared double (`./helpers/fakeHerdr`, #46); the old
+// file-local `RecordingHerdrCli` (with `expect()` embedded in the double and a
+// numeric `openTabs()`) is gone. Tests own every assertion, over `calls` /
+// `openTabs(): FakeTab[]`.
 // ---------------------------------------------------------------------------
-
-/**
- * An in-process fake `herdr` CLI. It pretends the server exists, tracks tabs,
- * and answers like the real CLI does: the parsed document nests payloads under
- * `.result`. Reports are produced by a test-provided `onPrompt`.
- */
-class RecordingHerdrCli {
-  calls: string[][] = [];
-  tabs = new Map<string, { id: string; pane: string; cwd: string; closed: boolean }>();
-  agentState = 'idle';
-  /** Test hook: runs when the adapter prompts the harness. */
-  onPrompt: ((prompt: string, cwd: string) => void) | null = null;
-
-  constructor(private readonly workspaceId = 'ws_factory') {}
-
-  async run(args: readonly string[]): Promise<{ result?: unknown }> {
-    const argv = [...args];
-    this.calls.push(argv);
-    const value = (key: string): string => {
-      const index = argv.indexOf(`--${key}`);
-      if (index < 0) throw new Error(`missing --${key}`);
-      return argv[index + 1]!;
-    };
-    const sub = argv[1];
-    if (argv[0] === 'workspace' && sub === 'list') {
-      return { result: [{ id: this.workspaceId, label: 'factory' }] };
-    }
-    if (argv[0] === 'tab' && sub === 'create') {
-      expect(value('workspace')).toBe(this.workspaceId);
-      const tab = { id: `tab_${this.tabs.size}`, pane: `pane_${this.tabs.size}`, cwd: value('cwd'), closed: false };
-      this.tabs.set(tab.id, tab);
-      return { result: { tab: tab.id, root_pane: tab.pane } };
-    }
-    if (argv[0] === 'agent' && sub === 'start') {
-      expect(argv[3]).toBe('--kind');
-      expect(argv[4]).toBe('opencode');
-      return { result: { agent: argv[2] } };
-    }
-    if (argv[0] === 'agent' && sub === 'prompt') {
-      const tab = [...this.tabs.values()].filter((t) => !t.closed).at(-1);
-      if (tab) this.onPrompt?.(argv[2] ?? '', tab.cwd);
-      return { result: { ok: true } };
-    }
-    if (argv[0] === 'agent' && sub === 'get') {
-      return { result: { state: this.agentState } };
-    }
-    if (argv[0] === 'agent' && sub === 'read') {
-      return { result: { text: 'Which approach should I take here?' } };
-    }
-    if (argv[0] === 'tab' && sub === 'close') {
-      const tab = this.tabs.get(argv[2] ?? '');
-      if (tab) tab.closed = true;
-      return { result: {} };
-    }
-    throw new Error(`unexpected herdr invocation: ${argv.join(' ')}`);
-  }
-
-  openTabs(): number {
-    return [...this.tabs.values()].filter((tab) => !tab.closed).length;
-  }
-}
 
 /** Write a `.factory/report.json` under a worktree root. */
 function seedReport(worktree: string, patch: Record<string, unknown> = {}): void {
@@ -1395,7 +1342,7 @@ describe('E3 real Herdr same-tick provision→assign→execute', () => {
       const worktreePath = join(worktreeRoot, taskId);
       mkdirSync(worktreePath, { recursive: true });
 
-      const cli = new RecordingHerdrCli();
+      const cli = new FakeHerdrCli();
       // The "harness" writes its own run-specific report when prompted (the
       // file must be produced by this turn, not seeded beforehand).
       cli.onPrompt = () => seedReport(worktreePath, { observations: ['run report from prompt'] });
@@ -1440,8 +1387,21 @@ describe('E3 real Herdr same-tick provision→assign→execute', () => {
       expect(result.failure).toBeNull();
       expect(result.observations).toContain('run report from prompt');
       // The tab was created for this Attempt's worktree — and closed after.
-      expect([...cli.tabs.values()].filter((tab) => tab.cwd === worktreePath)).toHaveLength(1);
-      expect(cli.openTabs()).toBe(0);
+      const tabs = [...cli.workspaces.values()]
+        .flatMap((ws) => ws.tabs)
+        .filter((tab) => tab.cwd === worktreePath);
+      expect(tabs).toHaveLength(1);
+      expect(cli.openTabs()).toHaveLength(0);
+      // The dispatch targeted the factory workspace and started the opencode
+      // harness. (These two assertions lived inside the old `RecordingHerdrCli`
+      // double, which `expect()`-ed on every call; moved here into the owning
+      // test as real assertions on the recorded `calls`.)
+      const createCall = cli.calls.find((argv) => argv[0] === 'tab' && argv[1] === 'create');
+      expect(createCall).toBeDefined();
+      expect(createCall!.join(' ')).toContain('--workspace ws_factory');
+      const startCall = cli.calls.find((argv) => argv[0] === 'agent' && argv[1] === 'start');
+      expect(startCall).toBeDefined();
+      expect(startCall!.join(' ')).toContain('--kind opencode');
     } finally {
       store.close();
     }
@@ -1467,8 +1427,8 @@ const envelopeFor = (): ExecutionEnvelope => ({
   requiredVerification: [],
 });
 
-function seedAdapter(): { adapter: WorkerAdapter; cli: RecordingHerdrCli } {
-  const cli = new RecordingHerdrCli();
+function seedAdapter(): { adapter: WorkerAdapter; cli: FakeHerdrCli } {
+  const cli = new FakeHerdrCli();
   const adapter = createHerdrWorker({
     cli,
     workspace: createHerdrWorkspaceManager(cli, { label: 'factory', repoPath }),
@@ -1495,7 +1455,22 @@ describe('E3 Herdr adapter lifecycle', () => {
       expect(result.verificationRequests).toEqual(['typecheck']);
       expect(result.observations).toEqual(['one observation']);
       expect((await adapter.status()).state).toBe('completed');
-      expect(cli.openTabs()).toBe(0);
+      expect(cli.openTabs()).toHaveLength(0);
+    } finally {
+      await adapter.destroy();
+    }
+  });
+
+  it('tears down the tab when the create payload is missing root_pane (no leaked pane)', async () => {
+    const { adapter, cli } = seedAdapter();
+    cli.omitRootPane = true;
+    try {
+      await adapter.provision();
+      await adapter.start();
+      await adapter.execute(envelopeFor());
+      const reported = await adapter.collectArtifacts();
+      expect(reported.failure).toContain('harness dispatch failed');
+      expect(cli.openTabs()).toHaveLength(0); // the created tab was closed, not leaked
     } finally {
       await adapter.destroy();
     }
@@ -1504,6 +1479,9 @@ describe('E3 Herdr adapter lifecycle', () => {
   it('fails loudly when the harness does not write a report within the deadline', async () => {
     const { adapter, cli } = seedAdapter();
     try {
+      // The turn has ended with nothing reported (the pre-shared-fake default),
+      // so this exercises the report-timeout path rather than a still-running one.
+      cli.agentState = 'idle';
       await adapter.provision();
       await adapter.start();
       await adapter.execute(envelopeFor());
@@ -1511,7 +1489,7 @@ describe('E3 Herdr adapter lifecycle', () => {
       expect(result.status).toBe('failed');
       expect(result.failure).toContain('report.json');
       expect((await adapter.status()).state).toBe('failed');
-      expect(cli.openTabs()).toBe(0);
+      expect(cli.openTabs()).toHaveLength(0);
     } finally {
       await adapter.destroy();
     }
@@ -1533,7 +1511,7 @@ describe('E3 Herdr adapter lifecycle', () => {
       await adapter.deliverAnswer({ interactionId: 'i', question: '?', response: 'do it' });
       const resumed = await adapter.collectArtifacts();
       expect(resumed.status).toBe('completed');
-      expect(cli.openTabs()).toBe(0);
+      expect(cli.openTabs()).toHaveLength(0);
     } finally {
       await adapter.destroy();
     }
@@ -1562,7 +1540,7 @@ describe('E3 Herdr adapter lifecycle', () => {
       const second = await adapter.collectArtifacts();
       expect(second.status).toBe('completed');
       expect(second.observations).toEqual(['run 2 report']);
-      expect(cli.openTabs()).toBe(0);
+      expect(cli.openTabs()).toHaveLength(0);
     } finally {
       await adapter.destroy();
     }
@@ -1570,21 +1548,64 @@ describe('E3 Herdr adapter lifecycle', () => {
 
   it('resolves every concurrent collect with the same settled report', async () => {
     const { adapter, cli } = seedAdapter();
+    // Hold the harness turn open so the run is live (tab created, polling) with
+    // no report settled yet.
+    let releasePrompt!: () => void;
+    const promptGate = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
     try {
       cli.agentState = 'running';
-      cli.onPrompt = (() => {
-        // The first poll after the prompt has no report; a later poll finds it.
-        seedReport(repoPath);
-        cli.onPrompt = null;
-      }) as RecordingHerdrCli['onPrompt'];
+      let promptReached!: () => void;
+      const promptSeen = new Promise<void>((resolve) => {
+        promptReached = resolve;
+      });
+      const realRun = cli.run.bind(cli);
+      cli.run = async (args: readonly string[]) => {
+        if (args[0] === 'agent' && args[1] === 'prompt') {
+          promptReached();
+          await promptGate;
+        }
+        return realRun(args);
+      };
+
       await adapter.provision();
       await adapter.start();
-      await adapter.execute(envelopeFor());
+      // Start the run but do NOT await it: `execute` is parked on the prompt with
+      // the run live and `result` still null.
+      const exec = adapter.execute(envelopeFor());
+      await promptSeen;
 
-      const [a, b] = await Promise.all([adapter.collectArtifacts(), adapter.collectArtifacts()]);
-      expect(a.status).toBe('completed');
-      expect(b.status).toBe('completed');
+      // Both collectors are created while the run is live and no report is
+      // settled, so both park on `reportWaiters` — genuinely concurrent. (The
+      // previous body awaited `execute` first, so both legs short-circuited on
+      // the already-settled result and no concurrency was exercised at all.)
+      let settledA = false;
+      let settledB = false;
+      const a = adapter.collectArtifacts().then((report) => {
+        settledA = true;
+        return report;
+      });
+      const b = adapter.collectArtifacts().then((report) => {
+        settledB = true;
+        return report;
+      });
+      await Promise.resolve();
+      expect(settledA).toBe(false);
+      expect(settledB).toBe(false);
+
+      // The report arrives: the poll finds it and settles every parked collector
+      // with the SAME settled report object.
+      seedReport(repoPath);
+      releasePrompt();
+      await exec;
+
+      const [ra, rb] = await Promise.all([a, b]);
+      expect(ra.status).toBe('completed');
+      expect(rb.status).toBe('completed');
+      expect(ra).toBe(rb);
     } finally {
+      releasePrompt();
       await adapter.destroy();
     }
   });

@@ -775,13 +775,14 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
             '--no-focus',
           ]),
         );
-        // Register the live run immediately after the tab exists, so a later
-        // failure (e.g. missing `root_pane` in a malformed create payload)
-        // tears the pane down in `releaseRun` instead of leaking the tab.
+        // Register the live run immediately after the tab exists — before
+        // reading `root_pane` — so a later failure (e.g. a missing `root_pane`
+        // in a malformed create payload) is caught with a live `runState`: the
+        // catch tears the pane down in `releaseRun` rather than leaking the tab.
         const tabId = refId(tabResult, 'tab', 'tab_id');
-        const rootPane = refId(tabResult, 'root_pane', 'pane_id');
         runState = { envelope, agentName: `factory-${envelope.attemptId}`, tab: tabId };
         run = runState;
+        const rootPane = refId(tabResult, 'root_pane', 'pane_id');
         const agentArgs = [
           'agent',
           'start',

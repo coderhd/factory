@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -25,7 +25,6 @@ import {
   createProcessHerdrCli,
   renderTaskPrompt,
   type ExecutionEnvelope,
-  type HerdrCli,
   type WorkerAdapter,
   type WorkerAnswer,
   type WorkerResult,
@@ -52,6 +51,10 @@ import {
   serializeFactoryConfig,
   type FactoryDesiredConfig,
 } from '../../src/factory/config/factoryConfig';
+
+// The single shared in-process `herdr` CLI fake (#46): used here and by the E3
+// lifecycle suite, so both exercise the same double (no divergent fakes).
+import { FakeHerdrCli, type HerdrDoc } from './helpers/fakeHerdr';
 
 /**
  * E11.3 (#43) — outbound GitHub transport/token configuration. A running
@@ -314,11 +317,23 @@ describe('E11.3 GitHub transport/token configuration (#43)', () => {
     ).toBe(true);
     expect(unknownKey.issues.some((issue) => issue.path === 'github.repository')).toBe(true);
 
+    // A stray key beside a valid `env` reference is refused: only `env` is a
+    // github.token key, so a raw secret dressed as `token.value` cannot ride in
+    // just because a legal `env` sits next to it.
+    const strayTokenKey = parseFactoryConfig(
+      `apiVersion: factory/v0.1\ngithub:\n  repository: acme/widgets\n  token:\n    env: GITHUB_TOKEN\n    value: ghp_raw_secret\n`,
+    );
+    if (strayTokenKey.ok) throw new Error('a stray github.token key must not parse');
+    expect(strayTokenKey.issues.some((issue) => issue.path === 'github.token.value')).toBe(true);
+
+    // A token mapping with no env reference (the raw `value:` secret shape) is
+    // still refused: the token itself may only ever be an { env: NAME } ref.
     const rawTokenValue = parseFactoryConfig(
       `apiVersion: factory/v0.1\ngithub:\n  repository: acme/widgets\n  token:\n    value: ghp_raw_secret\n`,
     );
     if (rawTokenValue.ok) throw new Error('a raw token.value secret must not parse');
     expect(rawTokenValue.issues.some((issue) => issue.path === 'github.token.env')).toBe(true);
+    expect(rawTokenValue.issues.some((issue) => issue.path === 'github.token.value')).toBe(true);
 
     // Where a raw token would read even if accepted — it must not end up in
     // the resolved runtime config: only the env var name is carried.
@@ -584,121 +599,8 @@ describe('E11.3 GitHub transport/token configuration (#43)', () => {
 // one opencode harness tab per Attempt, and collects results from a report
 // file + git. Hermetic throughout: the herdr CLI is an injected in-process
 // fake; real herdr/opencode are never spawned; git runs only on a temp repo.
+// The in-process fake `herdr` CLI is shared (`./helpers/fakeHerdr`, #46).
 // ---------------------------------------------------------------------------
-
-/** A workspace the fake herdr server tracks. */
-interface FakeWorkspace {
-  id: string;
-  label: string;
-  tabs: FakeTab[];
-}
-
-/** A tab the fake herdr server tracks (so tests can assert zero tabs at rest). */
-interface FakeTab {
-  id: string;
-  pane: string;
-  cwd: string;
-  label: string;
-  closed: boolean;
-}
-
-/** The parsed herdr CLI document shape the adapter consumes (`.result.*`). */
-type HerdrDoc = Record<string, unknown>;
-
-/**
- * An in-process fake `herdr` CLI (the hermetic seam). It records every
- * invocation, tracks a workspace + tabs, answers `agent get` with a
- * configurable state, and lets a test decide what `agent prompt` does (e.g.
- * "the harness wrote its report and committed").
- */
-class FakeHerdrCli implements HerdrCli {
-  calls: string[][] = [];
-  workspaces = new Map<string, FakeWorkspace>();
-  agentState = 'running';
-  /** Set by the test: invoked on `agent prompt <name> <text>` before settling. */
-  onPrompt: ((prompt: string, cwd: string) => void) | null = null;
-  /** Extra text a `--wait` prompt reports back; drives nothing but gets recorded. */
-  onAnswer = true;
-
-  callsMatching(prefix: string): string[][] {
-    return this.calls.filter((args) => args[0] === prefix);
-  }
-
-  openTabs(): FakeTab[] {
-    const tabs: FakeTab[] = [];
-    for (const ws of this.workspaces.values()) tabs.push(...ws.tabs);
-    return tabs.filter((tab) => !tab.closed);
-  }
-
-  async run(args: readonly string[]): Promise<HerdrDoc> {
-    const argv = [...args];
-    this.calls.push(argv);
-    const value = (key: string): string => {
-      const index = argv.indexOf(`--${key}`);
-      if (index < 0 || argv[index + 1] === undefined) throw new Error(`missing --${key}`);
-      return argv[index + 1]!;
-    };
-    const sub = argv[1];
-    if (argv[0] === 'workspace' && sub === 'list') {
-      return { result: [...this.workspaces.values()].map((ws) => ({ id: ws.id, label: ws.label })) };
-    }
-    if (argv[0] === 'workspace' && sub === 'create') {
-      const label = value('label');
-      const id = `ws_${label}`;
-      if (this.workspaces.has(id)) throw new Error(`workspace already exists: ${label}`);
-      this.workspaces.set(id, { id, label, tabs: [] });
-      return { result: { workspace: id, tab: 't0', root_pane: 'p0' } };
-    }
-    if (argv[0] === 'tab' && sub === 'create') {
-      const wsId = value('workspace');
-      const ws = this.workspaces.get(wsId);
-      if (!ws) throw new Error(`no such workspace: ${wsId}`);
-      const cwd = value('cwd');
-      if (!existsSync(cwd)) throw new Error(`cwd does not exist: ${cwd}`);
-      const tab: FakeTab = {
-        id: `tab_${ws.tabs.length}`,
-        pane: `pane_${ws.tabs.length}`,
-        cwd,
-        label: (argv.indexOf('--label') >= 0 ? argv[argv.indexOf('--label') + 1] : undefined) ?? '',
-        closed: false,
-      };
-      ws.tabs.push(tab);
-      return { result: { tab: tab.id, root_pane: tab.pane } };
-    }
-    if (argv[0] === 'tab' && sub === 'list') {
-      const wsId = value('workspace');
-      const ws = this.workspaces.get(wsId);
-      if (!ws) throw new Error(`no such workspace: ${wsId}`);
-      return {
-        result: ws.tabs.filter((tab) => !tab.closed).map((tab) => ({ id: tab.id, label: tab.label })),
-      };
-    }
-    if (argv[0] === 'agent' && sub === 'start') {
-      return { result: { agent: argv[2] } };
-    }
-    if (argv[0] === 'agent' && (sub === 'prompt' || sub === 'send-keys')) {
-      // The real CLI shape is `agent prompt <name> <text>` — capture the text.
-      const text = argv[3] ?? (argv[2] as string | undefined) ?? '';
-      const tab = this.openTabs().at(-1);
-      if (tab) this.onPrompt?.(text, tab.cwd);
-      return { result: { ok: true } };
-    }
-    if (argv[0] === 'agent' && sub === 'get') {
-      return { result: { state: this.agentState } };
-    }
-    if (argv[0] === 'agent' && sub === 'read') {
-      return { result: { text: 'How should I handle the ambiguous acceptance criterion?' } };
-    }
-    if (argv[0] === 'tab' && sub === 'close') {
-      const tabId = argv[2];
-      for (const ws of this.workspaces.values()) {
-        for (const tab of ws.tabs) if (tab.id === tabId) tab.closed = true;
-      }
-      return { result: {} };
-    }
-    throw new Error(`unexpected herdr invocation: ${argv.join(' ')}`);
-  }
-}
 
 const TEST_ENVELOPE: ExecutionEnvelope = {
   workOrderId: 'wo_44',
@@ -734,15 +636,9 @@ function idleAdapter(): WorkerAdapter {
 }
 
 describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)', () => {
-  beforeEach(() => {
-    workDir = mkdtempSync(join(tmpdir(), 'factory-e111-'));
-    repoPath = initRepo(workDir);
-  });
-
-  afterEach(() => {
-    rmSync(workDir, { recursive: true, force: true });
-  });
-
+  // The outer per-test fixture (workDir/repoPath/TOKEN_ENV) governs here too.
+  // The deleted nested hooks reassigned `workDir`, orphaning the outer temp dir
+  // on every test in this describe (#46).
   function makeAdapter(cli: FakeHerdrCli, models: Record<string, string> = {}): WorkerAdapter {
     const workspace = createHerdrWorkspaceManager(cli, { label: 'factory', repoPath });
     return createHerdrWorker({
@@ -1036,6 +932,33 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
     expect((await adapter.collectArtifacts()).failure ?? '').toContain('not running');
   });
 
+  it('deliverAnswer on a thrown answer turn fails loud ("harness did not resume after the delivered answer") and releases the harness', async () => {
+    const cli = new FakeHerdrCli();
+    cli.agentState = 'blocked'; // a live, blocked harness that never reports
+    const adapter = makeAdapter(cli);
+    await adapter.provision();
+    await adapter.start();
+    await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath });
+    const waiting = await adapter.collectArtifacts();
+    expect(waiting.status).toBe('waiting_input');
+    expect(cli.openTabs()).toHaveLength(1); // the harness is alive while blocked
+
+    // The answer turn's harness channel dies: the prompt throws a named error
+    // and no fresh report arrives. `deliverAnswer` must surface the underlying
+    // cause (never wedge the task, never throw out of the durable interaction
+    // path) and release the stranded harness.
+    cli.promptError = new Error('herdr answer channel died mid-turn');
+    await adapter.deliverAnswer({ interactionId: 'int_1', question: '?', response: 'resume' });
+
+    const settled = await adapter.collectArtifacts();
+    expect(settled.status).toBe('failed');
+    expect(settled.failure ?? '').toContain('harness did not resume after the delivered answer');
+    expect(settled.failure ?? '').toContain('herdr answer channel died mid-turn');
+    // Released: the stranded harness was torn down (zero tabs at rest).
+    expect(cli.openTabs()).toHaveLength(0);
+    expect((await adapter.status()).state).toBe('failed');
+  });
+
   it('treats a transient agent-get probe failure as unknown state and keeps polling to the deadline', async () => {
     const underlying = new FakeHerdrCli();
     underlying.agentState = 'idle'; // turn ended, nothing reported yet
@@ -1244,16 +1167,9 @@ class IdleFakeHerdr implements WorkerAdapter {
 }
 
 describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
-  beforeEach(() => {
-    workDir = mkdtempSync(join(tmpdir(), 'factory-e112-'));
-    repoPath = initRepo(workDir);
-  });
-
-  afterEach(() => {
-    rmSync(workDir, { recursive: true, force: true });
-    delete process.env[TOKEN_ENV];
-  });
-
+  // The outer per-test fixture (workDir/repoPath/TOKEN_ENV) governs here too:
+  // the deleted nested hooks reassigned `workDir`, orphaning the outer temp dir
+  // on every test in this describe (#46).
   function verificationText(verification?: VerificationConfig): string {
     const withKeys: FactoryDesiredConfig = {
       ...DEFAULT_FACTORY_CONFIG,
@@ -1496,12 +1412,17 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       // Zero tabs at rest even on the failed judgment.
       expect(cli.openTabs()).toHaveLength(0);
       // The verdict run is diagnosed, not just parked: the structured event
-      // carries the judge's own "no verdict file" failure.
+      // carries the judge's own "no verdict file" failure AND the structured
+      // per-criterion diagnosis (`FailureRecord.diagnosis`, a non-empty string).
       const failure = deps.events
         .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
         .find((event) => event.type === 'verification.failed');
-      const record = (failure!.payload as { failures: Array<{ evidence: { summary: string } }> }).failures[0]!;
+      const record = (failure!.payload as {
+        failures: Array<{ evidence: { summary: string }; diagnosis: string }>;
+      }).failures[0]!;
       expect(record.evidence.summary).toContain('no verdict file');
+      expect(record.diagnosis.length).toBeGreaterThan(0);
+      expect(record.diagnosis).toContain('semantic judge');
     } finally {
       deps.store.close();
     }
@@ -1528,13 +1449,18 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       expect(deps.store.get<WorkOrder>('work_orders', wo.id)!.state).toBe('REWORK');
       // The blocked pane is closed: zero harnesses at rest.
       expect(cli.openTabs()).toHaveLength(0);
-      // The stranded judgment is diagnosed, not silently parked.
+      // The stranded judgment is diagnosed, not silently parked: the structured
+      // failure carries both the evidence summary and the per-criterion
+      // diagnosis (`FailureRecord.diagnosis`).
       const failure = deps.events
         .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
         .find((event) => event.type === 'verification.failed');
-      expect(
-        (failure!.payload as { failures: Array<{ evidence: { summary: string } }> }).failures[0]!.evidence.summary,
-      ).toContain('semantic judge');
+      const record = (failure!.payload as {
+        failures: Array<{ evidence: { summary: string }; diagnosis: string }>;
+      }).failures[0]!;
+      expect(record.evidence.summary).toContain('semantic judge');
+      expect(record.diagnosis.length).toBeGreaterThan(0);
+      expect(record.diagnosis).toContain('semantic judge');
     } finally {
       deps.store.close();
     }
@@ -1569,8 +1495,12 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       const failure = deps.events
         .readEvents({ aggregateType: 'work_order', aggregateId: wo.id })
         .find((event) => event.type === 'verification.failed');
-      const record = (failure!.payload as { failures: Array<{ evidence: { summary: string } }> }).failures[0]!;
+      const record = (failure!.payload as {
+        failures: Array<{ evidence: { summary: string }; diagnosis: string }>;
+      }).failures[0]!;
       expect(record.evidence.summary).toContain('judge harness crashed mid-verdict');
+      expect(record.diagnosis.length).toBeGreaterThan(0);
+      expect(record.diagnosis).toContain('semantic judge');
     } finally {
       deps.store.close();
     }

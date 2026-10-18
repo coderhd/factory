@@ -546,11 +546,21 @@ export function parseFactoryConfig(text: string): ConfigParse {
         );
       } else if (!isPlainObject(github.token)) {
         issue('github.token', 'token must be a mapping with an env reference (e.g. env: GITHUB_TOKEN)');
-      } else if (
-        !isNonEmptyString(github.token.env) ||
-        !/^[A-Za-z_][A-Za-z0-9_]*$/.test(github.token.env)
-      ) {
-        issue('github.token.env', 'token.env must name an environment variable (never the token itself)');
+      } else {
+        // E11.6 (#46): only `env` is a github.token key. A stray key (e.g. a raw
+        // `value:` secret dressed as a mapping) must fail loudly rather than be
+        // silently ignored — the token may only ever be an { env: NAME } ref.
+        for (const key of Object.keys(github.token)) {
+          if (key !== 'env') {
+            issue(`github.token.${key}`, `"${key}" is not a github.token key (only "env" is allowed)`);
+          }
+        }
+        if (
+          !isNonEmptyString(github.token.env) ||
+          !/^[A-Za-z_][A-Za-z0-9_]*$/.test(github.token.env)
+        ) {
+          issue('github.token.env', 'token.env must name an environment variable (never the token itself)');
+        }
       }
       if (
         github.apiBaseUrl !== undefined &&
