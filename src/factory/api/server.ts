@@ -144,6 +144,9 @@ const STATUS_BY_CODE: Record<string, number> = {
   GITHUB_UNAVAILABLE: 502,
   // E12 (#48) the natural-language orchestrator is not composed on this server.
   ORCHESTRATOR_DISABLED: 503,
+  // E12 (#48) the orchestrator request body is malformed (no usable message
+  // and no valid confirmation) — the caller's error, not the model's.
+  INVALID_ORCHESTRATOR_REQUEST: 400,
 };
 
 function json(body: unknown, status = 200): Response {
@@ -173,6 +176,35 @@ async function readJson<T>(request: Request): Promise<T | null> {
 function stringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   return value.filter((item): item is string => typeof item === 'string');
+}
+
+/**
+ * E12 (#48): validate the orchestrator request body *before* delegating. The
+ * first turn is the operator's `message`; a confirmation re-issues with the
+ * pending action and may legitimately carry an empty message. A body that
+ * satisfies neither shape is the caller's error, so it is rejected here as a
+ * 400 rather than reaching `handle` and surfacing as a cryptic
+ * `MODEL_UNAVAILABLE` blamed on the inference endpoint.
+ */
+function isOrchestratorRequest(body: unknown): body is OrchestratorRequest {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return false;
+  const record = body as Record<string, unknown>;
+  const message = record['message'];
+  if (typeof message !== 'string') return false;
+
+  const confirm = record['confirm'];
+  if (confirm === undefined) {
+    // No confirmation: a non-empty message is required to have anything to ask.
+    return message.length > 0;
+  }
+  // A present `confirm` must be well-formed, even when it accompanies a message.
+  if (typeof confirm !== 'object' || confirm === null || Array.isArray(confirm)) return false;
+  const { tool, args } = confirm as { tool?: unknown; args?: unknown };
+  if (typeof tool !== 'string' || tool.length === 0) return false;
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return false;
+  // A valid confirmation authorizes exactly that tool, so an empty message is
+  // acceptable on this path.
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -459,8 +491,17 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
       if (!deps.orchestrator) {
         return apiError('ORCHESTRATOR_DISABLED', 'orchestrator is not configured', 503);
       }
-      const body = await readJson<OrchestratorRequest>(request);
-      if (!body) return apiError('INVALID_JSON', 'request body must be JSON', 400);
+      const body = await readJson<unknown>(request);
+      if (body === null) return apiError('INVALID_JSON', 'request body must be JSON', 400);
+      // Shape validation (Fix #2): a malformed body is the caller's error; never
+      // let it reach `handle` and masquerade as an upstream model failure.
+      if (!isOrchestratorRequest(body)) {
+        return apiError(
+          'INVALID_ORCHESTRATOR_REQUEST',
+          'request body requires a non-empty "message" string, or a "confirm" of { tool, args }',
+          400,
+        );
+      }
       return json(await deps.orchestrator.handle(body));
     }
 

@@ -24,10 +24,13 @@ import type { StateStore } from '../state/store';
  * than duplicating it. The poller's dedupe is the same identity read back from
  * the store, so an already-imported ticket is skipped before any GitHub I/O.
  *
- * Error isolation: a listing or import failure is caught, reported through
- * `onError`, and never thrown out of `tick()`; the poller stays usable for the
- * next interval. The GitHub token is never logged (transport errors carry a
- * method, path and status only).
+ * Error isolation: a listing failure is caught, and a per-issue failure (a
+ * deleted/404 issue, or one the server rejects) is caught around that issue
+ * alone — one poisoned ticket never aborts the rest of the tick. Both are
+ * reported through `onError` and never thrown out of `tick()`; the poller stays
+ * usable for the next interval. An issue whose import threw is neither imported
+ * nor skipped (the honest count). The GitHub token is never logged (transport
+ * errors carry a method, path and status only).
  */
 
 export interface ReadyTicketPoller {
@@ -93,23 +96,34 @@ export function createReadyTicketPoller(options: ReadyTicketPollerOptions): Read
     try {
       const issues = await options.adapter.listIssuesByLabel(options.label);
       for (const issue of issues) {
-        if (alreadyImported(issue)) {
-          skipped += 1;
+        // Per-issue isolation: one poisoned ticket (a deleted/404 issue, or one
+        // the server rejects) is reported and skipped over — it must not abort
+        // every later ready ticket in this tick, nor re-abort every future tick.
+        try {
+          if (alreadyImported(issue)) {
+            skipped += 1;
+            continue;
+          }
+          // The exact import+claim path the manual route uses. `importIssue` is
+          // idempotent on the `source:github/<repo>#<num>` marker, so a race (a
+          // ticket imported between the check above and here) reconciles instead
+          // of duplicating — it just reports as skipped, not imported.
+          const result = await options.adapter.importIssue({
+            repository: issue.repository,
+            number: issue.number,
+          });
+          if (result.created) imported += 1;
+          else skipped += 1;
+        } catch (error) {
+          // An issue whose import threw is neither imported nor skipped — the
+          // honest count — and the loop moves on to the remaining tickets.
+          onError(error);
           continue;
         }
-        // The exact import+claim path the manual route uses. `importIssue` is
-        // idempotent on the `source:github/<repo>#<num>` marker, so a race (a
-        // ticket imported between the check above and here) reconciles instead
-        // of duplicating — it just reports as skipped, not imported.
-        const result = await options.adapter.importIssue({
-          repository: issue.repository,
-          number: issue.number,
-        });
-        if (result.created) imported += 1;
-        else skipped += 1;
       }
     } catch (error) {
-      // Nothing escapes a tick: report the honest partial counts and stay usable.
+      // A listing failure: nothing escapes a tick; report the honest partial
+      // counts and stay usable.
       onError(error);
     }
     return { imported, skipped };

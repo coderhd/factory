@@ -1039,6 +1039,57 @@ describe('E12 orchestrator: POST /api/orchestrator/message (#48)', () => {
     expect(stub.requests).toEqual([{ message: 'hi' }]);
   });
 
+  it('rejects a body with no valid message or confirm with 400, never reaching the orchestrator', async () => {
+    const stub = stubOrchestrator(OK_RESULT);
+    const handler = orchestratorHandler({ orchestrator: stub.orchestrator });
+
+    // A missing/non-string message is the caller's error, not an upstream one;
+    // an empty message is only meaningful when it carries a valid confirmation.
+    // A present-but-malformed `confirm` is rejected too, even with a message.
+    const invalidBodies: unknown[] = [
+      {},
+      { message: 42 },
+      { message: '' },
+      { message: 'hi', confirm: 'pause' },
+      { message: '', confirm: {} },
+      { message: '', confirm: { tool: 'pause' } },
+      { message: '', confirm: { tool: '', args: {} } },
+      { message: 'hi', confirm: { tool: 'pause', args: 'nope' } },
+    ];
+    for (const body of invalidBodies) {
+      const response = await post(handler, '/orchestrator/message', body);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({
+        error: { code: 'INVALID_ORCHESTRATOR_REQUEST' },
+      });
+    }
+    // Fail closed: no malformed body reached `handle`, so no cryptic upstream
+    // MODEL_UNAVAILABLE can be blamed on the caller's body.
+    expect(stub.requests).toHaveLength(0);
+  });
+
+  it('accepts a confirm-only request with an empty message, and a plain message', async () => {
+    const stub = stubOrchestrator(OK_RESULT);
+    const handler = orchestratorHandler({ orchestrator: stub.orchestrator });
+
+    const confirmOnly = await post(handler, '/orchestrator/message', {
+      message: '',
+      confirm: { tool: 'pause', args: { actor: 'me' } },
+    });
+    expect(confirmOnly.status).toBe(200);
+    expect(await confirmOnly.json()).toEqual(OK_RESULT);
+
+    const plain = await post(handler, '/orchestrator/message', { message: 'hi' });
+    expect(plain.status).toBe(200);
+    expect(await plain.json()).toEqual(OK_RESULT);
+
+    // The stub's recorded requests prove only valid bodies reached `handle`.
+    expect(stub.requests).toEqual([
+      { message: '', confirm: { tool: 'pause', args: { actor: 'me' } } },
+      { message: 'hi' },
+    ]);
+  });
+
   it('requires a bearer token when auth is configured, and keeps GET public', async () => {
     const stub = stubOrchestrator(OK_RESULT);
     const handler = orchestratorHandler({
@@ -1368,6 +1419,42 @@ describe('E12 orchestrator: GitHub ready-ticket poller (#48)', () => {
 
       transport.issues.set('acme/widgets#7', transport.ready[0]!);
       expect(await poller.tick()).toEqual({ imported: 1, skipped: 0 });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('one poisoned ticket does not block the rest of the tick, and recovers later', async () => {
+    const store = freshStore();
+    try {
+      const transport = new FakeReadyTransport();
+      // Two ready issues: the first (7) is not registered, so its import throws
+      // mid-tick; the second (8) is healthy and must still be imported.
+      transport.ready = [readyTicket(7), readyTicket(8)];
+      transport.issues.set('acme/widgets#8', transport.ready[1]!);
+      const errors: unknown[] = [];
+      const poller = createReadyTicketPoller({
+        adapter: readyAdapter(transport, store),
+        store,
+        label: LABEL,
+        intervalMs: 60_000,
+        onError: (error) => errors.push(error),
+      });
+
+      // The failure is reported, the healthy ticket is still imported, and the
+      // poisoned one is neither imported nor skipped (honest counts).
+      expect(await poller.tick()).toEqual({ imported: 1, skipped: 0 });
+      expect(errors).toHaveLength(1);
+      expect((errors[0] as Error).message).toContain('no such issue');
+      expect(store.list<WorkOrder>('work_orders').map((wo) => wo.constraints[0])).toEqual([
+        'source:github/acme/widgets#8',
+      ]);
+
+      // The poisoned ticket was not permanently fatal: once GitHub serves it,
+      // the next tick imports it and skips the already-claimed healthy one.
+      transport.issues.set('acme/widgets#7', transport.ready[0]!);
+      expect(await poller.tick()).toEqual({ imported: 1, skipped: 1 });
+      expect(errors).toHaveLength(1);
     } finally {
       store.close();
     }
