@@ -7,7 +7,47 @@
     <link rel="stylesheet" href="/ui/styles.css" />
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <header class="topbar">
+        <h1>Factory</h1>
+        <button id="refresh" type="button">Refresh</button>
+      </header>
+
+      <!-- The read-first dashboard. Each panel owns its own container and its
+           own fetch, so one failing surface renders an inline error in that
+           panel and never blanks the others. -->
+      <main id="dashboard">
+        <section class="panel" id="work-orders" aria-labelledby="work-orders-heading">
+          <h2 id="work-orders-heading">Work Orders</h2>
+          <div class="panel-body" data-panel-body></div>
+        </section>
+
+        <section class="panel" id="observatory" aria-labelledby="observatory-heading">
+          <h2 id="observatory-heading">Observatory</h2>
+          <div class="panel-body" data-panel-body></div>
+        </section>
+
+        <section class="panel" id="approvals" aria-labelledby="approvals-heading">
+          <h2 id="approvals-heading">Approvals</h2>
+          <div class="panel-body" data-panel-body></div>
+        </section>
+
+        <section class="panel" id="interactions" aria-labelledby="interactions-heading">
+          <h2 id="interactions-heading">Interactions</h2>
+          <div class="panel-body" data-panel-body></div>
+        </section>
+
+        <section class="panel" id="scheduler" aria-labelledby="scheduler-heading">
+          <h2 id="scheduler-heading">Scheduler</h2>
+          <div class="panel-body" data-panel-body></div>
+        </section>
+
+        <section class="panel" id="controls" aria-labelledby="controls-heading">
+          <h2 id="controls-heading">Factory controls</h2>
+          <div class="panel-body" data-panel-body></div>
+        </section>
+      </main>
+    </div>
     <script type="module" src="/ui/app.js"></script>
   </body>
 </html>
