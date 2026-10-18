@@ -68,6 +68,38 @@ export interface GitHubDesiredConfig {
   baseBranch?: string;
 }
 
+/**
+ * E12 (#48) the natural-language orchestrator's identity. The optional section
+ * names the inference endpoint the orchestrator plans against, the wire family
+ * (`openai` / `anthropic` chat-completions shape), the concrete model, and the
+ * **name** of the environment variable holding the API key — never the key
+ * itself, so no secret is ever persisted or logged (spec §20, §28). An optional
+ * `poller` watches a Work Order label at a fixed interval.
+ */
+export type OrchestratorApiFamily = 'openai' | 'anthropic';
+
+export interface OrchestratorPollerDesired {
+  /** The Work Order label the poller watches for ready work. */
+  label: string;
+  /** How often the poller checks, in milliseconds (`>= 1`). */
+  intervalMs: number;
+}
+
+export interface OrchestratorDesired {
+  /** The inference API base URL (must be `http(s)://`). */
+  baseUrl: string;
+  /** The request/response wire family the endpoint speaks. */
+  apiFamily: OrchestratorApiFamily;
+  /** The concrete model id the orchestrator plans with. */
+  model: string;
+  /** The *name* of the environment variable holding the API key (never the key). */
+  apiKeyEnv: string;
+  /** Per-message token budget; defaults to 2048 at resolve time. */
+  maxTokensPerMessage?: number;
+  /** Optional label poller; absent → the orchestrator is only invoked explicitly. */
+  poller?: OrchestratorPollerDesired;
+}
+
 export interface FactoryDesiredConfig {
   apiVersion: string;
   factoryVersion: string;
@@ -115,6 +147,8 @@ export interface FactoryDesiredConfig {
   verification?: VerificationDesired;
   /** Optional outbound GitHub config (E11.3, #43); absent → no adapter, routes 404. */
   github?: GitHubDesiredConfig;
+  /** Optional natural-language orchestrator identity (E12, #48); absent → nothing is wired. */
+  orchestrator?: OrchestratorDesired;
   /**
    * E11.4 (#41): the policy source of truth (ADR 14 §11 shape), validated into
    * E7's `PolicyDocument`. Present, it is the deployment's override of the
@@ -166,6 +200,12 @@ export interface FactoryRuntimeConfig {
    * only in the adapter module).
    */
   github?: { repository: string; tokenEnv: string; apiBaseUrl?: string; baseBranch: string };
+  /**
+   * E12 (#48) the resolved orchestrator identity, carried through resolution.
+   * Only the API key's env **name** is ever carried — never its value — so a
+   * persisted runtime file or a log line can never expose the secret.
+   */
+  orchestrator?: OrchestratorDesired;
   /** E11.4 (#41): the loaded policy document; absent when no `policy:` source is configured. */
   policy?: PolicyDocument;
   image: { repository: string; tag: string; ref: string };
@@ -574,6 +614,81 @@ export function parseFactoryConfig(text: string): ConfigParse {
     }
   }
 
+  // E12 (#48): the optional `orchestrator:` section — the natural-language
+  // orchestrator's desired identity. Absent is valid (nothing is wired); present,
+  // every field must be well-formed. The API key is a *reference*: `apiKeyEnv`
+  // names an environment variable and never carries the value, so no secret is
+  // persisted or logged.
+  if (root.orchestrator !== undefined) {
+    if (!isPlainObject(root.orchestrator)) {
+      issue('orchestrator', 'orchestrator must be a mapping');
+    } else {
+      const orchestrator = root.orchestrator;
+      // Unknown keys are refused: a typo must fail loudly, and only the known
+      // set ever reaches orchestrator composition.
+      for (const key of Object.keys(orchestrator)) {
+        if (
+          !['baseUrl', 'apiFamily', 'model', 'apiKeyEnv', 'maxTokensPerMessage', 'poller'].includes(
+            key,
+          )
+        ) {
+          issue(
+            `orchestrator.${key}`,
+            `"${key}" is not an orchestrator config key (use baseUrl/apiFamily/model/apiKeyEnv/maxTokensPerMessage/poller)`,
+          );
+        }
+      }
+      if (!isNonEmptyString(orchestrator.baseUrl) || !/^https?:\/\//.test(orchestrator.baseUrl)) {
+        issue('orchestrator.baseUrl', 'baseUrl must be an http(s) URL');
+      }
+      if (orchestrator.apiFamily !== 'openai' && orchestrator.apiFamily !== 'anthropic') {
+        issue('orchestrator.apiFamily', 'apiFamily must be "openai" or "anthropic"');
+      }
+      if (!isNonEmptyString(orchestrator.model)) {
+        issue('orchestrator.model', 'model is required');
+      }
+      if (
+        !isNonEmptyString(orchestrator.apiKeyEnv) ||
+        !/^[A-Za-z_][A-Za-z0-9_]*$/.test(orchestrator.apiKeyEnv)
+      ) {
+        issue(
+          'orchestrator.apiKeyEnv',
+          'apiKeyEnv must name an environment variable (never the key itself)',
+        );
+      }
+      if (
+        orchestrator.maxTokensPerMessage !== undefined &&
+        !isPositiveInteger(orchestrator.maxTokensPerMessage)
+      ) {
+        issue(
+          'orchestrator.maxTokensPerMessage',
+          'maxTokensPerMessage must be an integer >= 1 when present',
+        );
+      }
+      if (orchestrator.poller !== undefined) {
+        if (!isPlainObject(orchestrator.poller)) {
+          issue('orchestrator.poller', 'orchestrator.poller must be a mapping');
+        } else {
+          const poller = orchestrator.poller;
+          for (const key of Object.keys(poller)) {
+            if (key !== 'label' && key !== 'intervalMs') {
+              issue(
+                `orchestrator.poller.${key}`,
+                `"${key}" is not an orchestrator.poller key (use label/intervalMs)`,
+              );
+            }
+          }
+          if (!isNonEmptyString(poller.label)) {
+            issue('orchestrator.poller.label', 'poller.label is required');
+          }
+          if (!isPositiveInteger(poller.intervalMs)) {
+            issue('orchestrator.poller.intervalMs', 'poller.intervalMs must be an integer >= 1');
+          }
+        }
+      }
+    }
+  }
+
   if (!isPlainObject(root.image)) {
     issue('image', 'image is required');
   } else {
@@ -718,6 +833,21 @@ export function resolveFactoryConfig(
         }
       : {}),
     ...(policy ? { policy } : {}),
+    ...(config.orchestrator
+      ? {
+          orchestrator: {
+            baseUrl: config.orchestrator.baseUrl,
+            apiFamily: config.orchestrator.apiFamily,
+            model: config.orchestrator.model,
+            // Only the env var *name* is carried; the value is read from the
+            // environment at run time and never logged or persisted (#48).
+            apiKeyEnv: config.orchestrator.apiKeyEnv,
+            // Defaulted here so every consumer sees a concrete token budget.
+            maxTokensPerMessage: config.orchestrator.maxTokensPerMessage ?? 2048,
+            ...(config.orchestrator.poller ? { poller: { ...config.orchestrator.poller } } : {}),
+          },
+        }
+      : {}),
     image: {
       repository: config.image.repository,
       tag: config.image.tag,
@@ -883,6 +1013,28 @@ export function serializeFactoryConfig(config: FactoryDesiredConfig): string {
             `      kind: ${JSON.stringify(check.kind)}`,
             `      command: ${JSON.stringify(check.command)}`,
           ]),
+        ]
+      : []),
+    // E12 (#48): the orchestrator identity. Only the API key's env *name* is
+    // written — never the key. Strings are JSON-quoted (valid YAML scalars) so
+    // a URL or label containing `:`/`#` cannot break the document.
+    ...(config.orchestrator
+      ? [
+          'orchestrator:',
+          `  baseUrl: ${JSON.stringify(config.orchestrator.baseUrl)}`,
+          `  apiFamily: ${JSON.stringify(config.orchestrator.apiFamily)}`,
+          `  model: ${JSON.stringify(config.orchestrator.model)}`,
+          `  apiKeyEnv: ${JSON.stringify(config.orchestrator.apiKeyEnv)}`,
+          ...(config.orchestrator.maxTokensPerMessage !== undefined
+            ? [`  maxTokensPerMessage: ${config.orchestrator.maxTokensPerMessage}`]
+            : []),
+          ...(config.orchestrator.poller
+            ? [
+                '  poller:',
+                `    label: ${JSON.stringify(config.orchestrator.poller.label)}`,
+                `    intervalMs: ${config.orchestrator.poller.intervalMs}`,
+              ]
+            : []),
         ]
       : []),
     'image:',
