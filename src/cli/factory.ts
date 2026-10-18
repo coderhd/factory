@@ -22,6 +22,9 @@ import {
   type GitHubAdapter,
   type GitHubTransport,
 } from '../factory/github/adapter';
+import { createReadyTicketPoller } from '../factory/github/poller';
+import { createHttpModelClient } from '../factory/inference/modelClient';
+import { createOrchestrator, type Orchestrator } from '../factory/orchestrator/orchestrator';
 import { openEventLog, type EventLog } from '../factory/events/log';
 import { createEvidenceReadPort } from '../factory/observatory/observatory';
 import { check, checkDetailed, repoWriteGate, type PolicyDocument } from '../factory/policy/policy';
@@ -321,6 +324,20 @@ export interface ServerDepsOptions {
    * when `spawn` is supplied.
    */
   herdrCli?: HerdrCli;
+  /**
+   * E12 (#48) hermetic orchestrator seam. When supplied, `buildServerDeps` uses
+   * it verbatim instead of composing one from the resolved `orchestrator:`
+   * config — so tests need no API key and no environment variable. Absent, a
+   * configured `orchestrator:` section is composed from the environment; absent
+   * both, no orchestrator is wired and the route 503s (fail closed).
+   */
+  orchestrator?: Orchestrator;
+  /**
+   * E12 (#48) injectable inference transport for the *composed* orchestrator,
+   * so a test can exercise the real `buildServerDeps` composition without the
+   * network. Ignored when `orchestrator` is supplied or the section is absent.
+   */
+  fetch?: typeof fetch;
 }
 
 /**
@@ -484,6 +501,9 @@ function resolveGitHubInputs(
         createGitHubRestTransport({
           token,
           apiBaseUrl: runtime.github.apiBaseUrl,
+          // E12 (#48): the transport's ready-ticket listing is bound to the
+          // configured repository (the same bound `github.repository` enforces).
+          repository: runtime.github.repository,
         }),
       apiBaseUrl: effectiveUrl,
       factoryBaseUrl: effectiveUrl,
@@ -508,6 +528,55 @@ function isWildcardHostname(hostname: string): boolean {
 function bindLinkHostname(hostname: string, configuredHostname: string): string {
   if (hostname !== '0.0.0.0' && hostname !== '::') return hostname;
   return isWildcardHostname(configuredHostname) ? '127.0.0.1' : configuredHostname;
+}
+
+/**
+ * Compose the E12 (#48) natural-language orchestrator (spec §22). An explicitly
+ * injected `options.orchestrator` (tests) wins; otherwise, when the resolved
+ * config carries an `orchestrator:` section, build the real stack — a generic
+ * HTTP model client over the configured inference endpoint, wrapped by the
+ * confirmation-gated tool loop (Task 3).
+ *
+ * Its action surface is a `FactoryClient` pointed at this server's own API (the
+ * sole mutation authority), resolved from the *effective* bind exactly as the
+ * E11.3 GitHub adapter's `apiBaseUrl` is, so a `--hostname`/`--port` override is
+ * honoured. The API key is read from the environment variable the config
+ * *names* and passed straight into the model client: never logged, never stored
+ * on `deps`, never serialized. A hung upstream is bounded by a default timeout
+ * (carry-forward from Task 2 — `createHttpModelClient` has no default).
+ */
+function resolveOrchestrator(
+  runtime: FactoryRuntimeConfig,
+  options: ServerDepsOptions,
+): Orchestrator | undefined {
+  if (options.orchestrator) return options.orchestrator;
+  const config = runtime.orchestrator;
+  if (!config) return undefined;
+  const hostname = options.serverBind?.hostname ?? runtime.server.hostname;
+  const port = options.serverBind?.port ?? runtime.server.port;
+  const selfUrl = `http://${bindLinkHostname(hostname, runtime.server.hostname)}:${port}`;
+  const client = createFactoryClient({
+    baseUrl: selfUrl,
+    ...(runtime.server.auth ? { token: runtime.server.auth.token } : {}),
+  });
+  const model = createHttpModelClient({
+    baseUrl: config.baseUrl,
+    apiFamily: config.apiFamily,
+    model: config.model,
+    // Read from the environment only — never logged or stored elsewhere.
+    apiKey: process.env[config.apiKeyEnv],
+    apiKeyEnvName: config.apiKeyEnv,
+    timeoutMs: 60_000,
+    ...(options.fetch ? { fetch: options.fetch } : {}),
+  });
+  return createOrchestrator({
+    client,
+    model,
+    modelName: config.model,
+    ...(config.maxTokensPerMessage === undefined
+      ? {}
+      : { maxTokensPerMessage: config.maxTokensPerMessage }),
+  });
 }
 
 export function buildServerDeps(
@@ -652,12 +721,36 @@ export function buildServerDeps(
       },
     },
   );
+  // E12 (#48): the natural-language orchestrator, when configured (or injected
+  // as a test seam). Composed last: it depends on no other resource here, and
+  // its API key stays local to the model client it builds.
+  const orchestrator = resolveOrchestrator(runtime, options);
+  // E12 (#48): the GitHub "ready ticket" poller. Constructed when the resolved
+  // `orchestrator:` config carries a `poller:` block AND a GitHub adapter exists
+  // to list/import through (without an adapter there is nothing to poll). It is
+  // built, not started: `cmdServe` owns the start/stop lifecycle alongside the
+  // scheduler, so no timer leaks from a non-serving process (tests).
+  const pollerConfig = runtime.orchestrator?.poller;
+  const poller =
+    pollerConfig && github
+      ? createReadyTicketPoller({
+          adapter: github,
+          store,
+          label: pollerConfig.label,
+          intervalMs: pollerConfig.intervalMs,
+        })
+      : undefined;
   return {
     store,
     events,
     evidence,
     scheduler,
     ...(github ? { github } : {}),
+    // E12 (#48): the composed orchestrator (or the injected test seam). The API
+    // key lives only inside the model client it closed over — never here.
+    ...(orchestrator ? { orchestrator } : {}),
+    // E12 (#48): the ready-ticket poller (or nothing). Started by `cmdServe`.
+    ...(poller ? { poller } : {}),
     // E10.4 (#40): carry the resolved bearer credential + principal into the
     // API surface so authenticated deployments gate mutating routes.
     ...(runtime.server.auth ? { auth: { ...runtime.server.auth } } : {}),
@@ -817,6 +910,9 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   const handle = startFactoryServer(deps, { port, hostname });
   // Actually run the E3 scheduler loop for the life of the server (spec §7.2).
   deps.scheduler?.start();
+  // E12 (#48): the ready-ticket poller runs for the life of the server too,
+  // when configured — the auto-claim the operators expect.
+  deps.poller?.start();
   writeRuntimeFile(dir, {
     pid: process.pid,
     url: handle.url,
@@ -828,6 +924,7 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
 
   const shutdown = (): void => {
     deps.scheduler?.stop();
+    deps.poller?.stop();
     clearRuntimeFile(dir);
     handle.stop();
     process.exit(0);

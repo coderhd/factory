@@ -1,6 +1,7 @@
 import type { WorkOrder, WorkOrderIntent, WorkOrderTransition } from '../domain/workOrder';
 import type { DAGProposalPayload } from '../planning/dag';
 import type { ApprovalRecord } from '../policy/policy';
+import type { OrchestratorRequest, OrchestratorResult } from '../orchestrator/orchestrator';
 import type {
   AnswerResultDto,
   ApprovalAnswerRequest,
@@ -81,6 +82,13 @@ export interface FactoryClient {
    * adapter's live `pr.create` policy gate.
    */
   githubOpenPullRequest(request: GitHubOpenPrRequest): Promise<GitHubPullRequestDto>;
+  /**
+   * E12 (#48): send one natural-language message to the Factory orchestrator.
+   * The server composes the bounded, confirmation-gated tool loop; the client
+   * only speaks the contract. `status: 'awaiting_confirmation'` means the
+   * operator must re-issue the request with `confirm` to execute the named tool.
+   */
+  orchestratorMessage(request: OrchestratorRequest): Promise<OrchestratorResult>;
 }
 
 export function createFactoryClient(options: FactoryClientOptions): FactoryClient {
@@ -190,5 +198,7 @@ export function createFactoryClient(options: FactoryClientOptions): FactoryClien
       request<GitHubImportResultDto>('POST', '/github/import', input),
     githubOpenPullRequest: (input) =>
       request<GitHubPullRequestDto>('POST', '/github/pull-requests', input),
+    orchestratorMessage: (input) =>
+      request<OrchestratorResult>('POST', '/orchestrator/message', input),
   };
 }

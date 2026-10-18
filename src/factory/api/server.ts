@@ -23,6 +23,8 @@ import {
   resumeFactory,
   type ApprovalRecord,
 } from '../policy/policy';
+import type { Orchestrator, OrchestratorRequest } from '../orchestrator/orchestrator';
+import type { ReadyTicketPoller } from '../github/poller';
 import type { Scheduler } from '../scheduler/scheduler';
 import type { StateStore } from '../state/store';
 import {
@@ -84,6 +86,22 @@ export interface FactoryServerDeps {
    * boundary is the loopback bind — documented in compose.yaml/§20.
    */
   auth?: ServerAuth;
+  /**
+   * E12 (#48) the natural-language orchestrator, composed by `buildServerDeps`
+   * from the resolved `orchestrator:` config. Its tool surface is a client
+   * pointed at this server's own API, so the server stays the sole mutation
+   * authority. Absent, `POST /api/orchestrator/message` 503s (fail closed) —
+   * the orchestrator is never invoked some other way.
+   */
+  orchestrator?: Orchestrator;
+  /**
+   * E12 (#48) the GitHub "ready ticket" poller, composed by `buildServerDeps`
+   * when the resolved `orchestrator.poller` is configured and a GitHub adapter
+   * exists to list/import through. `cmdServe` owns its start/stop lifecycle
+   * (like `scheduler`); the API surface does not touch it. Absent, nothing is
+   * polled — imports stay manual (`factory github import`).
+   */
+  poller?: ReadyTicketPoller;
   now?: () => string;
 }
 
@@ -124,6 +142,11 @@ const STATUS_BY_CODE: Record<string, number> = {
   INVALID_GITHUB_REQUEST: 400,
   GITHUB_POLICY_BLOCKED: 403,
   GITHUB_UNAVAILABLE: 502,
+  // E12 (#48) the natural-language orchestrator is not composed on this server.
+  ORCHESTRATOR_DISABLED: 503,
+  // E12 (#48) the orchestrator request body is malformed (no usable message
+  // and no valid confirmation) — the caller's error, not the model's.
+  INVALID_ORCHESTRATOR_REQUEST: 400,
 };
 
 function json(body: unknown, status = 200): Response {
@@ -153,6 +176,35 @@ async function readJson<T>(request: Request): Promise<T | null> {
 function stringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   return value.filter((item): item is string => typeof item === 'string');
+}
+
+/**
+ * E12 (#48): validate the orchestrator request body *before* delegating. The
+ * first turn is the operator's `message`; a confirmation re-issues with the
+ * pending action and may legitimately carry an empty message. A body that
+ * satisfies neither shape is the caller's error, so it is rejected here as a
+ * 400 rather than reaching `handle` and surfacing as a cryptic
+ * `MODEL_UNAVAILABLE` blamed on the inference endpoint.
+ */
+function isOrchestratorRequest(body: unknown): body is OrchestratorRequest {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return false;
+  const record = body as Record<string, unknown>;
+  const message = record['message'];
+  if (typeof message !== 'string') return false;
+
+  const confirm = record['confirm'];
+  if (confirm === undefined) {
+    // No confirmation: a non-empty message is required to have anything to ask.
+    return message.length > 0;
+  }
+  // A present `confirm` must be well-formed, even when it accompanies a message.
+  if (typeof confirm !== 'object' || confirm === null || Array.isArray(confirm)) return false;
+  const { tool, args } = confirm as { tool?: unknown; args?: unknown };
+  if (typeof tool !== 'string' || tool.length === 0) return false;
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return false;
+  // A valid confirmation authorizes exactly that tool, so an empty message is
+  // acceptable on this path.
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +473,36 @@ export function createApiHandler(deps: FactoryServerDeps): ApiHandler {
         const dto: FactoryControlsDto = { paused: state.paused, emergencyStopped: state.emergencyStopped };
         return json(dto);
       }
+    }
+
+    // E12 (#48) natural-language orchestrator. A thin, mutating (POST) entry
+    // point onto the composed `Orchestrator`; it is gated by the auth block
+    // above like every other non-GET route. The whole bounded tool loop lives
+    // behind `deps.orchestrator`, whose client points at this same API — so
+    // every action the orchestrator proposes still passes through the Factory's
+    // gates and the server remains the sole mutation authority. Absent a
+    // composed orchestrator, the route 503s (fail closed).
+    if (
+      resource === 'orchestrator' &&
+      method === 'POST' &&
+      id === 'message' &&
+      action === undefined
+    ) {
+      if (!deps.orchestrator) {
+        return apiError('ORCHESTRATOR_DISABLED', 'orchestrator is not configured', 503);
+      }
+      const body = await readJson<unknown>(request);
+      if (body === null) return apiError('INVALID_JSON', 'request body must be JSON', 400);
+      // Shape validation (Fix #2): a malformed body is the caller's error; never
+      // let it reach `handle` and masquerade as an upstream model failure.
+      if (!isOrchestratorRequest(body)) {
+        return apiError(
+          'INVALID_ORCHESTRATOR_REQUEST',
+          'request body requires a non-empty "message" string, or a "confirm" of { tool, args }',
+          400,
+        );
+      }
+      return json(await deps.orchestrator.handle(body));
     }
 
     if (resource === 'observatory') {
