@@ -1316,6 +1316,8 @@ class RecordingHerdrCli {
   calls: string[][] = [];
   tabs = new Map<string, { id: string; pane: string; cwd: string; closed: boolean }>();
   agentState = 'idle';
+  /** Test hook: drop `root_pane` from a `tab create` payload (malformed payload). */
+  omitRootPane = false;
   /** Test hook: runs when the adapter prompts the harness. */
   onPrompt: ((prompt: string, cwd: string) => void) | null = null;
 
@@ -1337,7 +1339,7 @@ class RecordingHerdrCli {
       expect(value('workspace')).toBe(this.workspaceId);
       const tab = { id: `tab_${this.tabs.size}`, pane: `pane_${this.tabs.size}`, cwd: value('cwd'), closed: false };
       this.tabs.set(tab.id, tab);
-      return { result: { tab: tab.id, root_pane: tab.pane } };
+      return { result: this.omitRootPane ? { tab: tab.id } : { tab: tab.id, root_pane: tab.pane } };
     }
     if (argv[0] === 'agent' && sub === 'start') {
       expect(argv[3]).toBe('--kind');
@@ -1496,6 +1498,21 @@ describe('E3 Herdr adapter lifecycle', () => {
       expect(result.observations).toEqual(['one observation']);
       expect((await adapter.status()).state).toBe('completed');
       expect(cli.openTabs()).toBe(0);
+    } finally {
+      await adapter.destroy();
+    }
+  });
+
+  it('tears down the tab when the create payload is missing root_pane (no leaked pane)', async () => {
+    const { adapter, cli } = seedAdapter();
+    cli.omitRootPane = true;
+    try {
+      await adapter.provision();
+      await adapter.start();
+      await adapter.execute(envelopeFor());
+      const reported = await adapter.collectArtifacts();
+      expect(reported.failure).toContain('harness dispatch failed');
+      expect(cli.openTabs()).toBe(0); // the created tab was closed, not leaked
     } finally {
       await adapter.destroy();
     }

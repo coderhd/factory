@@ -314,6 +314,17 @@ describe('E11.3 GitHub transport/token configuration (#43)', () => {
     ).toBe(true);
     expect(unknownKey.issues.some((issue) => issue.path === 'github.repository')).toBe(true);
 
+    // A stray key beside a valid `env` reference is refused: only `env` is a
+    // github.token key, so a raw secret dressed as `token.value` cannot ride in
+    // just because a legal `env` sits next to it.
+    const strayTokenKey = parseFactoryConfig(
+      `apiVersion: factory/v0.1\ngithub:\n  repository: acme/widgets\n  token:\n    env: GITHUB_TOKEN\n    value: ghp_raw_secret\n`,
+    );
+    if (strayTokenKey.ok) throw new Error('a stray github.token key must not parse');
+    expect(strayTokenKey.issues.some((issue) => issue.path === 'github.token.value')).toBe(true);
+
+    // A token mapping with no env reference (the raw `value:` secret shape) is
+    // still refused: the token itself may only ever be an { env: NAME } ref.
     const rawTokenValue = parseFactoryConfig(
       `apiVersion: factory/v0.1\ngithub:\n  repository: acme/widgets\n  token:\n    value: ghp_raw_secret\n`,
     );

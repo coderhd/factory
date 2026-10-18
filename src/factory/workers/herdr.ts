@@ -779,9 +779,12 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
         // failure (e.g. missing `root_pane` in a malformed create payload)
         // tears the pane down in `releaseRun` instead of leaking the tab.
         const tabId = refId(tabResult, 'tab', 'tab_id');
-        const rootPane = refId(tabResult, 'root_pane', 'pane_id');
         runState = { envelope, agentName: `factory-${envelope.attemptId}`, tab: tabId };
         run = runState;
+        // Read `root_pane` only after the run is registered: if the create
+        // payload is malformed here, the catch still owns a live `runState` and
+        // can close the tab it just created.
+        const rootPane = refId(tabResult, 'root_pane', 'pane_id');
         const agentArgs = [
           'agent',
           'start',
