@@ -9,6 +9,7 @@ import {
   parseFactoryConfig,
   resolveFactoryConfig,
   serializeFactoryConfig,
+  type FactoryDesiredConfig,
 } from '../../src/factory/config/factoryConfig';
 import {
   ModelUnavailableError,
@@ -24,7 +25,26 @@ import { createFactoryClient, type FactoryClient } from '../../src/factory/api/c
 import { createApiHandler, type ApiHandler } from '../../src/factory/api/server';
 import { createEmptyEvidenceReadPort } from '../../src/factory/observatory/observatory';
 import { openEventLog } from '../../src/factory/events/log';
-import { openStateStore } from '../../src/factory/state/store';
+import { openStateStore, type StateStore } from '../../src/factory/state/store';
+import type { WorkOrder, WorkOrderIntent } from '../../src/factory/domain/workOrder';
+import {
+  createGitHubAdapter,
+  createGitHubRestTransport,
+  type CreateBranchInput,
+  type CreatePullRequestInput,
+  type GitHubAdapter,
+  type GitHubBranch,
+  type GitHubIssue,
+  type GitHubMergeResult,
+  type GitHubPullRequest,
+  type GitHubPullRequestDetail,
+  type GitHubReadyIssue,
+  type GitHubTransport,
+  type IssueRef,
+  type MergePullRequestInput,
+  type PullRequestRef,
+} from '../../src/factory/github/adapter';
+import { createReadyTicketPoller } from '../../src/factory/github/poller';
 import { ORCHESTRATOR_TOOLS, toolByName } from '../../src/factory/orchestrator/tools';
 import { createOrchestrator } from '../../src/factory/orchestrator/orchestrator';
 import type {
@@ -1125,6 +1145,370 @@ describe('E12 orchestrator: buildServerDeps composition (#48)', () => {
     } finally {
       configured.store.close();
       rmSync(configuredDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T5 — the GitHub "ready ticket" poller (#48). A configured label is polled for
+// open issues, each imported + claimed through the same adapter path the manual
+// `/api/github/import` route uses (`adapter.importIssue`), deduped on the Work
+// Order's durable `source:github/<repo>#<num>` provenance marker. Hermetic: a
+// fake transport over an in-memory store — no network.
+// ---------------------------------------------------------------------------
+
+/**
+ * A `GitHubTransport` fake (Ruling R6) that serves a fixed set of ready issues
+ * and records every call. `listError` makes the next listing throw, to exercise
+ * the poller's error isolation without touching the network.
+ */
+class FakeReadyTransport implements GitHubTransport {
+  listCalls: string[] = [];
+  getIssueCalls: IssueRef[] = [];
+  issues = new Map<string, GitHubIssue>();
+  ready: GitHubIssue[] = [];
+  listError: Error | null = null;
+
+  async listIssuesByLabel(label: string): Promise<GitHubReadyIssue[]> {
+    this.listCalls.push(label);
+    if (this.listError) throw this.listError;
+    return this.ready.map((issue) => ({
+      repository: issue.repository,
+      number: issue.number,
+      title: issue.title,
+      url: issue.url,
+    }));
+  }
+
+  async getIssue(ref: IssueRef): Promise<GitHubIssue> {
+    this.getIssueCalls.push({ ...ref });
+    const issue = this.issues.get(`${ref.repository}#${ref.number}`);
+    if (!issue) throw new Error(`no such issue: ${ref.repository}#${ref.number}`);
+    return issue;
+  }
+
+  async createBranch(_input: CreateBranchInput): Promise<GitHubBranch> {
+    throw new Error('unexpected createBranch');
+  }
+  async createPullRequest(_input: CreatePullRequestInput): Promise<GitHubPullRequest> {
+    throw new Error('unexpected createPullRequest');
+  }
+  async getPullRequest(_ref: PullRequestRef): Promise<GitHubPullRequestDetail> {
+    throw new Error('unexpected getPullRequest');
+  }
+  async mergePullRequest(_input: MergePullRequestInput): Promise<GitHubMergeResult> {
+    throw new Error('unexpected mergePullRequest');
+  }
+}
+
+function readyTicket(number: number, repository = 'acme/widgets'): GitHubIssue {
+  return {
+    repository,
+    number,
+    title: `Ready ticket ${number}`,
+    body: `Acceptance:\n- [ ] ticket ${number} lands`,
+    labels: ['factory:ready'],
+    url: `https://github.com/${repository}/issues/${number}`,
+  };
+}
+
+/**
+ * The real GitHub adapter over a stateful in-memory `FactoryClient` (the
+ * `fakeFactoryClient` proxy, wired to write/read the same store the poller
+ * dedupes against). So the import path under test is production's, not a copy.
+ */
+function readyAdapter(transport: GitHubTransport, store: StateStore): GitHubAdapter {
+  let seq = 0;
+  const factory = fakeFactoryClient({
+    listWorkOrders: () => store.list<WorkOrder>('work_orders'),
+    submitWorkOrder: (intent: WorkOrderIntent) => {
+      seq += 1;
+      const now = new Date().toISOString();
+      const workOrder: WorkOrder = {
+        id: `wo_${seq}`,
+        intent: intent.intent,
+        acceptanceCriteria: intent.acceptanceCriteria ?? [],
+        riskTier: intent.riskTier ?? 'YELLOW',
+        constraints: intent.constraints ?? [],
+        outOfScope: intent.outOfScope ?? [],
+        repository: intent.repository ?? null,
+        requiredVerification: intent.requiredVerification ?? [],
+        state: 'DRAFT',
+        createdAt: now,
+        updatedAt: now,
+      };
+      store.set('work_orders', workOrder.id, workOrder);
+      return workOrder;
+    },
+  });
+  return createGitHubAdapter({
+    transport,
+    client: factory.client,
+    factoryBaseUrl: 'http://factory.local',
+  });
+}
+
+describe('E12 orchestrator: GitHub ready-ticket poller (#48)', () => {
+  const LABEL = 'factory:ready';
+
+  function freshStore(): StateStore {
+    return openStateStore(':memory:');
+  }
+
+  it('tick() imports and claims both ready issues', async () => {
+    const store = freshStore();
+    try {
+      const transport = new FakeReadyTransport();
+      transport.ready = [readyTicket(7), readyTicket(8)];
+      for (const issue of transport.ready) {
+        transport.issues.set(`${issue.repository}#${issue.number}`, issue);
+      }
+      const poller = createReadyTicketPoller({
+        adapter: readyAdapter(transport, store),
+        store,
+        label: LABEL,
+        intervalMs: 60_000,
+      });
+
+      const result = await poller.tick();
+
+      expect(result).toEqual({ imported: 2, skipped: 0 });
+      // The transport was asked for *open* issues carrying the configured label.
+      expect(transport.listCalls).toEqual([LABEL]);
+      const workOrders = store.list<WorkOrder>('work_orders');
+      expect(workOrders).toHaveLength(2);
+      // The durable import identity is the same `source:github/<repo>#<num>`
+      // marker the manual `/api/github/import` route reconciles on.
+      expect(workOrders.map((wo) => wo.constraints[0]).sort()).toEqual([
+        'source:github/acme/widgets#7',
+        'source:github/acme/widgets#8',
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a second tick() with the same issues is idempotent: {imported:0, skipped:2}', async () => {
+    const store = freshStore();
+    try {
+      const transport = new FakeReadyTransport();
+      transport.ready = [readyTicket(7), readyTicket(8)];
+      for (const issue of transport.ready) {
+        transport.issues.set(`${issue.repository}#${issue.number}`, issue);
+      }
+      const poller = createReadyTicketPoller({
+        adapter: readyAdapter(transport, store),
+        store,
+        label: LABEL,
+        intervalMs: 60_000,
+      });
+
+      expect(await poller.tick()).toEqual({ imported: 2, skipped: 0 });
+      expect(await poller.tick()).toEqual({ imported: 0, skipped: 2 });
+
+      // The dedupe is a real pre-check: the second tick never re-fetched an
+      // issue and never created a duplicate Work Order.
+      expect(transport.getIssueCalls).toHaveLength(2);
+      expect(transport.listCalls).toEqual([LABEL, LABEL]);
+      expect(store.list<WorkOrder>('work_orders')).toHaveLength(2);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a transport failure is caught, reported via onError, and tick() stays usable', async () => {
+    const store = freshStore();
+    try {
+      const transport = new FakeReadyTransport();
+      transport.ready = [readyTicket(7), readyTicket(8)];
+      for (const issue of transport.ready) {
+        transport.issues.set(`${issue.repository}#${issue.number}`, issue);
+      }
+      const errors: unknown[] = [];
+      const poller = createReadyTicketPoller({
+        adapter: readyAdapter(transport, store),
+        store,
+        label: LABEL,
+        intervalMs: 60_000,
+        onError: (error) => errors.push(error),
+      });
+
+      transport.listError = new Error('github unavailable');
+      // Never throws out of tick(); nothing imported, nothing skipped.
+      expect(await poller.tick()).toEqual({ imported: 0, skipped: 0 });
+      expect(errors).toHaveLength(1);
+      expect((errors[0] as Error).message).toContain('github unavailable');
+
+      // The poller is still usable: the next tick recovers.
+      transport.listError = null;
+      expect(await poller.tick()).toEqual({ imported: 2, skipped: 0 });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('an import failure is caught and reported too, and the poller recovers', async () => {
+    const store = freshStore();
+    try {
+      const transport = new FakeReadyTransport();
+      transport.ready = [readyTicket(7)];
+      // Deliberately do NOT register issue 7, so `getIssue` fails mid-import.
+      const errors: unknown[] = [];
+      const poller = createReadyTicketPoller({
+        adapter: readyAdapter(transport, store),
+        store,
+        label: LABEL,
+        intervalMs: 60_000,
+        onError: (error) => errors.push(error),
+      });
+
+      expect(await poller.tick()).toEqual({ imported: 0, skipped: 0 });
+      expect(errors).toHaveLength(1);
+      expect((errors[0] as Error).message).toContain('no such issue');
+
+      transport.issues.set('acme/widgets#7', transport.ready[0]!);
+      expect(await poller.tick()).toEqual({ imported: 1, skipped: 0 });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('the REST transport GETs open issues for the label (and skips pull requests)', async () => {
+    const { impl, calls } = recordingFetch(() =>
+      jsonResponse([
+        {
+          number: 7,
+          title: 'Counter',
+          body: '- [ ] x',
+          html_url: 'https://github.com/acme/widgets/issues/7',
+        },
+        {
+          number: 9,
+          title: 'A pull request, not an issue',
+          html_url: 'https://github.com/acme/widgets/pull/9',
+          pull_request: { url: 'https://api.github.com/repos/acme/widgets/pulls/9' },
+        },
+      ]),
+    );
+    const transport = createGitHubRestTransport({
+      token: 'secret-token',
+      repository: 'acme/widgets',
+      fetch: impl,
+    });
+
+    const issues = await transport.listIssuesByLabel(LABEL);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe('GET');
+    expect(calls[0]!.url).toBe(
+      'https://api.github.com/repos/acme/widgets/issues?state=open&labels=factory%3Aready',
+    );
+    expect(calls[0]!.headers.authorization).toBe('Bearer secret-token');
+    expect(issues).toEqual([
+      {
+        repository: 'acme/widgets',
+        number: 7,
+        title: 'Counter',
+        url: 'https://github.com/acme/widgets/issues/7',
+        body: '- [ ] x',
+      },
+    ]);
+  });
+
+  it('start()/stop() are guarded, and stop() halts the interval', async () => {
+    const store = freshStore();
+    try {
+      const transport = new FakeReadyTransport();
+      transport.ready = [readyTicket(7)];
+      transport.issues.set('acme/widgets#7', transport.ready[0]!);
+      const poller = createReadyTicketPoller({
+        adapter: readyAdapter(transport, store),
+        store,
+        label: LABEL,
+        intervalMs: 5,
+        onError: () => undefined,
+      });
+
+      poller.start();
+      poller.start(); // double-start is a no-op: exactly one interval
+      await Bun.sleep(40);
+      poller.stop();
+      const afterStop = transport.listCalls.length;
+      expect(afterStop).toBeGreaterThan(0);
+
+      await Bun.sleep(40);
+      expect(transport.listCalls.length).toBe(afterStop);
+      poller.stop(); // idempotent, and never leaks
+    } finally {
+      store.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T5b — buildServerDeps composition: the poller is constructed exactly when the
+// resolved `orchestrator.poller` is configured and a GitHub adapter exists.
+// ---------------------------------------------------------------------------
+
+describe('E12 orchestrator: buildServerDeps poller wiring (#48)', () => {
+  const TOKEN_ENV = 'E12_GH_TOKEN';
+  let dir = '';
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'factory-e12-poller-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function runtime(withPoller: boolean): ReturnType<typeof resolveFactoryConfig> {
+    const text = serializeFactoryConfig({
+      ...DEFAULT_FACTORY_CONFIG,
+      repository: { path: dir },
+      github: { repository: 'acme/widgets', token: { env: TOKEN_ENV } },
+      ...(withPoller
+        ? {
+            orchestrator: {
+              baseUrl: 'https://opencode.ai/inference',
+              apiFamily: 'openai' as const,
+              model: 'glm-5.3-flash',
+              apiKeyEnv: 'E12_API_KEY',
+              poller: { label: 'factory:ready', intervalMs: 60000 },
+            },
+          }
+        : {}),
+    } as FactoryDesiredConfig);
+    const parsed = parseFactoryConfig(text);
+    if (!parsed.ok) throw new Error(`fixture factory.yaml invalid: ${JSON.stringify(parsed.issues)}`);
+    return resolveFactoryConfig(parsed.config, { baseDir: dir });
+  }
+
+  it('exposes a poller dep exactly when orchestrator.poller is configured', () => {
+    process.env[TOKEN_ENV] = 'e12-github-token';
+    try {
+      const configured = buildServerDeps(runtime(true), {
+        reconcileOnBoot: false,
+        githubTransport: new FakeReadyTransport(),
+      });
+      try {
+        expect(configured.poller).toBeDefined();
+        expect(typeof configured.poller?.start).toBe('function');
+        expect(typeof configured.poller?.stop).toBe('function');
+      } finally {
+        configured.store.close();
+      }
+
+      const without = buildServerDeps(runtime(false), {
+        reconcileOnBoot: false,
+        githubTransport: new FakeReadyTransport(),
+      });
+      try {
+        expect(without.poller).toBeUndefined();
+      } finally {
+        without.store.close();
+      }
+    } finally {
+      delete process.env[TOKEN_ENV];
     }
   });
 });

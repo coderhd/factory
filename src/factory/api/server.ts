@@ -24,6 +24,7 @@ import {
   type ApprovalRecord,
 } from '../policy/policy';
 import type { Orchestrator, OrchestratorRequest } from '../orchestrator/orchestrator';
+import type { ReadyTicketPoller } from '../github/poller';
 import type { Scheduler } from '../scheduler/scheduler';
 import type { StateStore } from '../state/store';
 import {
@@ -93,6 +94,14 @@ export interface FactoryServerDeps {
    * the orchestrator is never invoked some other way.
    */
   orchestrator?: Orchestrator;
+  /**
+   * E12 (#48) the GitHub "ready ticket" poller, composed by `buildServerDeps`
+   * when the resolved `orchestrator.poller` is configured and a GitHub adapter
+   * exists to list/import through. `cmdServe` owns its start/stop lifecycle
+   * (like `scheduler`); the API surface does not touch it. Absent, nothing is
+   * polled — imports stay manual (`factory github import`).
+   */
+  poller?: ReadyTicketPoller;
   now?: () => string;
 }
 

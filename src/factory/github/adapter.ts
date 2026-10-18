@@ -55,6 +55,19 @@ export interface GitHubIssue extends IssueRef {
   url: string;
 }
 
+/**
+ * E12 (#48): one open issue carrying the configured "ready" label, as the
+ * ready-ticket poller sees it. Extends {@link IssueRef} so `repository` +
+ * `number` (the durable import identity, `issueSourceRef`) travel with the
+ * issue and can be handed straight to `GitHubAdapter.importIssue` — no second
+ * source of the repository to drift from the listing transport's bound repo.
+ */
+export interface GitHubReadyIssue extends IssueRef {
+  title: string;
+  url: string;
+  body?: string;
+}
+
 export interface GitHubBranch {
   repository: string;
   name: string;
@@ -127,6 +140,12 @@ export interface GitHubMergeResult {
  */
 export interface GitHubTransport {
   getIssue(ref: IssueRef): Promise<GitHubIssue>;
+  /**
+   * E12 (#48): list the open issues carrying `label` — the ready-ticket
+   * poller's read (`GET /repos/:owner/:repo/issues?state=open&labels=<label>`).
+   * The transport is bound to one repository at construction.
+   */
+  listIssuesByLabel(label: string): Promise<GitHubReadyIssue[]>;
   createBranch(input: CreateBranchInput): Promise<GitHubBranch>;
   createPullRequest(input: CreatePullRequestInput): Promise<GitHubPullRequest>;
   /** Read a PR back, for the merge gate's hygiene checks. */
@@ -151,6 +170,13 @@ export class GitHubTransportError extends Error {
 export interface GitHubRestTransportOptions {
   /** GitHub token (fine-grained PAT / app installation token). */
   token: string;
+  /**
+   * E12 (#48) the `owner/name` the transport lists ready tickets from. The
+   * per-ref methods carry their own repository; `listIssuesByLabel` cannot, so
+   * the transport is bound here. Absent, `listIssuesByLabel` fails closed
+   * before any network I/O.
+   */
+  repository?: string;
   /** Defaults to the public GitHub REST API. */
   apiBaseUrl?: string;
   /** Defaults to `factory-github-adapter`. */
@@ -168,6 +194,16 @@ interface GitHubIssueDto {
   body?: unknown;
   html_url?: unknown;
   labels?: unknown;
+}
+
+/** One entry of the `GET /repos/:owner/:repo/issues` list (E12 #48). */
+interface GitHubListedIssueDto {
+  number?: unknown;
+  title?: unknown;
+  body?: unknown;
+  html_url?: unknown;
+  /** Present on pull-request entries, which the issues endpoint also returns. */
+  pull_request?: unknown;
 }
 
 interface GitHubPrDto {
@@ -241,6 +277,38 @@ export function createGitHubRestTransport(options: GitHubRestTransportOptions): 
   }
 
   return {
+    async listIssuesByLabel(label: string): Promise<GitHubReadyIssue[]> {
+      const repository = options.repository;
+      if (!repository) {
+        throw new Error(
+          'github listIssuesByLabel requires a configured repository (owner/name); ' +
+            'nothing is listed without one (fails closed)',
+        );
+      }
+      // `state=open` + `labels=<label>` are the "ready" query; the label is
+      // URL-encoded so labels containing `:` (e.g. `factory:ready`) survive.
+      const query = new URLSearchParams({ state: 'open', labels: label });
+      const issues = await request<GitHubListedIssueDto[]>(
+        'GET',
+        `/repos/${repository}/issues?${query.toString()}`,
+      );
+      if (!Array.isArray(issues)) return [];
+      return issues
+        // The issues endpoint also returns pull requests; a ready *ticket* is an
+        // issue, so a PR entry is not imported as a Work Order.
+        .filter((issue) => issue?.pull_request === undefined)
+        .map((issue) => {
+          const ready: GitHubReadyIssue = {
+            repository,
+            number: typeof issue.number === 'number' ? issue.number : 0,
+            title: typeof issue.title === 'string' ? issue.title : '',
+            url: typeof issue.html_url === 'string' ? issue.html_url : '',
+          };
+          if (typeof issue.body === 'string') ready.body = issue.body;
+          return ready;
+        });
+    },
+
     async getIssue(ref: IssueRef): Promise<GitHubIssue> {
       const issue = await request<GitHubIssueDto>(
         'GET',
@@ -604,6 +672,12 @@ export interface GitHubAdapter {
    */
   importIssue(ref: IssueRef): Promise<ImportIssueResult>;
   /**
+   * E12 (#48): list the open issues carrying `label`. Read-only; the
+   * configured repository bound (E11.3) is applied, so a misconfigured
+   * transport cannot pull another repository's tickets into the Factory.
+   */
+  listIssuesByLabel(label: string): Promise<GitHubReadyIssue[]>;
+  /**
    * Create the change-set branch for a Work Order after a `branch.create` policy
    * check (fails closed via {@link PolicyBlockedError} on no port / non-ALLOW).
    */
@@ -674,6 +748,15 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
       constraints: [marker],
     });
     return { workOrder, created: true };
+  }
+
+  async function listIssuesByLabel(label: string): Promise<GitHubReadyIssue[]> {
+    const issues = await transport.listIssuesByLabel(label);
+    // The configured repository bound (E11.3, #43): a read that could only ever
+    // return the bound repo is still filtered, so a misconfigured transport can
+    // never feed another repository's tickets into the Factory.
+    if (allowedRepository === undefined) return issues;
+    return issues.filter((issue) => issue.repository === allowedRepository);
   }
 
   /** Authorize a non-merge GitHub side effect; fail closed on no port / non-ALLOW. */
@@ -906,5 +989,5 @@ export function createGitHubAdapter(options: GitHubAdapterOptions): GitHubAdapte
     return { merge: merged, workOrder: transitioned };
   }
 
-  return { importIssue, createBranch, openPR, merge };
+  return { importIssue, listIssuesByLabel, createBranch, openPR, merge };
 }

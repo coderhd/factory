@@ -22,6 +22,7 @@ import {
   type GitHubAdapter,
   type GitHubTransport,
 } from '../factory/github/adapter';
+import { createReadyTicketPoller } from '../factory/github/poller';
 import { createHttpModelClient } from '../factory/inference/modelClient';
 import { createOrchestrator, type Orchestrator } from '../factory/orchestrator/orchestrator';
 import { openEventLog, type EventLog } from '../factory/events/log';
@@ -500,6 +501,9 @@ function resolveGitHubInputs(
         createGitHubRestTransport({
           token,
           apiBaseUrl: runtime.github.apiBaseUrl,
+          // E12 (#48): the transport's ready-ticket listing is bound to the
+          // configured repository (the same bound `github.repository` enforces).
+          repository: runtime.github.repository,
         }),
       apiBaseUrl: effectiveUrl,
       factoryBaseUrl: effectiveUrl,
@@ -721,6 +725,21 @@ export function buildServerDeps(
   // as a test seam). Composed last: it depends on no other resource here, and
   // its API key stays local to the model client it builds.
   const orchestrator = resolveOrchestrator(runtime, options);
+  // E12 (#48): the GitHub "ready ticket" poller. Constructed when the resolved
+  // `orchestrator:` config carries a `poller:` block AND a GitHub adapter exists
+  // to list/import through (without an adapter there is nothing to poll). It is
+  // built, not started: `cmdServe` owns the start/stop lifecycle alongside the
+  // scheduler, so no timer leaks from a non-serving process (tests).
+  const pollerConfig = runtime.orchestrator?.poller;
+  const poller =
+    pollerConfig && github
+      ? createReadyTicketPoller({
+          adapter: github,
+          store,
+          label: pollerConfig.label,
+          intervalMs: pollerConfig.intervalMs,
+        })
+      : undefined;
   return {
     store,
     events,
@@ -730,6 +749,8 @@ export function buildServerDeps(
     // E12 (#48): the composed orchestrator (or the injected test seam). The API
     // key lives only inside the model client it closed over — never here.
     ...(orchestrator ? { orchestrator } : {}),
+    // E12 (#48): the ready-ticket poller (or nothing). Started by `cmdServe`.
+    ...(poller ? { poller } : {}),
     // E10.4 (#40): carry the resolved bearer credential + principal into the
     // API surface so authenticated deployments gate mutating routes.
     ...(runtime.server.auth ? { auth: { ...runtime.server.auth } } : {}),
@@ -889,6 +910,9 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
   const handle = startFactoryServer(deps, { port, hostname });
   // Actually run the E3 scheduler loop for the life of the server (spec §7.2).
   deps.scheduler?.start();
+  // E12 (#48): the ready-ticket poller runs for the life of the server too,
+  // when configured — the auto-claim the operators expect.
+  deps.poller?.start();
   writeRuntimeFile(dir, {
     pid: process.pid,
     url: handle.url,
@@ -900,6 +924,7 @@ async function cmdServe(args: ParsedArgs, io: CliIO): Promise<number> {
 
   const shutdown = (): void => {
     deps.scheduler?.stop();
+    deps.poller?.stop();
     clearRuntimeFile(dir);
     handle.stop();
     process.exit(0);

@@ -107,6 +107,10 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 class MockGitHub implements GitHubTransport {
+  /** E12 (#48): listing is not exercised by this suite. */
+  async listIssuesByLabel(label: string): Promise<never> {
+    throw new Error(`unexpected listIssuesByLabel(${label}) in this test`);
+  }
   issues = new Map<string, GitHubIssue>();
   issueCalls: IssueRef[] = [];
   branchCalls: CreateBranchInput[] = [];
