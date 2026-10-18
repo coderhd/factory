@@ -1,5 +1,9 @@
-import { describe, expect, it } from 'bun:test';
+import { beforeEach, afterEach, describe, expect, it } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import { buildServerDeps } from '../../src/cli/factory';
 import {
   DEFAULT_FACTORY_CONFIG,
   parseFactoryConfig,
@@ -16,10 +20,18 @@ import type {
   ModelReply,
   ModelRequest,
 } from '../../src/factory/inference/modelClient';
-import type { FactoryClient } from '../../src/factory/api/client';
+import { createFactoryClient, type FactoryClient } from '../../src/factory/api/client';
+import { createApiHandler, type ApiHandler } from '../../src/factory/api/server';
+import { createEmptyEvidenceReadPort } from '../../src/factory/observatory/observatory';
+import { openEventLog } from '../../src/factory/events/log';
+import { openStateStore } from '../../src/factory/state/store';
 import { ORCHESTRATOR_TOOLS, toolByName } from '../../src/factory/orchestrator/tools';
 import { createOrchestrator } from '../../src/factory/orchestrator/orchestrator';
-import type { OrchestratorResult } from '../../src/factory/orchestrator/orchestrator';
+import type {
+  Orchestrator,
+  OrchestratorRequest,
+  OrchestratorResult,
+} from '../../src/factory/orchestrator/orchestrator';
 
 /**
  * E12 (#48) — the `orchestrator:` config section. The Factory carries the
@@ -925,5 +937,194 @@ describe('E12 orchestrator: loop + confirmation gate (#48)', () => {
     expect(result.error.code).toBe('MODEL_UNAVAILABLE');
     expect(result.error.message).toContain('OPENCODE_API_KEY');
     expect(factory.calls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T4 — the E2 API surface: POST /api/orchestrator/message + the client method.
+// The route is a thin, mutating (therefore auth-gated) entry point onto the
+// composed `Orchestrator`; absent one it 503s. These tests drive the pure
+// handler (`createApiHandler`) directly, mirroring E10.4's hermetic style, and
+// the client over an injected `fetch` — nothing here touches the network.
+// ---------------------------------------------------------------------------
+
+const E12_TOKEN = 'e12-test-token-0123456789abcdef';
+const E12_ACTOR = 'operator-ada';
+
+/** A stub `Orchestrator` that records every request and returns a canned result. */
+function stubOrchestrator(result: OrchestratorResult): {
+  orchestrator: Orchestrator;
+  requests: OrchestratorRequest[];
+} {
+  const requests: OrchestratorRequest[] = [];
+  const orchestrator: Orchestrator = {
+    async handle(request: OrchestratorRequest): Promise<OrchestratorResult> {
+      requests.push(request);
+      return result;
+    },
+  };
+  return { orchestrator, requests };
+}
+
+/** Build a pure API handler over an in-memory store with optional seams. */
+function orchestratorHandler(options: {
+  orchestrator?: Orchestrator;
+  auth?: { token: string; actor: string };
+}): ApiHandler {
+  const store = openStateStore(':memory:');
+  const events = openEventLog(store.db);
+  return createApiHandler({
+    store,
+    events,
+    evidence: createEmptyEvidenceReadPort(),
+    ...(options.orchestrator ? { orchestrator: options.orchestrator } : {}),
+    ...(options.auth ? { auth: options.auth } : {}),
+  });
+}
+
+/** POST a JSON body to the handler (the E10.4 helper pattern). */
+function post(
+  handler: ApiHandler,
+  path: string,
+  body: unknown,
+  token?: string,
+): Promise<Response> {
+  return handler(
+    new Request(`http://factory.local/api${path}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(token !== undefined ? { authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+const OK_RESULT: OrchestratorResult = {
+  status: 'ok',
+  summary: '2 work orders',
+  toolCalls: [{ tool: 'list_work_orders', args: {} }],
+};
+
+describe('E12 orchestrator: POST /api/orchestrator/message (#48)', () => {
+  it('returns the orchestrator result for a message when no auth is configured', async () => {
+    const stub = stubOrchestrator(OK_RESULT);
+    const handler = orchestratorHandler({ orchestrator: stub.orchestrator });
+
+    const response = await post(handler, '/orchestrator/message', { message: 'hi' });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(OK_RESULT);
+    expect(stub.requests).toEqual([{ message: 'hi' }]);
+  });
+
+  it('requires a bearer token when auth is configured, and keeps GET public', async () => {
+    const stub = stubOrchestrator(OK_RESULT);
+    const handler = orchestratorHandler({
+      orchestrator: stub.orchestrator,
+      auth: { token: E12_TOKEN, actor: E12_ACTOR },
+    });
+
+    const denied = await post(handler, '/orchestrator/message', { message: 'hi' });
+    expect(denied.status).toBe(401);
+    expect(await denied.json()).toMatchObject({ error: { code: 'UNAUTHENTICATED' } });
+    // Fail closed: the stub never saw the unauthenticated request.
+    expect(stub.requests).toHaveLength(0);
+
+    const allowed = await post(handler, '/orchestrator/message', { message: 'hi' }, E12_TOKEN);
+    expect(allowed.status).toBe(200);
+    expect(await allowed.json()).toEqual(OK_RESULT);
+    expect(stub.requests).toEqual([{ message: 'hi' }]);
+
+    // GET remains the documented-public read boundary, even unauthenticated.
+    const health = await handler(new Request('http://factory.local/api/health'));
+    expect(health.status).toBe(200);
+  });
+
+  it('returns 503 ORCHESTRATOR_DISABLED when no orchestrator is configured', async () => {
+    const handler = orchestratorHandler({});
+
+    const response = await post(handler, '/orchestrator/message', { message: 'hi' });
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: 'ORCHESTRATOR_DISABLED' } });
+  });
+
+  it('client: orchestratorMessage POSTs /api/orchestrator/message with the request body', async () => {
+    const { impl, calls } = recordingFetch(() => jsonResponse(OK_RESULT));
+    const client = createFactoryClient({
+      baseUrl: 'http://factory.local',
+      fetch: impl,
+      token: E12_TOKEN,
+    });
+
+    const result = await client.orchestratorMessage({ message: 'hi' });
+
+    expect(result).toEqual(OK_RESULT);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe('POST');
+    expect(calls[0]!.url).toBe('http://factory.local/api/orchestrator/message');
+    expect(calls[0]!.body).toEqual({ message: 'hi' });
+    // A POST carries the bearer credential (the GET-public rule does not apply).
+    expect(calls[0]!.headers.authorization).toBe(`Bearer ${E12_TOKEN}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T4b — buildServerDeps composition. The route above is only useful if the
+// orchestrator is actually wired into `deps`: an injected seam is honoured
+// verbatim, a configured `orchestrator:` section composes the real stack, and
+// an absent section leaves the dep undefined (so the route 503s).
+// ---------------------------------------------------------------------------
+
+let e12WorkDir = '';
+
+describe('E12 orchestrator: buildServerDeps composition (#48)', () => {
+  beforeEach(() => {
+    e12WorkDir = mkdtempSync(join(tmpdir(), 'factory-e12-'));
+  });
+  afterEach(() => {
+    rmSync(e12WorkDir, { recursive: true, force: true });
+  });
+
+  function runtimeWith(withSection: boolean, dir = e12WorkDir): ReturnType<typeof resolveFactoryConfig> {
+    const base = { ...DEFAULT_FACTORY_CONFIG, repository: { path: dir } };
+    const text = serializeFactoryConfig(base) + (withSection ? VALID_ORCHESTRATOR : '');
+    const parsed = parseFactoryConfig(text);
+    if (!parsed.ok) throw new Error(`fixture factory.yaml invalid: ${JSON.stringify(parsed.issues)}`);
+    return resolveFactoryConfig(parsed.config, { baseDir: dir });
+  }
+
+  it('honors an injected orchestrator seam verbatim', () => {
+    const stub = stubOrchestrator(OK_RESULT);
+    const deps = buildServerDeps(runtimeWith(false), {
+      orchestrator: stub.orchestrator,
+      reconcileOnBoot: false,
+    });
+    try {
+      expect(deps.orchestrator).toBe(stub.orchestrator);
+    } finally {
+      deps.store.close();
+    }
+  });
+
+  it('composes the stack from a configured section and leaves it undefined otherwise', () => {
+    const without = buildServerDeps(runtimeWith(false), { reconcileOnBoot: false });
+    try {
+      expect(without.orchestrator).toBeUndefined();
+    } finally {
+      without.store.close();
+    }
+
+    const configuredDir = mkdtempSync(join(tmpdir(), 'factory-e12-on-'));
+    const configured = buildServerDeps(runtimeWith(true, configuredDir), { reconcileOnBoot: false });
+    try {
+      expect(configured.orchestrator).toBeDefined();
+      expect(typeof configured.orchestrator?.handle).toBe('function');
+    } finally {
+      configured.store.close();
+      rmSync(configuredDir, { recursive: true, force: true });
+    }
   });
 });
