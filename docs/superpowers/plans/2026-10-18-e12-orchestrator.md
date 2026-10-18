@@ -233,6 +233,9 @@ by a step in the task that owns the code:
     `{"tool":"<name>","args":{...}}` to act, or `{"final":"<summary>"}` to finish. Parse with
     `JSON.parse`; on parse failure or unknown tool, feed a one-line correction back and retry
     **once**, then return `{status:'error', error:{code:'ORCHESTRATOR_BAD_MODEL_OUTPUT', ...}}`.
+    *Implemented note (final review §plan-alignment):* the correction allowance resets after an
+    accepted reply, so a model may be corrected more than once across a long run; the loop is still
+    hard-bounded by `maxSteps` (below), so the deviation is bounded and tested.
   - **Confirmation gate:** a `read` tool runs immediately; a `mutate`/`control` tool is **not**
     executed — the loop returns `{status:'awaiting_confirmation', pending:{...}}`. When the request
     carries `confirm`, the orchestrator executes exactly that tool (via `toolByName`), **without**
