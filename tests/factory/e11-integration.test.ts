@@ -333,6 +333,7 @@ describe('E11.3 GitHub transport/token configuration (#43)', () => {
     );
     if (rawTokenValue.ok) throw new Error('a raw token.value secret must not parse');
     expect(rawTokenValue.issues.some((issue) => issue.path === 'github.token.env')).toBe(true);
+    expect(rawTokenValue.issues.some((issue) => issue.path === 'github.token.value')).toBe(true);
 
     // Where a raw token would read even if accepted — it must not end up in
     // the resolved runtime config: only the env var name is carried.

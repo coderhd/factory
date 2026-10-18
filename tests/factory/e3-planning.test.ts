@@ -1396,12 +1396,12 @@ describe('E3 real Herdr same-tick provision→assign→execute', () => {
       // harness. (These two assertions lived inside the old `RecordingHerdrCli`
       // double, which `expect()`-ed on every call; moved here into the owning
       // test as real assertions on the recorded `calls`.)
-      expect(cli.calls.find((argv) => argv[0] === 'tab' && argv[1] === 'create')!.join(' ')).toContain(
-        '--workspace ws_factory',
-      );
-      expect(cli.calls.find((argv) => argv[0] === 'agent' && argv[1] === 'start')!.join(' ')).toContain(
-        '--kind opencode',
-      );
+      const createCall = cli.calls.find((argv) => argv[0] === 'tab' && argv[1] === 'create');
+      expect(createCall).toBeDefined();
+      expect(createCall!.join(' ')).toContain('--workspace ws_factory');
+      const startCall = cli.calls.find((argv) => argv[0] === 'agent' && argv[1] === 'start');
+      expect(startCall).toBeDefined();
+      expect(startCall!.join(' ')).toContain('--kind opencode');
     } finally {
       store.close();
     }
@@ -1479,6 +1479,9 @@ describe('E3 Herdr adapter lifecycle', () => {
   it('fails loudly when the harness does not write a report within the deadline', async () => {
     const { adapter, cli } = seedAdapter();
     try {
+      // The turn has ended with nothing reported (the pre-shared-fake default),
+      // so this exercises the report-timeout path rather than a still-running one.
+      cli.agentState = 'idle';
       await adapter.provision();
       await adapter.start();
       await adapter.execute(envelopeFor());
