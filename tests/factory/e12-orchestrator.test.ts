@@ -6,6 +6,11 @@ import {
   resolveFactoryConfig,
   serializeFactoryConfig,
 } from '../../src/factory/config/factoryConfig';
+import {
+  ModelUnavailableError,
+  createHttpModelClient,
+} from '../../src/factory/inference/modelClient';
+import type { ModelFailureReason } from '../../src/factory/inference/modelClient';
 
 /**
  * E12 (#48) — the `orchestrator:` config section. The Factory carries the
@@ -212,5 +217,246 @@ describe('E12 orchestrator: config section (#48)', () => {
     }
     expect(reparsed.config.orchestrator).toEqual(parsed.config.orchestrator);
     expect(serializeFactoryConfig(reparsed.config)).toBe(serialized);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T2 — the generic ModelClient over the opencode inference API (hermetic:
+// injected fetch, no network, the API key never echoed)
+// ---------------------------------------------------------------------------
+
+interface RecordedRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: unknown;
+}
+
+/**
+ * A `typeof fetch` stand-in that records every call and answers with a canned
+ * `Response`. Mirrors the E6 GitHub transport's `recordingFetch` pattern
+ * (`tests/factory/e6-github.test.ts:719`): nothing here touches the network.
+ */
+function recordingFetch(respond: (request: RecordedRequest) => Response): {
+  impl: typeof fetch;
+  calls: RecordedRequest[];
+} {
+  const calls: RecordedRequest[] = [];
+  const impl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url =
+      typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    const request = {
+      method: (init?.method ?? 'GET').toUpperCase(),
+      url,
+      headers: (init?.headers ?? {}) as Record<string, string>,
+      body: typeof init?.body === 'string' ? JSON.parse(init.body) : init?.body,
+    };
+    calls.push(request);
+    return respond(request);
+  }) as unknown as typeof fetch;
+  return { impl, calls };
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+describe('E12 orchestrator: ModelClient (#48)', () => {
+  const BASE_URL = 'https://opencode.ai/inference';
+  const KEY = 'test-key';
+  const KEY_ENV = 'OPENCODE_API_KEY';
+
+  it('openai family: POSTs the chat-completions URL, body, and bearer header; parses the reply', async () => {
+    const { impl, calls } = recordingFetch(() =>
+      jsonResponse({
+        choices: [{ message: { role: 'assistant', content: 'hello there' } }],
+        usage: { prompt_tokens: 11, completion_tokens: 7 },
+      }),
+    );
+    const client = createHttpModelClient({
+      baseUrl: `${BASE_URL}/`,
+      apiFamily: 'openai',
+      model: 'glm-5.3-flash',
+      apiKey: KEY,
+      apiKeyEnvName: KEY_ENV,
+      fetch: impl,
+    });
+
+    const reply = await client.complete({
+      system: 'be terse',
+      turns: [{ role: 'user', content: 'hi' }],
+      maxTokens: 128,
+    });
+
+    expect(reply).toEqual({ text: 'hello there', usage: { inputTokens: 11, outputTokens: 7 } });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe('POST');
+    // The trailing slash on baseUrl is stripped before joining the family path.
+    expect(calls[0]!.url).toBe(`${BASE_URL}/openai/v1/chat/completions`);
+    expect(calls[0]!.headers.authorization).toBe(`Bearer ${KEY}`);
+    expect(calls[0]!.body).toEqual({
+      model: 'glm-5.3-flash',
+      messages: [
+        { role: 'system', content: 'be terse' },
+        { role: 'user', content: 'hi' },
+      ],
+      max_tokens: 128,
+    });
+  });
+
+  it('anthropic family: hoists system, always sends max_tokens (default 2048), parses content[0].text', async () => {
+    const { impl, calls } = recordingFetch(() =>
+      jsonResponse({
+        content: [{ type: 'text', text: 'hoisted reply' }],
+        usage: { input_tokens: 21, output_tokens: 13 },
+      }),
+    );
+    const client = createHttpModelClient({
+      baseUrl: BASE_URL,
+      apiFamily: 'anthropic',
+      model: 'claude-sonnet-4',
+      apiKey: KEY,
+      apiKeyEnvName: KEY_ENV,
+      fetch: impl,
+    });
+
+    const reply = await client.complete({
+      system: 'be terse',
+      turns: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'hello' },
+      ],
+    });
+
+    expect(reply).toEqual({ text: 'hoisted reply', usage: { inputTokens: 21, outputTokens: 13 } });
+    expect(calls[0]!.url).toBe(`${BASE_URL}/anthropic/v1/messages`);
+    expect(calls[0]!.headers.authorization).toBe(`Bearer ${KEY}`);
+    expect(calls[0]!.body).toEqual({
+      model: 'claude-sonnet-4',
+      max_tokens: 2048,
+      system: 'be terse',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'hello' },
+      ],
+    });
+  });
+
+  it('anthropic family: honors an explicit maxTokens', async () => {
+    const { impl, calls } = recordingFetch(() => jsonResponse({ content: [{ text: 'ok' }] }));
+    const client = createHttpModelClient({
+      baseUrl: BASE_URL,
+      apiFamily: 'anthropic',
+      model: 'qwen3-max',
+      apiKey: KEY,
+      apiKeyEnvName: KEY_ENV,
+      fetch: impl,
+    });
+
+    await client.complete({ turns: [{ role: 'user', content: 'hi' }], maxTokens: 512 });
+
+    expect((calls[0]!.body as { max_tokens: number }).max_tokens).toBe(512);
+    expect((calls[0]!.body as { system?: string }).system).toBeUndefined();
+  });
+
+  it('sends no Authorization header when apiKey is absent or empty (free models need no key)', async () => {
+    const { impl, calls } = recordingFetch(() => jsonResponse({ choices: [{ message: { content: 'ok' } }] }));
+    const client = createHttpModelClient({
+      baseUrl: BASE_URL,
+      apiFamily: 'openai',
+      model: 'deepseek-v4.1-flash-free',
+      apiKey: '',
+      apiKeyEnvName: KEY_ENV,
+      fetch: impl,
+    });
+
+    await client.complete({ turns: [{ role: 'user', content: 'hi' }] });
+
+    expect(calls[0]!.headers.authorization).toBeUndefined();
+  });
+
+  it('maps 401/403 → auth, 429 → quota, 500 → upstream, naming the env var and never the key', async () => {
+    const cases: Array<{ status: number; reason: ModelFailureReason }> = [
+      { status: 401, reason: 'auth' },
+      { status: 403, reason: 'auth' },
+      { status: 429, reason: 'quota' },
+      { status: 500, reason: 'upstream' },
+    ];
+    for (const { status, reason } of cases) {
+      const { impl } = recordingFetch(() => jsonResponse({ error: { message: 'nope' } }, status));
+      const client = createHttpModelClient({
+        baseUrl: BASE_URL,
+        apiFamily: 'openai',
+        model: 'glm-5.3-flash',
+        apiKey: KEY,
+        apiKeyEnvName: KEY_ENV,
+        fetch: impl,
+      });
+
+      const error = await client
+        .complete({ turns: [{ role: 'user', content: 'hi' }] })
+        .then(() => null)
+        .catch((thrown: unknown) => thrown as ModelUnavailableError);
+
+      expect(error).toBeInstanceOf(ModelUnavailableError);
+      expect(error!.reason).toBe(reason);
+      expect(error!.message).toContain(KEY_ENV);
+      expect(error!.message).not.toContain(KEY);
+    }
+  });
+
+  it('maps a thrown fetch/timeout → transport, naming the env var and never the key', async () => {
+    const { impl } = recordingFetch(() => {
+      throw new Error('socket hang up');
+    });
+    const client = createHttpModelClient({
+      baseUrl: BASE_URL,
+      apiFamily: 'anthropic',
+      model: 'claude-sonnet-4',
+      apiKey: KEY,
+      apiKeyEnvName: KEY_ENV,
+      fetch: impl,
+    });
+
+    const error = await client
+      .complete({ turns: [{ role: 'user', content: 'hi' }] })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ModelUnavailableError);
+
+    expect(error).toBeInstanceOf(ModelUnavailableError);
+    expect(error!.reason).toBe('transport');
+    expect(error!.message).toContain(KEY_ENV);
+    expect(error!.message).not.toContain(KEY);
+  });
+
+  it('a fetch that never settles becomes a transport failure once timeoutMs elapses', async () => {
+    // Abort-aware: like real `fetch`, the pending request rejects when the
+    // client's timeout aborts the signal, so nothing dangles after the test.
+    const hanging = ((_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () =>
+          reject(new DOMException('aborted', 'AbortError')),
+        );
+      })) as unknown as typeof fetch;
+    const client = createHttpModelClient({
+      baseUrl: BASE_URL,
+      apiFamily: 'openai',
+      model: 'glm-5.3-flash',
+      apiKeyEnvName: KEY_ENV,
+      fetch: hanging,
+      timeoutMs: 20,
+    });
+
+    const error = await client
+      .complete({ turns: [{ role: 'user', content: 'hi' }] })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ModelUnavailableError);
+
+    expect(error).toBeInstanceOf(ModelUnavailableError);
+    expect(error!.reason).toBe('transport');
+    expect(error!.message).toContain(KEY_ENV);
   });
 });
