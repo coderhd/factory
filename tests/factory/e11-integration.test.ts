@@ -1198,6 +1198,53 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
     expect((longError as Error).message).not.toContain(hugePrompt.slice(100));
     expect((longError as Error).message).toContain('agent prompt a');
   });
+
+  it('createProcessHerdrCli: surfaces the bounded *stdout* error document from a real non-zero exit (#45)', async () => {
+    // Gap 1 (#45): herdr writes its structured error document to *stdout* with
+    // an often-empty stderr, and the `agent start` retry predicate matches
+    // `message.includes('agent_pane_busy')`. Pin the real spawn path (not the
+    // FakeHerdrCli's hand-written messages) so the whole pane-ready retry can
+    // never rest on an untested composition.
+    const busyStdout = '{"error":{"code":"agent_pane_busy","message":"not an available shell"}}';
+    const busy = createProcessHerdrCli(
+      stubScript('herdr-cli-busy.sh', `echo '${busyStdout}'\nexit 1`),
+    );
+    let busyError: unknown;
+    try {
+      await busy.run(['agent', 'start', 'w1:tab']);
+    } catch (error) {
+      busyError = error;
+    }
+    const busyMessage = (busyError as Error).message;
+    expect(busyMessage).toContain('agent_pane_busy');
+    expect(busyMessage).toContain('not an available shell');
+    expect(busyMessage).toContain('exit 1');
+    expect(busyMessage).toContain('agent start w1:tab');
+
+    // Gap 2 (#45): the stdout snippet carries the same ~300-char bound as the
+    // argv preview — a multi-KB herdr error document (>1 KB) must never land
+    // verbatim in a durable log line.
+    const hugeStdout = JSON.stringify({
+      error: { code: 'agent_pane_busy', message: 'X'.repeat(4_000) },
+    });
+    expect(hugeStdout.length).toBeGreaterThan(1_024);
+    const long = createProcessHerdrCli(
+      stubScript('herdr-cli-busy-long.sh', `echo '${hugeStdout}'\nexit 1`),
+    );
+    let longError: unknown;
+    try {
+      await long.run(['agent', 'start', 'w1:tab']);
+    } catch (error) {
+      longError = error;
+    }
+    const longMessage = (longError as Error).message;
+    expect(longMessage).toContain('agent_pane_busy');
+    expect(longMessage.length).toBeLessThan(500);
+    expect(longMessage).not.toContain('X'.repeat(400));
+    const stdoutSnippet = longMessage.split('— stdout: ')[1] ?? '';
+    expect(stdoutSnippet.length).toBeLessThanOrEqual(302);
+    expect(stdoutSnippet.endsWith('…')).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
