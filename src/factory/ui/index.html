@@ -13,6 +13,35 @@
         <button id="refresh" type="button">Refresh</button>
       </header>
 
+      <!-- The orchestrator chat panel (spec §22 human UX) and the operator's
+           token control. Reads are public; every send is an authenticated POST
+           routed through apiSend. With no composed orchestrator the server 503s
+           and the panel says so while the dashboard keeps working. The token is
+           saved to localStorage only — never rendered back into the DOM. -->
+      <section class="panel" id="chat" aria-labelledby="chat-heading">
+        <h2 id="chat-heading">Orchestrator</h2>
+
+        <div class="chat-token">
+          <label for="token">Operator token</label>
+          <input id="token" type="password" autocomplete="off" spellcheck="false" />
+          <button id="save-token" type="button">Save token</button>
+        </div>
+
+        <div id="chat-log" class="chat-log" aria-live="polite"></div>
+
+        <div class="chat-compose">
+          <input
+            id="chat-input"
+            type="text"
+            placeholder="Ask the orchestrator…"
+            autocomplete="off"
+          />
+          <button id="chat-send" type="button">Send</button>
+        </div>
+
+        <div id="chat-pending" class="chat-pending"></div>
+      </section>
+
       <!-- The read-first dashboard. Each panel owns its own container and its
            own fetch, so one failing surface renders an inline error in that
            panel and never blanks the others. -->

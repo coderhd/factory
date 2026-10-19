@@ -247,3 +247,160 @@ body {
   font-size: 0.8rem;
   color: #374151;
 }
+
+/* --- the orchestrator chat panel + authenticated mutations ----------------- */
+
+#chat {
+  margin: 1.25rem;
+}
+
+.chat-token {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+}
+
+.chat-token label {
+  color: #6b7280;
+}
+
+.chat-token input,
+.answer-input,
+.chat-compose input {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #d1d5db;
+  border-radius: 0.35rem;
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.chat-token input {
+  flex: 1 1 14rem;
+  min-width: 0;
+  max-width: 22rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.chat-compose {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.chat-compose input {
+  flex: 1;
+}
+
+.chat-log {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-height: 18rem;
+  overflow-y: auto;
+  margin-bottom: 0.75rem;
+  padding: 0.5rem;
+  border: 1px solid #eef1f4;
+  border-radius: 0.35rem;
+  background: #fafbfc;
+}
+
+.chat-message {
+  display: flex;
+  gap: 0.6rem;
+  font-size: 0.85rem;
+}
+
+.chat-role {
+  flex: 0 0 4.5rem;
+  font-weight: 600;
+  color: #6b7280;
+}
+
+.chat-message.operator .chat-role {
+  color: #2563eb;
+}
+
+.chat-message.error .chat-role,
+.chat-message.error .chat-text {
+  color: #b91c1c;
+}
+
+.chat-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-pending {
+  margin-top: 0.6rem;
+}
+
+.chat-pending-note {
+  margin: 0 0 0.3rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #92400e;
+}
+
+.chat-pending-args {
+  margin: 0 0 0.5rem;
+  padding: 0.5rem;
+  overflow-x: auto;
+  border-radius: 0.35rem;
+  background: #fffbeb;
+  font-size: 0.8rem;
+}
+
+/* Every mutation affordance is one of these: a real authenticated API call. */
+.mutate {
+  margin-right: 0.35rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.35rem;
+  background: #f8fafc;
+  color: #1b1f24;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.mutate:hover {
+  background: #eef2f7;
+}
+
+.mutate:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.controls-actions,
+.decision-controls {
+  margin-top: 0.7rem;
+}
+
+.interaction {
+  padding: 0.4rem 0;
+  border-bottom: 1px solid #eef1f4;
+}
+
+.interaction-question {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.interaction-meta {
+  margin: 0.1rem 0 0.4rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  color: #6b7280;
+}
+
+.interaction-answer {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.interaction-answer .answer-input {
+  flex: 1;
+  min-width: 0;
+}

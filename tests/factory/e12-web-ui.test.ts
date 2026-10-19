@@ -359,3 +359,110 @@ describe('E12.2 Task 3 — Work Order detail + drill-down', () => {
     expect((await handler(new Request('http://factory.test/'))).status).toBe(200);
   });
 });
+
+// ---------------------------------------------------------------------------
+// E12.2 (#49) basic web UI — Task 4: chat panel + authenticated mutations.
+// The chat panel is the UI's only write surface, and every affordance that
+// mutates goes through one helper (`apiSend`) that attaches the operator's
+// bearer token — read from localStorage at runtime — *only* on non-GET and only
+// when a non-empty token is set (the E10.4 boundary). The token is never baked
+// into a served asset, echoed back into the DOM, or logged. As in Tasks 2–3 the
+// SPA's DOM is not executed headlessly, so the panel's contract is pinned
+// structurally over the served bytes plus behaviorally over the two acceptance
+// paths the plan's Review Focus names: an unauthenticated mutation is rejected
+// (401) while an authenticated one is not, and an uncomposed orchestrator 503s
+// while the dashboard keeps serving.
+// ---------------------------------------------------------------------------
+
+describe('E12.2 Task 4 — chat panel + authenticated mutations', () => {
+  it('the chat panel and token control are present', async () => {
+    const handler = uiHandler();
+    const html = await (await handler(new Request('http://factory.test/'))).text();
+    for (const id of [
+      'chat',
+      'chat-log',
+      'chat-input',
+      'chat-send',
+      'chat-pending',
+      'token',
+      'save-token',
+    ]) {
+      expect(html).toContain(`id="${id}"`);
+    }
+  });
+
+  it('app.js posts to the orchestrator and completes the confirmation round-trip', async () => {
+    const handler = uiHandler();
+    const js = await (await handler(new Request('http://factory.test/ui/app.js'))).text();
+    expect(js).toContain('/api/orchestrator/message');
+    expect(js).toContain('awaiting_confirmation');
+    expect(js).toContain('confirm');
+  });
+
+  it('app.js attaches the bearer token only on non-GET and reads it from localStorage', async () => {
+    const handler = uiHandler();
+    const js = await (await handler(new Request('http://factory.test/ui/app.js'))).text();
+    expect(js).toContain('localStorage');
+    expect(js).toContain('Authorization');
+    expect(js).toContain('Bearer');
+    expect(js).not.toContain(UI_TOKEN); // no configured token baked into the asset
+  });
+
+  it('app.js routes every mutation affordance through apiSend', async () => {
+    const handler = uiHandler();
+    const js = await (await handler(new Request('http://factory.test/ui/app.js'))).text();
+    expect(js).toContain('apiSend');
+    for (const path of [
+      '/api/orchestrator/message',
+      '/api/interactions/',
+      '/api/approvals/',
+      '/api/work-orders/',
+      '/api/factory/pause',
+      '/api/factory/resume',
+      '/api/factory/emergency-stop',
+    ]) {
+      expect(js).toContain(path);
+    }
+  });
+
+  it('rejects an unauthenticated mutation and accepts an authenticated one', async () => {
+    const handler = uiHandler({ auth: { token: UI_TOKEN, actor: 'operator-ada' } });
+    // no token → 401 (proves the UI's required wire contract is authenticated)
+    const anon = await handler(
+      new Request('http://factory.test/api/factory/pause', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      }),
+    );
+    expect(anon.status).toBe(401);
+    // with the token → not 401
+    const authed = await handler(
+      new Request('http://factory.test/api/factory/pause', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${UI_TOKEN}`,
+        },
+        body: JSON.stringify({ actor: 'x' }),
+      }),
+    );
+    expect(authed.status).not.toBe(401);
+  });
+
+  it('the chat panel degrades when no orchestrator is composed', async () => {
+    const handler = uiHandler(); // no orchestrator
+    const res = await handler(
+      new Request('http://factory.test/api/orchestrator/message', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ message: 'hi' }),
+      }),
+    );
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ error: { code: 'ORCHESTRATOR_DISABLED' } });
+    expect((await (await handler(new Request('http://factory.test/'))).text())).toContain(
+      'id="chat"',
+    );
+  });
+});

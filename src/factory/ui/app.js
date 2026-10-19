@@ -1,11 +1,16 @@
 // E12.2 (#49) the Factory web UI: a plain ES module (no framework, no bundler,
-// no build step). Task 2 renders the read-first dashboard over the public GET
-// routes; Task 3 renders one Work Order's snapshot plus the spec §23 drill-down
-// chain (`#/wo/<id>`). Every panel/section fetches and renders independently, so
-// one failing (or malformed) response shows an inline error in that area and
-// never blanks the page or throws unhandled. An empty Factory renders zeros and
-// "no …" text — nothing is fabricated. The UI does not mutate; Task 4 adds
-// apiSend.
+// no build step). Tasks 2–3 render the read-first dashboard and the Work Order
+// detail + spec §23 drill-down (`#/wo/<id>`) over the public GET routes; Task 4
+// adds the orchestrator chat panel and every mutation affordance. Every
+// panel/section fetches and renders independently, so one failing (or
+// malformed) response shows an inline error in that area and never blanks the
+// page or throws unhandled. An empty Factory renders zeros and "no …" text —
+// nothing is fabricated.
+//
+// Every mutation goes through `apiSend`, which attaches the operator's bearer
+// token (read from localStorage at runtime) only on non-GET and only when a
+// non-empty token is set. The token is never embedded in a served asset, never
+// rendered back into the DOM, and never logged.
 
 // The dashboard's read surfaces, in render order. Each entry names its locked
 // DOM id and the loader that writes into that panel's body. The loader owns its
@@ -29,28 +34,77 @@ const TOKEN_STORAGE_KEY = 'factory.token';
 const REFRESH_INTERVAL_MS = 10000;
 
 /**
- * GET `path` and parse its JSON body. A non-2xx response throws an Error that
- * carries `status` and, when the server sent its documented error envelope, the
- * `code`/`message` too — so a caller can tell "scheduler not configured"
- * (404 NOT_FOUND) from a real failure and render the right state.
+ * Build the Error a failed response raises. It carries `status` and, when the
+ * server sent its documented error envelope, the `code`/`message` too — so a
+ * caller can tell "scheduler not configured" (404 NOT_FOUND) from a real
+ * failure, and "orchestrator not configured" (503 ORCHESTRATOR_DISABLED) from a
+ * model failure, and render the right state.
+ */
+async function responseError(method, path, response) {
+  const error = new Error(`${method} ${path} failed with HTTP ${response.status}`);
+  error.status = response.status;
+  try {
+    const body = await response.json();
+    if (body && typeof body === 'object' && body.error) {
+      error.code = body.error.code;
+      if (typeof body.error.message === 'string') error.message = body.error.message;
+    }
+  } catch {
+    // A non-JSON error body (or none) is fine: the status is the signal.
+  }
+  return error;
+}
+
+/**
+ * GET `path` and parse its JSON body. Reads are public (the E10.4 boundary keeps
+ * GET open), so this sends no credential.
  */
 async function apiGet(path) {
   const response = await fetch(path, { headers: { accept: 'application/json' } });
-  if (!response.ok) {
-    const error = new Error(`GET ${path} failed with HTTP ${response.status}`);
-    error.status = response.status;
-    try {
-      const body = await response.json();
-      if (body && typeof body === 'object' && body.error) {
-        error.code = body.error.code;
-        if (typeof body.error.message === 'string') error.message = body.error.message;
-      }
-    } catch {
-      // A non-JSON error body (or none) is fine: the status is the signal.
-    }
-    throw error;
-  }
+  if (!response.ok) throw await responseError('GET', path, response);
   return await response.json();
+}
+
+/**
+ * The operator's bearer token, read from `localStorage` at send time. It is
+ * never cached in a variable that is rendered, never written to the DOM, and
+ * never logged.
+ */
+function operatorToken() {
+  try {
+    const token = window.localStorage.getItem(TOKEN_STORAGE_KEY);
+    return typeof token === 'string' ? token.trim() : '';
+  } catch {
+    // A browser that blocks storage simply has no token; mutations then surface
+    // the server's 401 rather than a fabricated success.
+    return '';
+  }
+}
+
+/**
+ * The single mutation path (spec §22: the server is the sole mutation
+ * authority). GET delegates to `apiGet`. Every non-GET attaches
+ * `Authorization: Bearer <token>` **only** when the operator has saved a
+ * non-empty token; with no token the request still goes out and the server
+ * answers 401, which the caller must surface — the UI never claims success
+ * without a 2xx.
+ */
+async function apiSend(method, path, body) {
+  const verb = String(method).toUpperCase();
+  if (verb === 'GET') return apiGet(path);
+
+  const headers = { accept: 'application/json', 'content-type': 'application/json' };
+  const token = operatorToken();
+  if (token.length > 0) headers.Authorization = `Bearer ${token}`;
+
+  const response = await fetch(path, {
+    method: verb,
+    headers,
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  if (!response.ok) throw await responseError(verb, path, response);
+  const text = await response.text();
+  return text.length > 0 ? JSON.parse(text) : null;
 }
 
 // --- tiny DOM helpers -------------------------------------------------------
@@ -214,16 +268,52 @@ async function loadApprovals(body) {
     return;
   }
   reset(body);
-  body.append(
-    table(
-      ['Id', 'Capability', 'Status'],
-      approvals.map((approval) => [
-        approval.id,
+  body.append(approvalsTable(body, approvals));
+}
+
+/** Approvals, with an authenticated Approve/Deny affordance on PENDING rows. */
+function approvalsTable(body, approvals) {
+  const node = document.createElement('table');
+  const head = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  for (const header of ['Id', 'Capability', 'Status', 'Decision']) {
+    headRow.append(element('th', null, header));
+  }
+  head.append(headRow);
+
+  const tbody = document.createElement('tbody');
+  for (const approval of approvals) {
+    const tr = document.createElement('tr');
+    tr.append(element('td', null, approval.id));
+    tr.append(
+      element(
+        'td',
+        null,
         approval.binding && approval.binding.capability ? approval.binding.capability : '—',
-        approval.status,
-      ]),
-    ),
-  );
+      ),
+    );
+    tr.append(element('td', null, approval.status));
+
+    const action = document.createElement('td');
+    if (approval.status === 'PENDING') {
+      const path = `/api/approvals/${encodeURIComponent(approval.id)}/answer`;
+      action.append(
+        mutateButton('Approve', () =>
+          mutate(body, path, { decision: 'APPROVAL' }, () => loadApprovals(body)),
+        ),
+        mutateButton('Deny', () =>
+          mutate(body, path, { decision: 'DENY' }, () => loadApprovals(body)),
+        ),
+      );
+    } else {
+      action.textContent = '—';
+    }
+    tr.append(action);
+    tbody.append(tr);
+  }
+
+  node.append(head, tbody);
+  return node;
 }
 
 async function loadInteractions(body) {
@@ -234,16 +324,39 @@ async function loadInteractions(body) {
     return;
   }
   reset(body);
-  body.append(
-    table(
-      ['Id', 'Question', 'Status'],
-      interactions.map((interaction) => [
-        interaction.id,
-        interaction.question,
-        interaction.status,
-      ]),
-    ),
-  );
+  for (const interaction of interactions) {
+    body.append(interactionRow(body, interaction));
+  }
+}
+
+/** One open question, with an authenticated Answer affordance when PENDING. */
+function interactionRow(body, interaction) {
+  const row = document.createElement('div');
+  row.className = 'interaction';
+  row.append(element('p', 'interaction-question', interaction.question ?? '—'));
+  row.append(element('p', 'interaction-meta', `${interaction.id} · ${interaction.status}`));
+
+  if (interaction.status === 'PENDING') {
+    const answer = document.createElement('input');
+    answer.type = 'text';
+    answer.className = 'answer-input';
+    answer.setAttribute('aria-label', `Answer for ${interaction.id}`);
+
+    const submit = mutateButton('Answer', () =>
+      mutate(
+        body,
+        `/api/interactions/${encodeURIComponent(interaction.id)}/answer`,
+        { response: answer.value },
+        () => loadInteractions(body),
+      ),
+    );
+
+    const form = document.createElement('div');
+    form.className = 'interaction-answer';
+    form.append(answer, submit);
+    row.append(form);
+  }
+  return row;
 }
 
 async function loadScheduler(body) {
@@ -301,6 +414,19 @@ async function loadControls(body) {
   flags.append(flag('Paused', controls.paused));
   flags.append(flag('Emergency stopped', controls.emergencyStopped));
   body.append(flags);
+
+  // The operator entry point (spec §10/§18.11). The server remains the sole
+  // mutation authority; each button is an authenticated POST through apiSend.
+  const actions = document.createElement('div');
+  actions.className = 'controls-actions';
+  actions.append(
+    mutateButton('Pause', () => mutate(body, '/api/factory/pause', {}, () => loadControls(body))),
+    mutateButton('Resume', () => mutate(body, '/api/factory/resume', {}, () => loadControls(body))),
+    mutateButton('Emergency stop', () =>
+      mutate(body, '/api/factory/emergency-stop', {}, () => loadControls(body)),
+    ),
+  );
+  body.append(actions);
 }
 
 function flag(label, on) {
@@ -405,6 +531,27 @@ function renderSnapshot(body, snapshot) {
   addMetric(facts, 'Risk tier', workOrder.riskTier ?? 'none');
   addMetric(facts, 'Repository', workOrder.repository ?? 'none');
   body.append(facts);
+
+  // The human gate (spec §13): each decision is an authenticated POST. The
+  // reload re-reads the snapshot so the rendered state is the server's, not an
+  // optimistic guess.
+  if (typeof workOrder.id === 'string') {
+    const decision = document.createElement('div');
+    decision.className = 'decision-controls';
+    for (const choice of ['APPROVE', 'REWORK', 'REJECT']) {
+      decision.append(
+        mutateButton(choice, () =>
+          mutate(
+            body,
+            `/api/work-orders/${encodeURIComponent(workOrder.id)}/decision`,
+            { decision: choice },
+            () => renderWorkOrderDetail(workOrder.id),
+          ),
+        ),
+      );
+    }
+    body.append(decision);
+  }
 
   const criteria = Array.isArray(workOrder.acceptanceCriteria) ? workOrder.acceptanceCriteria : [];
   body.append(element('h3', null, 'Acceptance criteria'));
@@ -539,6 +686,204 @@ function renderChainError(chain, error) {
   chain.append(element('li', 'panel-error', `Could not load: ${message}`));
 }
 
+// --- authenticated mutations -------------------------------------------------
+//
+// Every write below goes through `apiSend`, so each is a real bearer-authorized
+// API call. There is no local state to write: after a 2xx the owning panel
+// re-reads the server; on failure (401 without a token, 400, 503, …) the reason
+// is rendered inline and the panel stays usable — success is never claimed.
+
+/** A button that runs one authenticated mutation when clicked. */
+function mutateButton(label, onClick) {
+  const button = element('button', 'mutate', label);
+  button.type = 'button';
+  button.addEventListener('click', () => void onClick());
+  return button;
+}
+
+/**
+ * Run one authenticated mutation into `body`. On success the panel reloads from
+ * the server; on failure the reason is appended (the panel is not wiped, so the
+ * affordance stays usable for a retry after saving a token).
+ */
+async function mutate(body, path, payload, reload) {
+  body.setAttribute('aria-busy', 'true');
+  try {
+    await apiSend('POST', path, payload);
+    await reload();
+  } catch (error) {
+    body.append(mutationError(error));
+  } finally {
+    body.removeAttribute('aria-busy');
+  }
+}
+
+/** The inline reason for a failed mutation — never a success message. */
+function mutationError(error) {
+  const status = error && error.status;
+  if (status === 401) {
+    return element('p', 'panel-error', 'unauthorized — save your operator token, then retry');
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return element('p', 'panel-error', message);
+}
+
+// --- the orchestrator chat panel --------------------------------------------
+
+/** Chat line role → the label shown beside it. */
+const CHAT_ROLES = { operator: 'You', factory: 'Factory', error: 'Error' };
+
+/** Append one chat line. Text only: the model reply is rendered as text. */
+function chatLine(log, role, text) {
+  if (!log) return;
+  const line = document.createElement('div');
+  line.className = `chat-message ${role}`;
+  line.append(element('span', 'chat-role', CHAT_ROLES[role] ?? 'Factory'));
+  line.append(element('span', 'chat-text', text));
+  log.append(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+/** Clear the pending-confirmation area (stale state must not linger). */
+function clearPending(pending) {
+  if (pending) pending.replaceChildren();
+}
+
+/**
+ * POST one orchestrator request and render its result. Used both for a fresh
+ * message and for the confirmation round-trip (`{ message: '', confirm }`),
+ * which is itself a mutation and so takes the same bearer path.
+ */
+async function runChatRequest(log, pending, request, busyButton) {
+  clearPending(pending);
+  const message = typeof request.message === 'string' ? request.message : '';
+  if (message.length > 0) chatLine(log, 'operator', message);
+  if (busyButton) busyButton.disabled = true;
+  try {
+    const result = await apiSend('POST', '/api/orchestrator/message', request);
+    renderOrchestratorResult(log, pending, result);
+  } catch (error) {
+    chatError(log, error);
+  } finally {
+    if (busyButton) busyButton.disabled = false;
+  }
+}
+
+/** Render the three documented OrchestratorResult shapes as chat lines. */
+function renderOrchestratorResult(log, pending, result) {
+  if (!result || typeof result !== 'object') {
+    chatLine(log, 'factory', 'The orchestrator returned no result.');
+    return;
+  }
+
+  if (result.status === 'awaiting_confirmation') {
+    if (typeof result.summary === 'string' && result.summary) {
+      chatLine(log, 'factory', result.summary);
+    }
+    renderPending(pending, result.pending, log);
+    return;
+  }
+
+  if (result.status === 'error') {
+    const message =
+      result.error && typeof result.error.message === 'string'
+        ? result.error.message
+        : 'the orchestrator reported an error';
+    chatLine(log, 'error', message);
+    return;
+  }
+
+  chatLine(
+    log,
+    'factory',
+    typeof result.summary === 'string' && result.summary ? result.summary : 'Done.',
+  );
+}
+
+/**
+ * A mutating proposal is not executed until a human confirms it. Render the
+ * pending `{ tool, args }` and a Confirm control that re-posts
+ * `{ message: '', confirm: { tool, args } }` through `apiSend`.
+ */
+function renderPending(pending, details, log) {
+  clearPending(pending);
+  if (!pending) return;
+  const tool = details && typeof details.tool === 'string' ? details.tool : 'unknown tool';
+  const args = details && details.args && typeof details.args === 'object' ? details.args : {};
+  pending.append(element('p', 'chat-pending-note', `Awaiting confirmation: ${tool}`));
+  pending.append(element('pre', 'chat-pending-args', JSON.stringify(args, null, 2)));
+
+  const confirmButton = mutateButton('Confirm', () =>
+    runChatRequest(log, pending, { message: '', confirm: { tool, args } }, confirmButton),
+  );
+  pending.append(confirmButton);
+}
+
+/** The chat failure states. A 503 is the documented uncomposed orchestrator. */
+function chatError(log, error) {
+  const status = error && error.status;
+  if (status === 503) {
+    chatLine(log, 'error', 'orchestrator not configured');
+    return;
+  }
+  if (status === 401) {
+    chatLine(log, 'error', 'unauthorized — save your operator token, then send again');
+    return;
+  }
+  chatLine(log, 'error', error instanceof Error ? error.message : String(error));
+}
+
+/**
+ * Wire the chat panel: the Send button and Enter send one message through
+ * `apiSend`. Called once at mount so listeners are never doubled.
+ */
+function renderChat() {
+  const log = document.getElementById('chat-log');
+  const input = document.getElementById('chat-input');
+  const send = document.getElementById('chat-send');
+  const pending = document.getElementById('chat-pending');
+  if (!log || !input || !send) return;
+
+  const submit = () => {
+    const message = typeof input.value === 'string' ? input.value.trim() : '';
+    if (message.length === 0) return;
+    input.value = '';
+    void runChatRequest(log, pending, { message }, send);
+  };
+
+  send.addEventListener('click', submit);
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      submit();
+    }
+  });
+}
+
+/**
+ * Wire the token control. Saving persists to `localStorage['factory.token']`;
+ * clearing removes it. The value is never read back into the field and never
+ * rendered anywhere — the browser keeps it, the UI only sends it.
+ */
+function wireTokenControl() {
+  const input = document.getElementById('token');
+  const save = document.getElementById('save-token');
+  if (!input || !save) return;
+
+  save.addEventListener('click', () => {
+    const value = typeof input.value === 'string' ? input.value.trim() : '';
+    try {
+      if (value.length > 0) window.localStorage.setItem(TOKEN_STORAGE_KEY, value);
+      else window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+    } catch {
+      // Storage blocked: the token is not persisted, so mutations surface 401.
+    }
+    // Never echo the secret back: clear the input immediately.
+    input.value = '';
+    save.textContent = value.length > 0 ? 'Saved' : 'Cleared';
+  });
+}
+
 // --- dashboard, routing, mounting ------------------------------------------
 
 /**
@@ -587,6 +932,8 @@ function route() {
 function mount() {
   const refresh = document.getElementById('refresh');
   if (refresh) refresh.addEventListener('click', () => route());
+  wireTokenControl();
+  renderChat();
   window.addEventListener('hashchange', route);
   route();
   window.setInterval(() => route(), REFRESH_INTERVAL_MS);
