@@ -2,7 +2,7 @@
 
 A practical guide to running a Factory deployment: what `factory start` is, how to create the first Work Order and DAG, what the Factory does automatically, and where the human loops are.
 
-> The Factory is a **verification-first control plane**. It owns execution state; coding-agent harnesses (opencode, run inside a long-lived herdr server) do the work; a separate independent judge verifies it. **There is no web UI or TUI** — the surface is an HTTP API plus the `factory` CLI.
+> The Factory is a **verification-first control plane**. It owns execution state; coding-agent harnesses (opencode, run inside a long-lived herdr server) do the work; a separate independent judge verifies it. The surface is an HTTP API plus the `factory` CLI, plus a small **read-first web UI** the server serves at `/`: a live dashboard, Work Order detail with the `WO → Task → Attempt → trace → verification → evidence → decision` drill-down, and an orchestrator chat panel (anchored at `#chat`). The UI is reached **without a token for reads**; in authenticated deployments every mutation it offers requires the operator's bearer token.
 
 ---
 

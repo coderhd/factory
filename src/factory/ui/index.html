@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Factory</title>
+    <link rel="stylesheet" href="/ui/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <h1>Factory</h1>
+        <button id="refresh" type="button">Refresh</button>
+      </header>
+
+      <!-- The orchestrator chat panel (spec §22 human UX) and the operator's
+           token + operator-name controls. Reads are public; every send is an
+           authenticated POST routed through apiSend. With no composed
+           orchestrator the server 503s and the panel says so while the
+           dashboard keeps working. The token is saved to localStorage only —
+           never rendered back into the DOM; the operator name is likewise
+           sent from storage (default `web-operator`). -->
+      <section class="panel" id="chat" aria-labelledby="chat-heading">
+        <h2 id="chat-heading">Orchestrator</h2>
+
+        <div class="chat-token">
+          <label for="token">Operator token</label>
+          <input id="token" type="password" autocomplete="off" spellcheck="false" />
+          <button id="save-token" type="button">Save token</button>
+        </div>
+
+        <div class="chat-operator">
+          <label for="operator">Operator</label>
+          <input id="operator" type="text" value="web-operator" autocomplete="off" spellcheck="false" />
+          <button id="save-operator" type="button">Save operator</button>
+        </div>
+
+        <div id="chat-log" class="chat-log" aria-live="polite"></div>
+
+        <div class="chat-compose">
+          <input
+            id="chat-input"
+            type="text"
+            placeholder="Ask the orchestrator…"
+            autocomplete="off"
+          />
+          <button id="chat-send" type="button">Send</button>
+        </div>
+
+        <div id="chat-pending" class="chat-pending"></div>
+      </section>
+
+      <!-- The read-first dashboard. Each panel owns its own container and its
+           own fetch, so one failing surface renders an inline error in that
+           panel and never blanks the others. -->
+      <main id="dashboard">
+        <section class="panel" id="work-orders" aria-labelledby="work-orders-heading">
+          <h2 id="work-orders-heading">Work Orders</h2>
+          <div class="panel-body" data-panel-body></div>
+        </section>
+
+        <section class="panel" id="observatory" aria-labelledby="observatory-heading">
+          <h2 id="observatory-heading">Observatory</h2>
+          <div class="panel-body" data-panel-body></div>
+        </section>
+
+        <section class="panel" id="approvals" aria-labelledby="approvals-heading">
+          <h2 id="approvals-heading">Approvals</h2>
+          <div class="panel-body" data-panel-body></div>
+        </section>
+
+        <section class="panel" id="interactions" aria-labelledby="interactions-heading">
+          <h2 id="interactions-heading">Interactions</h2>
+          <div class="panel-body" data-panel-body></div>
+        </section>
+
+        <section class="panel" id="scheduler" aria-labelledby="scheduler-heading">
+          <h2 id="scheduler-heading">Scheduler</h2>
+          <div class="panel-body" data-panel-body></div>
+        </section>
+
+        <section class="panel" id="controls" aria-labelledby="controls-heading">
+          <h2 id="controls-heading">Factory controls</h2>
+          <div class="panel-body" data-panel-body></div>
+        </section>
+      </main>
+
+      <!-- The read-first Work Order detail (`#/wo/<id>`). Two areas, each with
+           its own fetch and its own inline error: the snapshot body and the
+           spec §23 drill-down chain. A failed snapshot leaves the chain usable
+           and vice versa. -->
+      <main id="detail" hidden>
+        <p class="detail-back"><a href="#/">← All work orders</a></p>
+        <h2 class="detail-heading">
+          Work order <span id="detail-id"></span>
+        </h2>
+        <div id="detail-body" class="panel"></div>
+        <section class="panel" aria-labelledby="detail-chain-heading">
+          <h3 id="detail-chain-heading">Drill-down</h3>
+          <ol id="detail-chain"></ol>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/ui/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,414 @@
+/* E12.2 (#49) Factory web UI. A read-first dashboard: no framework, no build
+   step. Each panel is a self-contained card; a failing panel shows an inline
+   error and leaves the rest of the page usable. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.5;
+  color: #1b1f24;
+  background: #f4f6f8;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1.25rem;
+  background: #1b1f24;
+  color: #f4f6f8;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 1.15rem;
+  letter-spacing: 0.02em;
+}
+
+.topbar button {
+  padding: 0.35rem 0.9rem;
+  border: 1px solid #4b5563;
+  border-radius: 0.35rem;
+  background: #2b3138;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.topbar button:hover {
+  background: #3a424b;
+}
+
+#dashboard {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1rem;
+  padding: 1.25rem;
+  align-items: start;
+}
+
+/* An author `display` rule beats the UA `[hidden] { display: none }`, so the
+   route toggles below must restore the hidden semantics explicitly. */
+#dashboard[hidden] {
+  display: none;
+}
+
+.panel {
+  padding: 0.9rem 1rem 1.1rem;
+  border: 1px solid #dfe3e8;
+  border-radius: 0.5rem;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(27 31 36 / 6%);
+}
+
+.panel h2 {
+  margin: 0 0 0.6rem;
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #4b5563;
+}
+
+.panel-body[aria-busy="true"] {
+  opacity: 0.6;
+}
+
+.panel h3 {
+  margin: 0.8rem 0 0.4rem;
+  font-size: 0.85rem;
+  color: #4b5563;
+}
+
+.panel table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.panel th,
+.panel td {
+  padding: 0.3rem 0.4rem;
+  border-bottom: 1px solid #eef1f4;
+  text-align: left;
+  vertical-align: top;
+}
+
+.panel th {
+  font-weight: 600;
+  color: #6b7280;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.25rem 1rem;
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+}
+
+.metrics dt {
+  color: #6b7280;
+}
+
+.metrics dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.flags {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.85rem;
+}
+
+.flags .flag {
+  padding: 0.2rem 0;
+}
+
+.flags .flag.on {
+  color: #b91c1c;
+  font-weight: 600;
+}
+
+.flags .flag.off {
+  color: #15803d;
+}
+
+.empty {
+  margin: 0;
+  color: #6b7280;
+  font-style: italic;
+  font-size: 0.85rem;
+}
+
+.panel-error {
+  margin: 0;
+  padding: 0.5rem 0.6rem;
+  border-radius: 0.35rem;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 0.85rem;
+}
+
+/* --- Work Order detail + the drill-down chain ----------------------------- */
+
+#detail {
+  padding: 1.25rem;
+  max-width: 900px;
+}
+
+#detail[hidden] {
+  display: none;
+}
+
+.detail-back {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+}
+
+.detail-back a {
+  color: #2563eb;
+  text-decoration: none;
+}
+
+.detail-back a:hover {
+  text-decoration: underline;
+}
+
+.detail-heading {
+  margin: 0 0 0.6rem;
+  font-size: 1.05rem;
+}
+
+.detail-heading #detail-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+  color: #4b5563;
+}
+
+/* The snapshot body sits above the chain panel, each a self-contained card. */
+#detail-body {
+  margin-bottom: 1rem;
+}
+
+#detail-body h3 {
+  margin: 0.9rem 0 0.4rem;
+  font-size: 0.85rem;
+  color: #4b5563;
+}
+
+/* The chain is an ordered list: 1. Work order → 2. Task → … → 7. decision. */
+#detail-chain {
+  margin: 0;
+  padding-left: 1.4rem;
+  font-size: 0.85rem;
+}
+
+#detail-chain .chain-stage {
+  padding: 0.25rem 0;
+}
+
+#detail-chain .chain-stage-name {
+  font-weight: 600;
+}
+
+#detail-chain .chain-status {
+  margin-left: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 0.75rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+#detail-chain .chain-stage.available .chain-status {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+#detail-chain .chain-stage.stub .chain-status {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+#detail-chain .chain-refs {
+  margin: 0.15rem 0 0;
+  padding-left: 1.1rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  color: #374151;
+}
+
+/* --- the orchestrator chat panel + authenticated mutations ----------------- */
+
+#chat {
+  margin: 1.25rem;
+}
+
+.chat-token,
+.chat-operator {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+}
+
+.chat-token label,
+.chat-operator label {
+  color: #6b7280;
+}
+
+.chat-token input,
+.chat-operator input,
+.answer-input,
+.chat-compose input {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #d1d5db;
+  border-radius: 0.35rem;
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.chat-token input {
+  flex: 1 1 14rem;
+  min-width: 0;
+  max-width: 22rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.chat-operator input {
+  flex: 0 1 14rem;
+  min-width: 0;
+}
+
+.chat-compose {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.chat-compose input {
+  flex: 1;
+}
+
+.chat-log {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-height: 18rem;
+  overflow-y: auto;
+  margin-bottom: 0.75rem;
+  padding: 0.5rem;
+  border: 1px solid #eef1f4;
+  border-radius: 0.35rem;
+  background: #fafbfc;
+}
+
+.chat-message {
+  display: flex;
+  gap: 0.6rem;
+  font-size: 0.85rem;
+}
+
+.chat-role {
+  flex: 0 0 4.5rem;
+  font-weight: 600;
+  color: #6b7280;
+}
+
+.chat-message.operator .chat-role {
+  color: #2563eb;
+}
+
+.chat-message.error .chat-role,
+.chat-message.error .chat-text {
+  color: #b91c1c;
+}
+
+.chat-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-pending {
+  margin-top: 0.6rem;
+}
+
+.chat-pending-note {
+  margin: 0 0 0.3rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #92400e;
+}
+
+.chat-pending-args {
+  margin: 0 0 0.5rem;
+  padding: 0.5rem;
+  overflow-x: auto;
+  border-radius: 0.35rem;
+  background: #fffbeb;
+  font-size: 0.8rem;
+}
+
+/* Every mutation affordance is one of these: a real authenticated API call. */
+.mutate {
+  margin-right: 0.35rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.35rem;
+  background: #f8fafc;
+  color: #1b1f24;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.mutate:hover {
+  background: #eef2f7;
+}
+
+.mutate:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.controls-actions,
+.decision-controls {
+  margin-top: 0.7rem;
+}
+
+.interaction {
+  padding: 0.4rem 0;
+  border-bottom: 1px solid #eef1f4;
+}
+
+.interaction-question {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.interaction-meta {
+  margin: 0.1rem 0 0.4rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  color: #6b7280;
+}
+
+.interaction-answer {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.interaction-answer .answer-input {
+  flex: 1;
+  min-width: 0;
+}
