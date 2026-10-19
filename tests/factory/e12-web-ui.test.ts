@@ -514,3 +514,72 @@ describe('E12.2 Task 5 — end-to-end listener smoke', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// E12.2 (#49) final whole-branch review — fix wave. Four findings are pinned
+// here. The two behavioral ones are the loopback (no-auth) mutation contract:
+// the server resolves `actor = authenticatedActor ?? bodyActor` and requires a
+// non-empty actor (`OPERATOR_REQUIRED`, server.ts:473–475), so the SPA must
+// always send a body `actor`. The two structural ones are the DOM-not-executed
+// limits this file has carried since Task 1: the periodic refresh skips while a
+// form control holds focus (so it cannot wipe in-progress input), and a
+// hand-typed malformed hash (`#/wo/%zz`) must not throw out of `route()`.
+// ---------------------------------------------------------------------------
+
+describe('E12.2 (#49) fix wave — loopback actor, refresh guard, bad-hash fallback', () => {
+  it('a loopback (no-auth) mutation succeeds with a body actor', async () => {
+    const handler = uiHandler(); // no auth → loopback mode
+    const res = await handler(
+      new Request('http://factory.test/api/factory/pause', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ actor: 'web-operator' }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ paused: true });
+  });
+
+  it('the same loopback mutation without an actor is OPERATOR_REQUIRED (400)', async () => {
+    const handler = uiHandler();
+    const res = await handler(
+      new Request('http://factory.test/api/factory/pause', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: { code: 'OPERATOR_REQUIRED' } });
+  });
+
+  it('the shell carries an operator-name control and app.js reads it for mutations', async () => {
+    const handler = uiHandler();
+    const html = await (await handler(new Request('http://factory.test/'))).text();
+    expect(html).toContain('id="operator"');
+
+    const js = await (await handler(new Request('http://factory.test/ui/app.js'))).text();
+    expect(js).toContain('operatorName');
+    expect(js).toContain('factory.operator');
+    expect(js).toContain('web-operator');
+  });
+
+  it('the periodic refresh is skipped while the operator is editing', async () => {
+    const handler = uiHandler();
+    const js = await (await handler(new Request('http://factory.test/ui/app.js'))).text();
+    // The guard checks the focused element so a tick cannot re-render (and wipe)
+    // an in-progress interaction answer.
+    expect(js).toContain('document.activeElement');
+    expect(js).toContain('isEditing');
+    expect(js).toContain('TEXTAREA');
+  });
+
+  it('a malformed WO hash falls back instead of throwing', async () => {
+    const handler = uiHandler();
+    const js = await (await handler(new Request('http://factory.test/ui/app.js'))).text();
+    // `route()` decodes the WO id inside a try/catch and falls back to the
+    // dashboard on a malformed escape (e.g. `#/wo/%zz`).
+    expect(js).toContain('decodeURIComponent');
+    expect(js).toContain('%zz');
+  });
+});

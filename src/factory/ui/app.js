@@ -29,6 +29,15 @@ const PANELS = [
 // served asset, never rendered back into the DOM, and never logged.
 const TOKEN_STORAGE_KEY = 'factory.token';
 
+// The operator's own name, supplied at runtime (Task 4) and sent as the `actor`
+// on every mutation. The loopback (no-auth) server requires a non-empty actor
+// (`OPERATOR_REQUIRED` / `APPROVAL_ACTOR_REQUIRED`), and in an authenticated
+// deployment the server ignores the body actor in favour of the bearer's
+// principal — so sending it is always correct and never lets the body override
+// the authenticated identity.
+const OPERATOR_STORAGE_KEY = 'factory.operator';
+const DEFAULT_OPERATOR = 'web-operator';
+
 // How often the dashboard re-renders on its own, so live Factory state stays
 // visible without a manual reload.
 const REFRESH_INTERVAL_MS = 10000;
@@ -78,6 +87,22 @@ function operatorToken() {
     // A browser that blocks storage simply has no token; mutations then surface
     // the server's 401 rather than a fabricated success.
     return '';
+  }
+}
+
+/**
+ * The operator's name, read from `localStorage` at send time and defaulting to
+ * `web-operator`. It is not a secret, but it is only ever rendered inside its
+ * own input — never echoed elsewhere in the DOM.
+ */
+function operatorName() {
+  try {
+    const name = window.localStorage.getItem(OPERATOR_STORAGE_KEY);
+    const trimmed = typeof name === 'string' ? name.trim() : '';
+    return trimmed.length > 0 ? trimmed : DEFAULT_OPERATOR;
+  } catch {
+    // A browser that blocks storage still has a usable default actor.
+    return DEFAULT_OPERATOR;
   }
 }
 
@@ -299,10 +324,10 @@ function approvalsTable(body, approvals) {
       const path = `/api/approvals/${encodeURIComponent(approval.id)}/answer`;
       action.append(
         mutateButton('Approve', () =>
-          mutate(body, path, { decision: 'APPROVAL' }, () => loadApprovals(body)),
+          mutate(body, path, { decision: 'APPROVAL', actor: operatorName() }, () => loadApprovals(body)),
         ),
         mutateButton('Deny', () =>
-          mutate(body, path, { decision: 'DENY' }, () => loadApprovals(body)),
+          mutate(body, path, { decision: 'DENY', actor: operatorName() }, () => loadApprovals(body)),
         ),
       );
     } else {
@@ -346,7 +371,7 @@ function interactionRow(body, interaction) {
       mutate(
         body,
         `/api/interactions/${encodeURIComponent(interaction.id)}/answer`,
-        { response: answer.value },
+        { response: answer.value, actor: operatorName() },
         () => loadInteractions(body),
       ),
     );
@@ -420,10 +445,14 @@ async function loadControls(body) {
   const actions = document.createElement('div');
   actions.className = 'controls-actions';
   actions.append(
-    mutateButton('Pause', () => mutate(body, '/api/factory/pause', {}, () => loadControls(body))),
-    mutateButton('Resume', () => mutate(body, '/api/factory/resume', {}, () => loadControls(body))),
+    mutateButton('Pause', () =>
+      mutate(body, '/api/factory/pause', { actor: operatorName() }, () => loadControls(body)),
+    ),
+    mutateButton('Resume', () =>
+      mutate(body, '/api/factory/resume', { actor: operatorName() }, () => loadControls(body)),
+    ),
     mutateButton('Emergency stop', () =>
-      mutate(body, '/api/factory/emergency-stop', {}, () => loadControls(body)),
+      mutate(body, '/api/factory/emergency-stop', { actor: operatorName() }, () => loadControls(body)),
     ),
   );
   body.append(actions);
@@ -544,7 +573,7 @@ function renderSnapshot(body, snapshot) {
           mutate(
             body,
             `/api/work-orders/${encodeURIComponent(workOrder.id)}/decision`,
-            { decision: choice },
+            { decision: choice, actor: operatorName() },
             () => renderWorkOrderDetail(workOrder.id),
           ),
         ),
@@ -884,6 +913,29 @@ function wireTokenControl() {
   });
 }
 
+/**
+ * Wire the operator-name control. Saving persists to
+ * `localStorage['factory.operator']`; clearing removes it (falling back to the
+ * `web-operator` default). The name is not a secret, so the field keeps showing
+ * it — unlike the token, which is cleared immediately.
+ */
+function wireOperatorControl() {
+  const input = document.getElementById('operator');
+  const save = document.getElementById('save-operator');
+  if (!input || !save) return;
+
+  save.addEventListener('click', () => {
+    const value = typeof input.value === 'string' ? input.value.trim() : '';
+    try {
+      if (value.length > 0) window.localStorage.setItem(OPERATOR_STORAGE_KEY, value);
+      else window.localStorage.removeItem(OPERATOR_STORAGE_KEY);
+    } catch {
+      // Storage blocked: the name is not persisted; the default actor is used.
+    }
+    save.textContent = value.length > 0 ? 'Saved' : 'Cleared';
+  });
+}
+
 // --- dashboard, routing, mounting ------------------------------------------
 
 /**
@@ -917,7 +969,18 @@ function route() {
   const hash = window.location.hash || '#/';
   const detail = hash.match(/^#\/wo\/(.+)$/);
   if (detail) {
-    void renderWorkOrderDetail(decodeURIComponent(detail[1]));
+    let id;
+    try {
+      id = decodeURIComponent(detail[1]);
+    } catch {
+      // A hand-typed malformed escape (e.g. `#/wo/%zz`) must not throw out of
+      // route(): fall back to the dashboard rather than leaving the page broken
+      // until a clean reload.
+      showDetail(false);
+      void renderDashboard();
+      return;
+    }
+    void renderWorkOrderDetail(id);
     return;
   }
   showDetail(false);
@@ -925,18 +988,41 @@ function route() {
 }
 
 /**
+ * True while the operator is editing a form control. The periodic tick must not
+ * re-render then, or it would wipe in-progress input (e.g. a half-typed
+ * interaction answer) every refresh interval.
+ */
+function isEditing() {
+  const active = document.activeElement;
+  if (!active) return false;
+  const tag = active.tagName;
+  return (
+    tag === 'INPUT' ||
+    tag === 'TEXTAREA' ||
+    tag === 'SELECT' ||
+    active.isContentEditable === true
+  );
+}
+
+/**
  * Wire the shell: the Refresh button, the hash route, and a periodic re-render
  * of whichever view is active, so live Factory state stays visible without a
- * manual reload.
+ * manual reload. The periodic tick is skipped while the operator is editing so
+ * it never erases in-progress input; the manual Refresh button and hashchange
+ * still route unconditionally.
  */
 function mount() {
   const refresh = document.getElementById('refresh');
   if (refresh) refresh.addEventListener('click', () => route());
   wireTokenControl();
+  wireOperatorControl();
   renderChat();
   window.addEventListener('hashchange', route);
   route();
-  window.setInterval(() => route(), REFRESH_INTERVAL_MS);
+  window.setInterval(() => {
+    if (isEditing()) return;
+    route();
+  }, REFRESH_INTERVAL_MS);
 }
 
 mount();

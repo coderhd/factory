@@ -254,7 +254,8 @@ body {
   margin: 1.25rem;
 }
 
-.chat-token {
+.chat-token,
+.chat-operator {
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -262,11 +263,13 @@ body {
   font-size: 0.85rem;
 }
 
-.chat-token label {
+.chat-token label,
+.chat-operator label {
   color: #6b7280;
 }
 
 .chat-token input,
+.chat-operator input,
 .answer-input,
 .chat-compose input {
   padding: 0.35rem 0.5rem;
@@ -281,6 +284,11 @@ body {
   min-width: 0;
   max-width: 22rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.chat-operator input {
+  flex: 0 1 14rem;
+  min-width: 0;
 }
 
 .chat-compose {
