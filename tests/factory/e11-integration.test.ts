@@ -25,6 +25,7 @@ import {
   createProcessHerdrCli,
   renderTaskPrompt,
   type ExecutionEnvelope,
+  type HerdrOptions,
   type WorkerAdapter,
   type WorkerAnswer,
   type WorkerResult,
@@ -643,7 +644,11 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
   // The outer per-test fixture (workDir/repoPath/TOKEN_ENV) governs here too.
   // The deleted nested hooks reassigned `workDir`, orphaning the outer temp dir
   // on every test in this describe (#46).
-  function makeAdapter(cli: FakeHerdrCli, models: Record<string, string> = {}): WorkerAdapter {
+  function makeAdapter(
+    cli: FakeHerdrCli,
+    models: Record<string, string> = {},
+    overrides: Partial<HerdrOptions> = {},
+  ): WorkerAdapter {
     const workspace = createHerdrWorkspaceManager(cli, { label: 'factory', repoPath });
     return createHerdrWorker({
       cli,
@@ -653,6 +658,7 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
       repoPath,
       pollIntervalMs: 5,
       waitTimeoutMs: 500,
+      ...overrides,
     });
   }
 
@@ -679,7 +685,7 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
     writeFileSync(join(worktree, '.factory', 'report.json'), JSON.stringify(report));
   }
 
-  it('runs one Attempt: create tab → agent start (with model) → prompt → report → tab close; zero tabs at rest', async () => {
+  it('runs one Attempt: create tab → agent start → prompt → report → tab close; zero tabs at rest', async () => {
     const cli = new FakeHerdrCli();
     const adapter = makeAdapter(cli, { implementer: 'opencode/sonnet-x' });
     const envelope: ExecutionEnvelope = {
@@ -722,7 +728,10 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
     const agentStart = cli.callsMatching('agent').find((argv) => argv[1] === 'start')!.join(' ');
     expect(agentStart).toContain('--kind opencode');
     expect(agentStart).toContain('--pane pane_0');
-    expect(agentStart).toContain('-- --model opencode/sonnet-x');
+    // Live #45: the interactive opencode TUI rejects `--model`; the routed model
+    // is validated but never forwarded, and `agent start` carries a startup wait.
+    expect(agentStart).not.toContain('--model');
+    expect(agentStart).toContain('--timeout 120000');
     const prompt = cli.callsMatching('agent').find((argv) => argv[1] === 'prompt')!.join(' ');
     expect(prompt).toContain('--wait');
     expect(prompt).toContain(envelope.branch);
@@ -804,14 +813,82 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
     expect(cli.callsMatching('agent').find((argv) => argv[1] === 'start')).toBeUndefined();
     expect(cli.openTabs()).toHaveLength(0);
 
-    // Mapped id: the --model flag carries the concrete model.
+    // Mapped id: dispatch succeeds, and the mapped model is NOT forwarded to
+    // the interactive TUI (#45) — validation only.
     cli.calls = [];
     cli.onPrompt = () => {
       writeReport(repoPath, { status: 'completed' });
     };
     await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath, model: 'implementer' });
     const agentStart = cli.callsMatching('agent').find((argv) => argv[1] === 'start')!.join(' ');
-    expect(agentStart).toContain('-- --model opencode/sonnet-x');
+    expect(agentStart).not.toContain('--model');
+  });
+
+  it('passes the configured agent-start timeout to `agent start` as `--timeout`', async () => {
+    const cli = new FakeHerdrCli();
+    cli.onPrompt = () => writeReport(repoPath, { status: 'completed' });
+    const adapter = makeAdapter(cli, {}, { agentStartTimeoutMs: 250_000 });
+    await adapter.provision();
+    await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath });
+
+    const agentStart = cli.callsMatching('agent').find((argv) => argv[1] === 'start')!.join(' ');
+    // Live #45: the CLI's startup default is 30000 ms and a cold pane can exceed
+    // it; the adapter must ask for its own (longer) startup window.
+    expect(agentStart).toContain('--timeout 250000');
+  });
+
+  it('retries `agent start` on `agent_pane_busy`, then completes (live pane-not-ready race)', async () => {
+    const cli = new FakeHerdrCli();
+    // Live #45: `agent start` immediately after `tab create` can answer
+    // `{"error":{"code":"agent_pane_busy",...}}` (the pane is not yet an
+    // available shell). One busy answer, then the retry succeeds.
+    cli.agentStartErrors = [
+      new Error(
+        'herdr agent start x failed (exit 1):  — stdout: {"error":{"code":"agent_pane_busy","message":"agent target pane pane_0 is not an available shell"}}',
+      ),
+    ];
+    cli.onPrompt = () => writeReport(repoPath, { status: 'completed', observations: ['retried'] });
+    const adapter = makeAdapter(cli, {}, { paneReadyDelayMs: 1 });
+    await adapter.provision();
+    await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath });
+    const result = await adapter.collectArtifacts();
+
+    expect(result.status).toBe('completed');
+    expect(result.observations).toContain('retried');
+    // Retried once: two `agent start` invocations, and no tab leaked.
+    expect(cli.callsMatching('agent').filter((argv) => argv[1] === 'start')).toHaveLength(2);
+    expect(cli.openTabs()).toHaveLength(0);
+  });
+
+  it('does not retry a non-pane-busy `agent start` failure (surfaced loud, once)', async () => {
+    const cli = new FakeHerdrCli();
+    cli.agentStartErrors = [new Error('herdr agent start x failed (exit 1): no such harness kind')];
+    const adapter = makeAdapter(cli, {}, { paneReadyDelayMs: 1 });
+    await adapter.provision();
+    await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath });
+    const result = await adapter.collectArtifacts();
+
+    expect(result.status).toBe('failed');
+    expect(result.failure ?? '').toContain('no such harness kind');
+    expect(cli.callsMatching('agent').filter((argv) => argv[1] === 'start')).toHaveLength(1);
+    expect(cli.openTabs()).toHaveLength(0);
+  });
+
+  it('gives up after the bounded pane-busy attempts instead of retrying forever', async () => {
+    const cli = new FakeHerdrCli();
+    cli.agentStartErrors = Array.from(
+      { length: 12 },
+      () => new Error('herdr agent start x failed (exit 1): agent_pane_busy'),
+    );
+    const adapter = makeAdapter(cli, {}, { paneReadyDelayMs: 1, paneReadyAttempts: 3 });
+    await adapter.provision();
+    await adapter.execute({ ...TEST_ENVELOPE, worktree: repoPath });
+    const result = await adapter.collectArtifacts();
+
+    expect(result.status).toBe('failed');
+    expect(result.failure ?? '').toContain('agent_pane_busy');
+    expect(cli.callsMatching('agent').filter((argv) => argv[1] === 'start')).toHaveLength(3);
+    expect(cli.openTabs()).toHaveLength(0);
   });
 
   it('ensures the factory workspace once and reuses it across adapters, never touching other workspaces', async () => {
@@ -860,7 +937,7 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
     expect(cli.calls.some((argv) => argv.join(' ').includes('tab_user_pane'))).toBe(false);
   });
 
-  it('plumbs workers.models from config through the default spawn into the harness argv', async () => {
+  it('plumbs workers.models from config through the default spawn: validated, not forwarded to the TUI argv', async () => {
     const cli = new FakeHerdrCli();
     cli.onPrompt = (_prompt, cwd) => {
       // The harness does the work (and commits, so the run carries evidence).
@@ -887,7 +964,10 @@ describe('E11.1 herdr-once worker environment + opencode harness lifecycle (#44)
 
       const start = cli.callsMatching('agent').find((argv) => argv[1] === 'start');
       expect(start).toBeDefined();
-      expect(start!.join(' ')).toContain('-- --model opencode/sonnet-x');
+      // The map still routes (an unmapped id would fail loud), but the concrete
+      // model never rides the interactive TUI argv (#45, live).
+      expect(start!.join(' ')).not.toContain('--model');
+      expect(start!.join(' ')).toContain('--timeout 120000');
       // The run was dispatched and settled: every seeded task left READY.
       expect(deps.store.list<Task>('tasks').every((task) => task.state !== 'READY')).toBe(true);
       expect(cli.openTabs()).toHaveLength(0);
@@ -1298,11 +1378,12 @@ describe('E11.2 production semantic judge + CLI wiring (#42)', () => {
       expect(bundles[0]!.workOrderId).toBe(wo.id);
       expect(deps.store.get<Task>('tasks', tasks[0].id)!.state).toBe('VERIFIED');
 
-      // The judge ran as an opencode harness in its own fresh tab with the
-      // configured concrete model, and was torn down (zero tabs at rest).
+      // The judge ran as an opencode harness in its own fresh tab, and was torn
+      // down (zero tabs at rest). Its concrete model is validated by routing but
+      // is NOT forwarded to the interactive TUI (#45, live).
       const judgeStart = cli.callsMatching('agent').find((argv) => argv[1] === 'start')!.join(' ');
       expect(judgeStart).toContain('--kind opencode');
-      expect(judgeStart).toContain('-- --model opencode/judge-claude');
+      expect(judgeStart).not.toContain('--model');
       const judgeTabCreate = cli.callsMatching('tab').find((argv) => argv[1] === 'create')!.join(' ');
       expect(judgeTabCreate).toContain('--no-focus');
       expect(cli.openTabs()).toHaveLength(0);

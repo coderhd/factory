@@ -169,7 +169,11 @@ export interface HarnessSemanticJudgeOptions {
   identity: ModelIdentity;
   /** The harness kind the judge's pane runs. Default `opencode`. */
   harness?: string;
-  /** The concrete model passed to `agent start -- --model`. Defaults to `provider/model`. */
+  /**
+   * The judge's concrete model identity, used to route/validate `verifier`
+   * against `workers.models`. It is never forwarded to the interactive opencode
+   * TUI (#45): the harness model is opencode's own config concern.
+   */
   modelArg?: string;
   waitTimeoutMs?: number;
   pollIntervalMs?: number;

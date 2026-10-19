@@ -48,6 +48,13 @@ export class FakeHerdrCli implements HerdrCli {
    * answer turn), so the adapter's error-surfacing paths can be pinned.
    */
   promptError: Error | null = null;
+  /**
+   * Test hook: errors that `agent start` throws before succeeding, consumed in
+   * order (live #45: `agent start` right after `tab create` can answer
+   * `{"error":{"code":"agent_pane_busy",...}}` until the pane is a shell). A
+   * test enqueues a busy error then asserts the adapter retried and completed.
+   */
+  agentStartErrors: Error[] = [];
 
   callsMatching(prefix: string): string[][] {
     return this.calls.filter((args) => args[0] === prefix);
@@ -105,6 +112,8 @@ export class FakeHerdrCli implements HerdrCli {
       };
     }
     if (argv[0] === 'agent' && sub === 'start') {
+      const failure = this.agentStartErrors.shift();
+      if (failure) throw failure;
       return { result: { agent: argv[2] } };
     }
     if (argv[0] === 'agent' && (sub === 'prompt' || sub === 'send-keys')) {

@@ -209,9 +209,18 @@ export function createProcessHerdrCli(command = 'herdr'): HerdrCli {
         { encoding: 'utf8' },
         (error: (Error & { code?: number | string }) | null, stdout: string | Buffer, stderr: string | Buffer) => {
           if (error) {
+            // Live (#45): herdr writes its structured error document to
+            // *stdout* (`{"error":{"code":"agent_pane_busy",...}}`) and exits
+            // non-zero with an often-empty *stderr*. Surface the (bounded)
+            // stdout text so retry logic can match the error code and operators
+            // can see the real cause instead of an empty detail.
+            const out = String(stdout).trim();
+            const detail = String(stderr).trim() || error.message;
+            const stdoutNote =
+              out.length > 0 ? ` — stdout: ${out.slice(0, 300)}${out.length > 300 ? '…' : ''}` : '';
             reject(
               new Error(
-                `herdr ${argvPreview(args)} failed (exit ${error.code ?? 'unknown'}): ${String(stderr).trim() || error.message}`,
+                `herdr ${argvPreview(args)} failed (exit ${error.code ?? 'unknown'}): ${detail}${stdoutNote}`,
               ),
             );
             return;
@@ -499,11 +508,23 @@ export interface HerdrOptions {
   waitTimeoutMs?: number;
   /** Poll cadence while waiting for the report file. */
   pollIntervalMs?: number;
+  /**
+   * Startup wait passed to `agent start --timeout <ms>` (live #45: the CLI
+   * default is 30000 and its max is 300000). Default 120000 ms.
+   */
+  agentStartTimeoutMs?: number;
+  /** Delay between `agent_pane_busy` retries of `agent start`. Default 1000 ms. */
+  paneReadyDelayMs?: number;
+  /** Max `agent start` attempts when the target pane is not yet a shell. Default 10. */
+  paneReadyAttempts?: number;
 }
 
 const DEFAULT_HARNESS = 'opencode';
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
+const DEFAULT_AGENT_START_TIMEOUT_MS = 120_000;
+const DEFAULT_PANE_READY_DELAY_MS = 1_000;
+const DEFAULT_PANE_READY_ATTEMPTS = 10;
 
 const emptyResult = (failure: string): WorkerResult => ({
   status: 'failed',
@@ -529,6 +550,9 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
   const models = options.models ?? {};
   const waitTimeoutMs = options.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const agentStartTimeoutMs = options.agentStartTimeoutMs ?? DEFAULT_AGENT_START_TIMEOUT_MS;
+  const paneReadyDelayMs = options.paneReadyDelayMs ?? DEFAULT_PANE_READY_DELAY_MS;
+  const paneReadyAttempts = options.paneReadyAttempts ?? DEFAULT_PANE_READY_ATTEMPTS;
   const repoPath = options.repoPath ?? '.';
 
   let heartbeatAt = new Date().toISOString();
@@ -577,7 +601,15 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
     result = null;
   };
 
-  /** Resolve the concrete model from the Attempt's generic routed id (#44). */
+  /**
+   * Validate the Attempt's generic routed capability id against `workers.models`
+   * and return its concrete model. Fail-loud on an unmapped id (#44). The
+   * returned model is deliberately **not** passed to the harness: live smoke
+   * (#45) proved the interactive opencode TUI rejects `--model` (`Unrecognized
+   * flag: --model in command opencode`), so herdr never sees the agent become
+   * ready and `agent start` times out. The model is opencode's own config
+   * concern (see factory-docs/implementation/herdr-live-smoke-findings.md).
+   */
   const resolveModel = (envelope: ExecutionEnvelope): string | null => {
     if (!envelope.model) return null;
     const mapped = models[envelope.model];
@@ -587,6 +619,26 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
       );
     }
     return mapped;
+  };
+
+  /**
+   * Start the harness, tolerating the live `agent_pane_busy` race (#45):
+   * immediately after `tab create` a pane may not yet be an available shell, so
+   * herdr answers `{"error":{"code":"agent_pane_busy",...}}` until it is. Retry
+   * that one code a bounded number of times; any other failure propagates
+   * unchanged.
+   */
+  const startAgent = async (agentArgs: string[]): Promise<void> => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await cli.run(agentArgs);
+        return;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (attempt >= paneReadyAttempts || !message.includes('agent_pane_busy')) throw error;
+        await sleep(paneReadyDelayMs);
+      }
+    }
   };
 
   /**
@@ -761,7 +813,9 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
       let runState: { envelope: ExecutionEnvelope; agentName: string; tab: string } | null = null;
       try {
         const { workspace } = await options.workspace.ensure();
-        const concrete = resolveModel(envelope);
+        // Validation only (#45): an unmapped routed id still fails loud, but the
+        // concrete model is never forwarded to the interactive opencode TUI.
+        resolveModel(envelope);
         const tabResult = resultOf(
           await cli.run([
             'tab',
@@ -791,13 +845,12 @@ export function createHerdrWorker(options: HerdrOptions): WorkerAdapter {
           harness,
           '--pane',
           rootPane,
+          '--timeout',
+          String(agentStartTimeoutMs),
         ];
-        if (concrete) {
-          // The model rides the harness argv after the `--` separator; no
-          // dangling separator when the run is unrouted.
-          agentArgs.push('--', '--model', concrete);
-        }
-        await cli.run(agentArgs);
+        // No `--model`: the interactive opencode TUI rejects it (#45, live).
+        // The routed model is validated above but is opencode's config concern.
+        await startAgent(agentArgs);
         polling = true;
         await turn(runState, renderTaskPrompt(envelope));
       } catch (error) {
