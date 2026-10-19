@@ -47,6 +47,22 @@
           <div class="panel-body" data-panel-body></div>
         </section>
       </main>
+
+      <!-- The read-first Work Order detail (`#/wo/<id>`). Two areas, each with
+           its own fetch and its own inline error: the snapshot body and the
+           spec §23 drill-down chain. A failed snapshot leaves the chain usable
+           and vice versa. -->
+      <main id="detail" hidden>
+        <p class="detail-back"><a href="#/">← All work orders</a></p>
+        <h2 class="detail-heading">
+          Work order <span id="detail-id"></span>
+        </h2>
+        <div id="detail-body" class="panel"></div>
+        <section class="panel" aria-labelledby="detail-chain-heading">
+          <h3 id="detail-chain-heading">Drill-down</h3>
+          <ol id="detail-chain"></ol>
+        </section>
+      </main>
     </div>
     <script type="module" src="/ui/app.js"></script>
   </body>

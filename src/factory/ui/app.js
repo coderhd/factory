@@ -1,9 +1,11 @@
 // E12.2 (#49) the Factory web UI: a plain ES module (no framework, no bundler,
 // no build step). Task 2 renders the read-first dashboard over the public GET
-// routes. Every panel fetches and renders independently, so one failing (or
-// malformed) response shows an inline error in that panel and never blanks the
-// page or throws unhandled. An empty Factory renders zeros and "no …" text —
-// nothing is fabricated. The dashboard does not mutate; Task 4 adds apiSend.
+// routes; Task 3 renders one Work Order's snapshot plus the spec §23 drill-down
+// chain (`#/wo/<id>`). Every panel/section fetches and renders independently, so
+// one failing (or malformed) response shows an inline error in that area and
+// never blanks the page or throws unhandled. An empty Factory renders zeros and
+// "no …" text — nothing is fabricated. The UI does not mutate; Task 4 adds
+// apiSend.
 
 // The dashboard's read surfaces, in render order. Each entry names its locked
 // DOM id and the loader that writes into that panel's body. The loader owns its
@@ -138,16 +140,34 @@ async function loadWorkOrders(body) {
     return;
   }
   reset(body);
-  body.append(
-    table(
-      ['Id', 'Intent', 'State'],
-      workOrders.map((workOrder) => [
-        workOrder.id,
-        workOrder.intent,
-        workOrder.state,
-      ]),
-    ),
-  );
+  body.append(workOrdersTable(workOrders));
+}
+
+/**
+ * The Work Orders table. Each id is a link to that order's detail route
+ * (`#/wo/<id>`), so a row drills down into the snapshot + chain. Ids and text
+ * are set as text (never injected as HTML).
+ */
+function workOrdersTable(workOrders) {
+  const node = document.createElement('table');
+  const head = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  for (const header of ['Id', 'Intent', 'State']) headRow.append(element('th', null, header));
+  head.append(headRow);
+
+  const tbody = document.createElement('tbody');
+  for (const workOrder of workOrders) {
+    const tr = document.createElement('tr');
+    const idCell = document.createElement('td');
+    const link = element('a', null, workOrder.id);
+    link.href = `#/wo/${encodeURIComponent(workOrder.id)}`;
+    idCell.append(link);
+    tr.append(idCell, element('td', null, workOrder.intent), element('td', null, workOrder.state));
+    tbody.append(tr);
+  }
+
+  node.append(head, tbody);
+  return node;
 }
 
 async function loadObservatory(body) {
@@ -290,6 +310,235 @@ function flag(label, on) {
   return item;
 }
 
+// --- Work Order detail + the spec §23 drill-down ----------------------------
+
+// The drill-down chain, in the order spec §23 fixes it. The server already
+// returns it in this order; we re-key by stage so a reordering bug on the wire
+// cannot reorder the rendered chain, and any stage we do not recognise is
+// appended (never dropped) after the known ones.
+const DETAIL_CHAIN_ORDER = [
+  'work_order',
+  'task',
+  'attempt',
+  'trace',
+  'verification',
+  'evidence',
+  'human_decision',
+];
+
+const STAGE_LABELS = {
+  work_order: 'Work order',
+  task: 'Task',
+  attempt: 'Attempt',
+  trace: 'trace',
+  verification: 'verification',
+  evidence: 'evidence',
+  human_decision: 'decision',
+};
+
+/** Toggle between the dashboard (`#/`) and one Work Order's detail view. */
+function showDetail(on) {
+  const dashboard = document.getElementById('dashboard');
+  const detail = document.getElementById('detail');
+  if (dashboard) dashboard.hidden = on;
+  if (detail) detail.hidden = !on;
+}
+
+/**
+ * Render one Work Order's detail view. The snapshot and the drill-down are two
+ * independent areas: each is fetched, rendered, and failed *on its own*, so a
+ * 404 (or a malformed body) in one shows an inline error there and leaves the
+ * other — and the rest of the page — untouched.
+ */
+async function renderWorkOrderDetail(id) {
+  showDetail(true);
+  const idLabel = document.getElementById('detail-id');
+  if (idLabel) idLabel.textContent = id;
+
+  const body = document.getElementById('detail-body');
+  const chain = document.getElementById('detail-chain');
+
+  await Promise.all([
+    (async () => {
+      if (!body) return;
+      body.setAttribute('aria-busy', 'true');
+      try {
+        const snapshot = await apiGet(`/api/work-orders/${encodeURIComponent(id)}`);
+        renderSnapshot(body, snapshot);
+      } catch (error) {
+        renderError(body, error);
+      } finally {
+        body.removeAttribute('aria-busy');
+      }
+    })(),
+    (async () => {
+      if (!chain) return;
+      chain.setAttribute('aria-busy', 'true');
+      try {
+        const drillDown = await apiGet(
+          `/api/observatory/work-orders/${encodeURIComponent(id)}/drill-down`,
+        );
+        renderChain(chain, drillDown);
+      } catch (error) {
+        renderChainError(chain, error);
+      } finally {
+        chain.removeAttribute('aria-busy');
+      }
+    })(),
+  ]);
+}
+
+/** The snapshot half: header facts, criteria, tasks, attempts, interactions, DAG. */
+function renderSnapshot(body, snapshot) {
+  const workOrder = snapshot && snapshot.workOrder;
+  if (!workOrder) {
+    renderError(body, new Error('the work-order snapshot is missing its workOrder'));
+    return;
+  }
+
+  reset(body);
+
+  const facts = document.createElement('dl');
+  facts.className = 'metrics';
+  addMetric(facts, 'Intent', workOrder.intent ?? 'none');
+  addMetric(facts, 'State', workOrder.state ?? 'none');
+  addMetric(facts, 'Risk tier', workOrder.riskTier ?? 'none');
+  addMetric(facts, 'Repository', workOrder.repository ?? 'none');
+  body.append(facts);
+
+  const criteria = Array.isArray(workOrder.acceptanceCriteria) ? workOrder.acceptanceCriteria : [];
+  body.append(element('h3', null, 'Acceptance criteria'));
+  if (criteria.length === 0) {
+    body.append(element('p', 'empty', 'No acceptance criteria.'));
+  } else {
+    const list = document.createElement('ul');
+    for (const criterion of criteria) list.append(element('li', null, String(criterion)));
+    body.append(list);
+  }
+
+  const tasks = Array.isArray(snapshot.tasks) ? snapshot.tasks : [];
+  body.append(element('h3', null, 'Tasks'));
+  if (tasks.length === 0) {
+    body.append(element('p', 'empty', 'No tasks yet.'));
+  } else {
+    body.append(
+      table(
+        ['Id', 'Title', 'State'],
+        tasks.map((task) => [task.id, task.title, task.state]),
+      ),
+    );
+  }
+
+  const attempts = Array.isArray(snapshot.attempts) ? snapshot.attempts : [];
+  body.append(element('h3', null, 'Attempts'));
+  if (attempts.length === 0) {
+    body.append(element('p', 'empty', 'No attempts yet.'));
+  } else {
+    body.append(
+      table(
+        ['Id', 'Task', 'Outcome'],
+        attempts.map((attempt) => [attempt.id, attempt.taskId, attempt.outcome ?? 'none']),
+      ),
+    );
+  }
+
+  const interactions = Array.isArray(snapshot.interactions) ? snapshot.interactions : [];
+  body.append(element('h3', null, 'Interactions'));
+  if (interactions.length === 0) {
+    body.append(element('p', 'empty', 'No interactions yet.'));
+  } else {
+    body.append(
+      table(
+        ['Id', 'Question', 'Status'],
+        interactions.map((interaction) => [
+          interaction.id,
+          interaction.question,
+          interaction.status,
+        ]),
+      ),
+    );
+  }
+
+  const dag = snapshot.dag ?? null;
+  body.append(element('h3', null, 'DAG'));
+  if (!dag) {
+    body.append(element('p', 'empty', 'No DAG committed.'));
+  } else {
+    const nodes = Array.isArray(dag.nodes) ? dag.nodes : [];
+    if (nodes.length === 0) {
+      body.append(element('p', 'empty', 'The committed DAG has no nodes.'));
+    } else {
+      body.append(
+        table(
+          ['Node', 'Task', 'Depends on'],
+          nodes.map((node) => {
+            const dependsOn = Array.isArray(node.dependsOnTaskIds) ? node.dependsOnTaskIds : [];
+            return [
+              node.nodeId,
+              node.taskId,
+              dependsOn.length === 0 ? 'none' : dependsOn.join(', '),
+            ];
+          }),
+        ),
+      );
+    }
+  }
+}
+
+/** Render the drill-down chain in spec §23 order, non-fabricating per stage. */
+function renderChain(chain, drillDown) {
+  reset(chain);
+  const stages = drillDown && Array.isArray(drillDown.chain) ? drillDown.chain : [];
+  if (stages.length === 0) {
+    chain.append(element('li', 'empty', 'No drill-down stages for this work order.'));
+    return;
+  }
+
+  const byStage = new Map(stages.map((stage) => [stage.stage, stage]));
+  const ordered = [];
+  for (const name of DETAIL_CHAIN_ORDER) {
+    if (byStage.has(name)) ordered.push(byStage.get(name));
+  }
+  for (const stage of stages) {
+    if (!DETAIL_CHAIN_ORDER.includes(stage.stage)) ordered.push(stage);
+  }
+
+  for (const stage of ordered) chain.append(chainStage(stage));
+}
+
+/** One chain stage: its label, its status, and its refs (or an explicit "none"). */
+function chainStage(stage) {
+  const item = document.createElement('li');
+  item.className = `chain-stage ${stage.status === 'stub' ? 'stub' : 'available'}`;
+  const label = stage.stage in STAGE_LABELS ? STAGE_LABELS[stage.stage] : String(stage.stage);
+  item.append(element('span', 'chain-stage-name', label));
+  item.append(
+    element(
+      'span',
+      'chain-status',
+      stage.status === 'stub' ? 'stub (not resolved yet)' : 'available',
+    ),
+  );
+
+  const refs = Array.isArray(stage.refs) ? stage.refs : [];
+  if (refs.length === 0) {
+    item.append(element('p', 'empty', 'no references'));
+  } else {
+    const list = document.createElement('ul');
+    list.className = 'chain-refs';
+    for (const ref of refs) list.append(element('li', null, String(ref)));
+    item.append(list);
+  }
+  return item;
+}
+
+/** The chain area's own inline error: the snapshot half is unaffected. */
+function renderChainError(chain, error) {
+  reset(chain);
+  const message = error instanceof Error ? error.message : String(error);
+  chain.append(element('li', 'panel-error', `Could not load: ${message}`));
+}
+
 // --- dashboard, routing, mounting ------------------------------------------
 
 /**
@@ -314,21 +563,33 @@ async function renderDashboard() {
   );
 }
 
-/** Hash routing. Task 2 implements the dashboard (`#/`); Task 3 adds `#/wo/<id>`. */
+/**
+ * Hash routing. `#/` (or no hash) renders the dashboard; `#/wo/<id>` renders
+ * one Work Order's detail + drill-down. Anything else falls back to the
+ * dashboard so a stale/typo'd hash never leaves a blank page.
+ */
 function route() {
+  const hash = window.location.hash || '#/';
+  const detail = hash.match(/^#\/wo\/(.+)$/);
+  if (detail) {
+    void renderWorkOrderDetail(decodeURIComponent(detail[1]));
+    return;
+  }
+  showDetail(false);
   void renderDashboard();
 }
 
 /**
  * Wire the shell: the Refresh button, the hash route, and a periodic re-render
- * so live Factory state stays visible without a manual reload.
+ * of whichever view is active, so live Factory state stays visible without a
+ * manual reload.
  */
 function mount() {
   const refresh = document.getElementById('refresh');
-  if (refresh) refresh.addEventListener('click', () => void renderDashboard());
+  if (refresh) refresh.addEventListener('click', () => route());
   window.addEventListener('hashchange', route);
   route();
-  window.setInterval(() => void renderDashboard(), REFRESH_INTERVAL_MS);
+  window.setInterval(() => route(), REFRESH_INTERVAL_MS);
 }
 
 mount();

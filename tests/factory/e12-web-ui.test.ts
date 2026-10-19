@@ -3,6 +3,11 @@ import { describe, expect, it } from 'bun:test';
 import { createApiHandler, type ApiHandler } from '../../src/factory/api/server';
 import { createEmptyEvidenceReadPort } from '../../src/factory/observatory/observatory';
 import { openEventLog } from '../../src/factory/events/log';
+import {
+  createAttempt,
+  createTask,
+  createWorkOrder,
+} from '../../src/factory/domain/workOrder';
 import type { Scheduler, SchedulerStatus } from '../../src/factory/scheduler/scheduler';
 import { openStateStore } from '../../src/factory/state/store';
 
@@ -18,19 +23,32 @@ import { openStateStore } from '../../src/factory/state/store';
 // assertions over the served bytes.
 // ---------------------------------------------------------------------------
 
-/** Build a pure API handler over an in-memory store, optionally with auth. */
-function uiHandler(
+/**
+ * Build a pure API handler over an in-memory store, optionally with auth, and
+ * hand back the same store/events the handler reads. Task 3's drill-down tests
+ * seed a Work Order *through the store* — the same seam the server reads — so
+ * they assert over real served bytes, not a stubbed handler.
+ */
+function uiHarness(
   options: { auth?: { token: string; actor: string }; scheduler?: Scheduler } = {},
-): ApiHandler {
+): { handler: ApiHandler; store: ReturnType<typeof openStateStore>; events: ReturnType<typeof openEventLog> } {
   const store = openStateStore(':memory:');
   const events = openEventLog(store.db);
-  return createApiHandler({
+  const handler = createApiHandler({
     store,
     events,
     evidence: createEmptyEvidenceReadPort(),
     ...(options.auth ? { auth: options.auth } : {}),
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
   });
+  return { handler, store, events };
+}
+
+/** Build a pure API handler over an in-memory store, optionally with auth. */
+function uiHandler(
+  options: { auth?: { token: string; actor: string }; scheduler?: Scheduler } = {},
+): ApiHandler {
+  return uiHarness(options).handler;
 }
 
 /**
@@ -236,5 +254,108 @@ describe('E12.2 Task 2 — dashboard (read-first overview)', () => {
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({ [key]: [] });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E12.2 (#49) basic web UI — Task 3: Work Order detail + drill-down (spec §23).
+// The detail view is read-first: it renders one Work Order's snapshot plus the
+// `WO → Task → Attempt → trace → verification → evidence → human decision`
+// drill-down chain. As in Task 2 the SPA's DOM is not executed headlessly, so
+// the view's contract is pinned structurally over the served bytes plus
+// behaviorally over the two routes it reads. The third test pins the "a failing
+// panel does not blank the page" behavior at the handler-contract level: a
+// missing Work Order 404s (`WORK_ORDER_NOT_FOUND`) for *both* the snapshot and
+// the drill-down, while the shell and the other surfaces keep answering — which
+// is what lets the UI render one inline error and leave the rest usable.
+// ---------------------------------------------------------------------------
+
+describe('E12.2 Task 3 — Work Order detail + drill-down', () => {
+  it('app.js links the drill-down chain and routes to a work order', async () => {
+    const handler = uiHandler();
+    const js = await (await handler(new Request('http://factory.test/ui/app.js'))).text();
+    expect(js).toContain('/api/work-orders/');
+    expect(js).toContain('/drill-down');
+    expect(js).toContain('renderWorkOrderDetail');
+    expect(js).toContain('#/wo/');
+  });
+
+  it('the shell contains the detail containers', async () => {
+    const handler = uiHandler();
+    const html = await (await handler(new Request('http://factory.test/'))).text();
+    for (const id of ['detail', 'detail-chain']) {
+      expect(html).toContain(`id="${id}"`);
+    }
+  });
+
+  it('the drill-down route returns the chain for a seeded work order', async () => {
+    const { handler, store, events } = uiHarness();
+    const workOrder = createWorkOrder({ store, events }, { intent: 'drill-down subject' });
+    const task = createTask({ store, events }, { workOrderId: workOrder.id, title: 'T' });
+    const attempt = createAttempt(
+      { store, events },
+      { taskId: task.id, model: 'generalist', workerId: null },
+    );
+    store.set('interactions', 'interaction_1', {
+      id: 'interaction_1',
+      taskId: task.id,
+      status: 'PENDING',
+    });
+
+    const res = await handler(
+      new Request(`http://factory.test/api/observatory/work-orders/${workOrder.id}/drill-down`),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      workOrderId: string;
+      chain: Array<{ stage: string; refs: string[]; status: string }>;
+    };
+    expect(body.workOrderId).toBe(workOrder.id);
+    // Spec §23 order: WO → Task → Attempt → trace → verification → evidence → decision.
+    expect(body.chain.map((step) => step.stage)).toEqual([
+      'work_order',
+      'task',
+      'attempt',
+      'trace',
+      'verification',
+      'evidence',
+      'human_decision',
+    ]);
+    const byStage = new Map(body.chain.map((step) => [step.stage, step]));
+    expect(byStage.get('work_order')?.refs).toEqual([workOrder.id]);
+    expect(byStage.get('task')?.refs).toEqual([task.id]);
+    expect(byStage.get('attempt')?.refs).toEqual([attempt.id]);
+    expect(byStage.get('human_decision')?.refs).toEqual(['interaction_1']);
+    // Nothing was recorded for trace/verification/evidence, so those stages are
+    // honest stubs with no refs — never fabricated.
+    expect(byStage.get('trace')?.status).toBe('stub');
+    expect(byStage.get('trace')?.refs).toEqual([]);
+    expect(byStage.get('evidence')?.status).toBe('stub');
+    expect(byStage.get('evidence')?.refs).toEqual([]);
+  });
+
+  it('a failing panel does not blank the page', async () => {
+    const { handler } = uiHarness();
+
+    // A missing Work Order 404s on *both* routes the detail view reads, with the
+    // documented code — the UI's cue to render an inline error in that area.
+    const snapshot = await handler(
+      new Request('http://factory.test/api/work-orders/wo_missing'),
+    );
+    expect(snapshot.status).toBe(404);
+    expect(await snapshot.json()).toMatchObject({ error: { code: 'WORK_ORDER_NOT_FOUND' } });
+
+    const drillDown = await handler(
+      new Request('http://factory.test/api/observatory/work-orders/wo_missing/drill-down'),
+    );
+    expect(drillDown.status).toBe(404);
+    expect(await drillDown.json()).toMatchObject({ error: { code: 'WORK_ORDER_NOT_FOUND' } });
+
+    // The rest of the page is unaffected: the dashboard surface still answers and
+    // the shell still serves — the failure is local to the detail area.
+    const list = await handler(new Request('http://factory.test/api/work-orders'));
+    expect(list.status).toBe(200);
+    expect(await list.json()).toMatchObject({ workOrders: [] });
+    expect((await handler(new Request('http://factory.test/'))).status).toBe(200);
   });
 });

@@ -54,6 +54,12 @@ body {
   align-items: start;
 }
 
+/* An author `display` rule beats the UA `[hidden] { display: none }`, so the
+   route toggles below must restore the hidden semantics explicitly. */
+#dashboard[hidden] {
+  display: none;
+}
+
 .panel {
   padding: 0.9rem 1rem 1.1rem;
   border: 1px solid #dfe3e8;
@@ -151,4 +157,93 @@ body {
   background: #fef2f2;
   color: #b91c1c;
   font-size: 0.85rem;
+}
+
+/* --- Work Order detail + the drill-down chain ----------------------------- */
+
+#detail {
+  padding: 1.25rem;
+  max-width: 900px;
+}
+
+#detail[hidden] {
+  display: none;
+}
+
+.detail-back {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+}
+
+.detail-back a {
+  color: #2563eb;
+  text-decoration: none;
+}
+
+.detail-back a:hover {
+  text-decoration: underline;
+}
+
+.detail-heading {
+  margin: 0 0 0.6rem;
+  font-size: 1.05rem;
+}
+
+.detail-heading #detail-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+  color: #4b5563;
+}
+
+/* The snapshot body sits above the chain panel, each a self-contained card. */
+#detail-body {
+  margin-bottom: 1rem;
+}
+
+#detail-body h3 {
+  margin: 0.9rem 0 0.4rem;
+  font-size: 0.85rem;
+  color: #4b5563;
+}
+
+/* The chain is an ordered list: 1. Work order → 2. Task → … → 7. decision. */
+#detail-chain {
+  margin: 0;
+  padding-left: 1.4rem;
+  font-size: 0.85rem;
+}
+
+#detail-chain .chain-stage {
+  padding: 0.25rem 0;
+}
+
+#detail-chain .chain-stage-name {
+  font-weight: 600;
+}
+
+#detail-chain .chain-status {
+  margin-left: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 0.75rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+#detail-chain .chain-stage.available .chain-status {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+#detail-chain .chain-stage.stub .chain-status {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+#detail-chain .chain-refs {
+  margin: 0.15rem 0 0;
+  padding-left: 1.1rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  color: #374151;
 }
