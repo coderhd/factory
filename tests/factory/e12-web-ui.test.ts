@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'bun:test';
 
-import { createApiHandler, type ApiHandler } from '../../src/factory/api/server';
+import {
+  createApiHandler,
+  startFactoryServer,
+  type ApiHandler,
+} from '../../src/factory/api/server';
 import { createEmptyEvidenceReadPort } from '../../src/factory/observatory/observatory';
 import { openEventLog } from '../../src/factory/events/log';
 import {
@@ -464,5 +468,49 @@ describe('E12.2 Task 4 — chat panel + authenticated mutations', () => {
     expect((await (await handler(new Request('http://factory.test/'))).text())).toContain(
       'id="chat"',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E12.2 (#49) basic web UI — Task 5: `factory start` end-to-end listener smoke.
+// Tasks 1–4 drive the *pure handler* in-process. This closes the last gap the
+// acceptance criterion names — "the UI is served by `factory start`" — by
+// starting the real listener (`startFactoryServer`, the exact call `cmdServe`
+// makes at `factory.ts:910`) on an ephemeral loopback port and fetching it over
+// a genuine socket. The store is a fresh in-memory one, so the read surfaces the
+// UI consumes must answer empty and non-fabricated. `server.stop()` runs in a
+// `finally` so the listener is torn down on the failing path too. No production
+// code changes were needed: the boot path already serves the UI through
+// `startFactoryServer(createApiHandler(deps))` (`server.ts:768`).
+// ---------------------------------------------------------------------------
+
+describe('E12.2 Task 5 — end-to-end listener smoke', () => {
+  it('a real listener serves the UI and the live read surfaces', async () => {
+    const store = openStateStore(':memory:');
+    const events = openEventLog(store.db);
+    const server = startFactoryServer(
+      { store, events, evidence: createEmptyEvidenceReadPort() },
+      { port: 0 },
+    );
+    try {
+      // The SPA shell, over the wire, exactly as a browser would receive it.
+      expect(server.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+      const html = await (await fetch(`${server.url}/`)).text();
+      expect(html).toContain('id="app"');
+
+      // The served module is the real asset, with its declared content type.
+      const js = await fetch(`${server.url}/ui/app.js`);
+      expect(js.status).toBe(200);
+      expect(js.headers.get('content-type')).toBe('text/javascript; charset=utf-8');
+
+      // A live read surface on the same socket: empty and non-fabricated.
+      // The route's documented shape is `{ workOrders: [...] }` (server.ts:554),
+      // so full equality pins both the empty array and the absence of extras.
+      const wos = await fetch(`${server.url}/api/work-orders`);
+      expect(wos.status).toBe(200);
+      expect(await wos.json()).toEqual({ workOrders: [] });
+    } finally {
+      server.stop();
+    }
   });
 });
